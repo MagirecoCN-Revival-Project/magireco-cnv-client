@@ -35,7 +35,7 @@ on:
       key_alias:
         description: 'Key 别名（KEY_ALIAS）'
         required: true
-        default: 'android'
+        default: 'magirecocn-public-client'
         type: string
       store_password:
         description: 'Keystore 与 Key 共用密码（KEY_STORE_PASSWORD / KEY_PASSWORD）— 留空则自动生成 32 位强密码'
@@ -45,12 +45,12 @@ on:
       validity_years:
         description: '证书有效期（年）'
         required: false
-        default: '27'
+        default: '30'
         type: string
       distinguished_name:
         description: '证书 Distinguished Name（DN）'
         required: false
-        default: 'CN=MagirecoCN, OU=MagirecoCN-Revival-Project, O=MagirecoCN, L=CN, ST=CN, C=CN'
+        default: 'CN=MagirecoCN Revival Project, OU=Public Client, O=MagirecoCN Revival Project, L=CN, ST=CN, C=CN'
         type: string
       auto_save_secrets:
         description: '自动将生成的 4 个值写入仓库 Secrets（需要 GH_TOKEN 具备 secrets:write 权限）'
