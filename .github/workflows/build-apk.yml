@@ -395,10 +395,10 @@ jobs:
         env:
           ANDROID_JAR: ${{ steps.tools.outputs.android_jar }}
 
-      - name: 📦 将 .class 转换为 classes3.dex（d8）
+      - name: 📦 将 Java 源码打包为 jar，再转换为 classes3.dex（d8）
         run: |
           python3 <<'SCRIPT_END'
-          import subprocess, os, sys, glob, shutil
+          import subprocess, os, sys, shutil, glob
 
           sys.stdout.reconfigure(line_buffering=True)
 
@@ -430,25 +430,31 @@ jobs:
                   sys.exit(1)
               return r.stdout.strip()
 
-          header("生成 classes3.dex（d8）")
+          header("生成 classes3.dex（jar → d8）")
 
           bt_dir      = os.environ["BT_DIR"]
           class_dir   = "/tmp/patch_classes"
+          jar_path    = "/tmp/patch.jar"
           dex_out_dir = "/tmp/dex_out"
           dex_final   = "/tmp/classes3.dex"
 
-          class_files = sorted(glob.glob(f"{class_dir}/**/*.class", recursive=True))
-          section(f"待转换 .class 文件：{len(class_files)} 个")
+          # 统计编译产物
+          class_files = glob.glob(f"{class_dir}/**/*.class", recursive=True)
+          section(f"编译产物：{len(class_files)} 个 .class 文件")
 
-          os.makedirs(dex_out_dir, exist_ok=True)
-          files_arg = " ".join(f'"{cf}"' for cf in class_files)
+          # 打成 jar——单一输入给 d8，彻底规避 glob 重复路径问题
+          section("打包为 patch.jar（jar cf）")
+          run(f'jar cf "{jar_path}" -C "{class_dir}" .')
+          ok(f"patch.jar（{os.path.getsize(jar_path):,} bytes）")
 
+          # d8：jar → DEX
           section("运行 d8（--min-api 21 匹配 minSdkVersion）")
+          os.makedirs(dex_out_dir, exist_ok=True)
           run(
               f'"{bt_dir}/d8" '
               f'--output "{dex_out_dir}" '
               f'--min-api 21 '
-              f'{files_arg}'
+              f'"{jar_path}"'
           )
 
           # d8 输出目录中固定产生 classes.dex，重命名为 classes3.dex
