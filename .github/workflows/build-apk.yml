@@ -717,6 +717,38 @@ jobs:
           NEW_VERSION: ${{ steps.version.outputs.new_version }}
           NEW_CODE:    ${{ steps.version.outputs.new_code }}
 
+      - name: 🎵 转换 HCA 音频为 OGG（vgmstream + ffmpeg）
+        run: |
+          set -euo pipefail
+
+          # 安装 vgmstream-cli 与 ffmpeg
+          sudo apt-get install -y ffmpeg > /dev/null 2>&1
+
+          # 从 GitHub Releases 下载最新 vgmstream-cli
+          VGMS_URL="https://github.com/vgmstream/vgmstream/releases/latest/download/vgmstream-linux-cli.tar.gz"
+          curl -fsSL "$VGMS_URL" -o /tmp/vgmstream.tar.gz
+          tar -xzf /tmp/vgmstream.tar.gz -C /tmp
+          VGMS_BIN="$(find /tmp -name 'vgmstream-cli' -type f | head -1)"
+          chmod +x "$VGMS_BIN"
+          echo "[vgmstream] 使用: $VGMS_BIN"
+
+          # 把仓库内所有 .hca 文件转为同目录同名 .ogg
+          HCA_FILES=$(find assets/resource/sound_native -name '*.hca' 2>/dev/null || true)
+          if [ -z "$HCA_FILES" ]; then
+            echo "未找到 .hca 文件，跳过转换"
+            exit 0
+          fi
+
+          for HCA in $HCA_FILES; do
+            WAV_TMP="${HCA%.hca}.wav"
+            OGG_OUT="${HCA%.hca}.ogg"
+            echo "[HCA→OGG] 转换 $HCA"
+            "$VGMS_BIN" -o "$WAV_TMP" "$HCA"
+            ffmpeg -y -i "$WAV_TMP" -c:a libvorbis -q:a 5 "$OGG_OUT" 2>/dev/null
+            rm -f "$WAV_TMP"
+            echo "  ✔ 生成 $OGG_OUT ($(du -h "$OGG_OUT" | cut -f1))"
+          done
+
       - name: 🔨 重组 APK（apktool b）
         run: |
           python3 <<'SCRIPT_END'
