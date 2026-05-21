@@ -1097,7 +1097,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private void openLogFile() {
         synchronized (logFileLock) {
             try {
-                java.io.File logFile = new java.io.File(getFilesDir(), "lastest.log");
+                java.io.File logFile = new java.io.File(getFilesDir(), "latest.log");
                 logFileWriter = new java.io.BufferedWriter(new java.io.OutputStreamWriter(
                         new java.io.FileOutputStream(logFile, false), "UTF-8"));
                 String head = "==== Magireco CNV Bootstrap 日志 (开始于 "
@@ -1640,7 +1640,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             logBuffer.addLast(ts);
             while (logBuffer.size() > LOG_BUFFER_MAX) logBuffer.removeFirst();
         }
-        // 同步落盘到 lastest.log
+        // 同步落盘到 latest.log
         synchronized (logFileLock) {
             if (logFileWriter != null) {
                 try {
@@ -1648,7 +1648,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                     logFileWriter.write('\n');
                     logFileWriter.flush();
                 } catch (Throwable t) {
-                    android.util.Log.w(TAG, "lastest.log 写入失败: " + t);
+                    android.util.Log.w(TAG, "latest.log 写入失败: " + t);
                 }
             }
         }
