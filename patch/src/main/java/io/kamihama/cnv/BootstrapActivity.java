@@ -176,6 +176,12 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private Runnable   fatalRetrigger;
     private ScrollView vLogScroll;
 
+    // ---- 主布局根视图（供 syncGlassToButtons 动态计算边距） ----
+    private FrameLayout    vRoot;
+    private GlassPanelView vGlassPanel;
+    private LinearLayout   vHeadRight;
+    private LinearLayout   vMainRow;
+
     // ---- 右上角胶囊按钮背景（主题切换时统一重置颜色） ----
     private TextView       vThemeChip;
     private TextView       vHomeChip;
@@ -290,6 +296,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     /** 构建整棵视图树并返回根视图。主题切换时会被重新调用。 */
     private View buildLayout() {
         FrameLayout root = new FrameLayout(this);
+        vRoot = root;
 
         // ── 第 0 层：背景图（background_light.png） ──
         ImageView bgView = new ImageView(this);
@@ -301,22 +308,19 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
 
-        // ── 第 1 层：毛玻璃底板（居中覆盖，浮动按钮叠在上方） ──
+        // ── 第 1 层：毛玻璃底板（边距由 syncGlassToButtons 在首次 layout 后动态写入） ──
         // 使用异步 Stack Blur 处理背景图，初次显示前先用纯色半透明占位
         GlassPanelView glassPanel = new GlassPanelView(this, COLOR_GLASS, COLOR_GLASS_STK, dp(20));
+        vGlassPanel = glassPanel;
         FrameLayout.LayoutParams glassLp = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT);
-        glassLp.leftMargin   = dp(16);
-        glassLp.rightMargin  = dp(16);
-        glassLp.topMargin    = dp(16);
-        glassLp.bottomMargin = dp(16);
         root.addView(glassPanel, glassLp);
 
-        // ── 第 2 层：主内容区（横向两列） ──
+        // ── 第 2 层：主内容区（横向两列，内边距由 syncGlassToButtons 动态写入） ──
         LinearLayout mainRow = new LinearLayout(this);
+        vMainRow = mainRow;
         mainRow.setOrientation(LinearLayout.HORIZONTAL);
-        mainRow.setPadding(dp(70), dp(60), dp(14), dp(36));
         root.addView(mainRow, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
@@ -491,6 +495,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 ViewGroup.LayoutParams.WRAP_CONTENT);
         ghLp.leftMargin = dp(8);
         headRight.addView(vGitHubChip, ghLp);
+        vHeadRight = headRight;
         root.addView(headRight, headLp);
 
         applyThemeChipColors();
@@ -612,7 +617,55 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
+        // 首帧绘制前动态计算玻璃边距，避免界面闪烁
+        root.getViewTreeObserver().addOnPreDrawListener(
+                new android.view.ViewTreeObserver.OnPreDrawListener() {
+            @Override public boolean onPreDraw() {
+                root.getViewTreeObserver().removeOnPreDrawListener(this);
+                syncGlassToButtons();
+                return true;
+            }
+        });
+
         return root;
+    }
+
+    /**
+     * 根据浮动按钮和版本信息的实际测量位置，动态计算毛玻璃边距和主内容行内边距，
+     * 确保角落控件（LOG 胶囊、右上角功能胶囊、底部版本信息）不被包裹进玻璃范围内。
+     * buildLayout() 首帧绘制前调用一次；toggleTheme() 重建视图后会再次触发。
+     */
+    private void syncGlassToButtons() {
+        if (vRoot == null || vGlassPanel == null || vMainRow == null
+                || vHeadRight == null || vLogPill == null
+                || vVersionLeft == null || vVersionRight == null) return;
+
+        final int rootW = vRoot.getWidth();
+        final int rootH = vRoot.getHeight();
+        if (rootW == 0 || rootH == 0) return;
+
+        final int gap   = dp(6);   // 玻璃边与按钮之间的间隙
+        final int inner = dp(10);  // 玻璃内壁到内容的内边距
+
+        // 左：LOG 胶囊右侧
+        int mLeft   = vLogPill.getRight() + gap;
+        // 上：顶部按钮行（LOG 胶囊与功能胶囊组）的下侧
+        int mTop    = Math.max(vLogPill.getBottom(), vHeadRight.getBottom()) + gap;
+        // 右：右侧功能胶囊组的左侧（转换为从右边缘算起的距离）
+        int mRight  = rootW - vHeadRight.getLeft() + gap;
+        // 下：底部版本信息的上侧（转换为从下边缘算起的距离）
+        int mBottom = rootH - Math.min(vVersionLeft.getTop(), vVersionRight.getTop()) + gap;
+
+        // 更新毛玻璃边距
+        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) vGlassPanel.getLayoutParams();
+        lp.leftMargin   = mLeft;
+        lp.topMargin    = mTop;
+        lp.rightMargin  = mRight;
+        lp.bottomMargin = mBottom;
+        vGlassPanel.setLayoutParams(lp);
+
+        // 同步主内容行内边距，使内容始终位于玻璃内壁以内
+        vMainRow.setPadding(mLeft + inner, mTop + inner, mRight + inner, mBottom + inner);
     }
 
     // ── 毛玻璃底板 View ──────────────────────────────────────────────────
