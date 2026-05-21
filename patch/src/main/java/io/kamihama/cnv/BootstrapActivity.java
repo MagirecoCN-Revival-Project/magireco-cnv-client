@@ -175,7 +175,10 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private final java.util.List<SlotViews> slotList = new java.util.ArrayList<>();
 
     // ---- 浮动日志面板 ----
+    private LinearLayout vLeftPills;   // LOG + BGM 胶囊容器（左上角）
     private TextView   vLogPill;
+    private TextView   vBgmPill;
+    private GradientDrawable bgmPillBg;
     private FrameLayout logModal;
     private TextView   vLogFull;
     /** FATAL 对话框被"查看日志"临时关闭时，此 Runnable 保存重弹逻辑。 */
@@ -202,6 +205,8 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private boolean bgmWasPlayingWhenPaused = false;
     /** true = 本次会话内不再尝试播 BGM（资源缺失 / 解码失败）。 */
     private boolean bgmDisabled = false;
+    /** true = 用户手动关闭 BGM。 */
+    private boolean bgmMuted = false;
     /** 标题音效播放器（system02，一次性）。 */
     private MediaPlayer sfxPlayer;
     /** true = 本次会话内不再尝试播标题音效。 */
@@ -454,7 +459,18 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
 
         // ── 第 3 层：顶部浮动按钮（LOG 左上 + 三个胶囊右上） ──
 
-        // LOG 胶囊（左上）
+        // 左上角胶囊容器（LOG + BGM）
+        LinearLayout leftPills = new LinearLayout(this);
+        leftPills.setOrientation(LinearLayout.HORIZONTAL);
+        FrameLayout.LayoutParams leftPillsLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        leftPillsLp.gravity    = Gravity.TOP | Gravity.START;
+        leftPillsLp.topMargin  = dp(10);
+        leftPillsLp.leftMargin = dp(10);
+        vLeftPills = leftPills;
+
+        // LOG 胶囊
         vLogPill = new TextView(this);
         vLogPill.setText("LOG");
         vLogPill.setTextColor(0xFFFFFFFF);
@@ -466,14 +482,30 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         pillBg.setColor(COLOR_LOG_PILL);
         pillBg.setCornerRadius(dp(20));
         vLogPill.setBackground(pillBg);
-        FrameLayout.LayoutParams logPillLp = new FrameLayout.LayoutParams(
+        vLogPill.setOnClickListener(v -> openLogModal());
+        leftPills.addView(vLogPill, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        // BGM 胶囊
+        vBgmPill = new TextView(this);
+        vBgmPill.setTextColor(0xFFFFFFFF);
+        vBgmPill.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f);
+        vBgmPill.setTypeface(vBgmPill.getTypeface(), Typeface.BOLD);
+        vBgmPill.setGravity(Gravity.CENTER);
+        vBgmPill.setPadding(dp(12), dp(6), dp(12), dp(6));
+        bgmPillBg = new GradientDrawable();
+        bgmPillBg.setCornerRadius(dp(20));
+        vBgmPill.setBackground(bgmPillBg);
+        vBgmPill.setOnClickListener(v -> toggleBgm());
+        LinearLayout.LayoutParams bgmLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT);
-        logPillLp.gravity = Gravity.TOP | Gravity.START;
-        logPillLp.topMargin  = dp(10);
-        logPillLp.leftMargin = dp(10);
-        vLogPill.setOnClickListener(v -> openLogModal());
-        root.addView(vLogPill, logPillLp);
+        bgmLp.leftMargin = dp(8);
+        leftPills.addView(vBgmPill, bgmLp);
+        updateBgmPill();
+
+        root.addView(leftPills, leftPillsLp);
 
         // 右上角三个胶囊
         LinearLayout headRight = new LinearLayout(this);
@@ -663,7 +695,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
      */
     private void syncGlassToButtons() {
         if (vRoot == null || vGlassPanel == null || vMainRow == null
-                || vHeadRight == null || vLogPill == null
+                || vHeadRight == null || vLeftPills == null || vLogPill == null
                 || vVersionLeft == null || vVersionRight == null) return;
 
         final int rootW = vRoot.getWidth();
@@ -674,13 +706,13 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         final int inner = dp(10);  // 玻璃内壁到内容的内边距
 
         // 左右两侧取平均值，保证玻璃面板水平居中
-        // rawLeft = LOG 胶囊右侧到屏幕左边缘的距离；rawRight = 功能胶囊右侧到屏幕右边缘的距离
-        int rawLeft  = vLogPill.getRight() + gap;
+        // rawLeft = 左侧胶囊容器（LOG + BGM）右边缘；rawRight = 功能胶囊右侧到屏幕右边缘的距离
+        int rawLeft  = vLeftPills.getRight() + gap;
         int rawRight = rootW - vHeadRight.getRight() + gap;
         int mLeft    = (rawLeft + rawRight) / 2;
         int mRight   = mLeft;
-        // 上：顶部按钮行（LOG 胶囊与功能胶囊组）的下侧
-        int mTop    = Math.max(vLogPill.getBottom(), vHeadRight.getBottom()) + gap;
+        // 上：顶部按钮行（左侧胶囊容器与右侧功能胶囊组）的下侧
+        int mTop    = Math.max(vLeftPills.getBottom(), vHeadRight.getBottom()) + gap;
         // 下：底部版本信息的上侧（转换为从下边缘算起的距离）
         int mBottom = rootH - Math.min(vVersionLeft.getTop(), vVersionRight.getTop()) + gap;
 
@@ -926,6 +958,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         if (vThemeChip   != null) vThemeChip.setText(darkMode ? "☀  亮色" : "☾  夜间");
         if (homeChipBg   != null) homeChipBg.setColor(COLOR_LOG_PILL);
         if (githubChipBg != null) githubChipBg.setColor(COLOR_ACCENT2);
+        updateBgmPill();
     }
 
     /** 切换深色/浅色主题：保存偏好，重建整棵视图树。 */
@@ -1114,12 +1147,35 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         }
     }
 
+    /** 切换 BGM 开/关状态并更新胶囊按钮外观。 */
+    private void toggleBgm() {
+        bgmMuted = !bgmMuted;
+        if (bgmMuted) {
+            stopBgm();
+        } else {
+            startBgm();
+        }
+        updateBgmPill();
+    }
+
+    /** 根据 bgmMuted 状态刷新 BGM 胶囊的文字和背景色。 */
+    private void updateBgmPill() {
+        if (vBgmPill == null || bgmPillBg == null) return;
+        if (bgmMuted) {
+            vBgmPill.setText("♪  静音");
+            bgmPillBg.setColor(0xAA888888);
+        } else {
+            vBgmPill.setText("♪  音乐");
+            bgmPillBg.setColor(COLOR_LOG_PILL);
+        }
+    }
+
     /**
      * 异步启动循环 BGM（system01）。
-     * 已经在播或已禁用时直接返回。
+     * 已经在播、已禁用或用户已静音时直接返回。
      */
     private void startBgm() {
-        if (bgmDisabled || bgmPlayer != null) return;
+        if (bgmDisabled || bgmPlayer != null || bgmMuted) return;
         try {
             AssetFileDescriptor afd = getAssets().openFd(BGM_ASSET);
             MediaPlayer mp = new MediaPlayer();
