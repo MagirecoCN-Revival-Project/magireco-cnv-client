@@ -56,6 +56,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write    # 允许 GITHUB_TOKEN 读写 Actions Variables（版本号持久化）
 
 jobs:
   build:
@@ -892,6 +893,12 @@ jobs:
               err("GH_TOKEN 未配置，无法写入 Variables")
               err("请在仓库 Settings → Secrets 中配置 GH_TOKEN（需具备 repo 或 actions:write 权限）")
               sys.exit(1)
+
+          # 诊断：区分 PAT（ghp_/github_pat_）与 GITHUB_TOKEN（ghs_）
+          if token.startswith("ghs_"):
+              warn("使用内置 GITHUB_TOKEN（ghs_…），依赖 'actions: write' 权限")
+          else:
+              ok("使用 PAT（secrets.GH_TOKEN）")
 
           failed = False
           for var_name, var_value in [
