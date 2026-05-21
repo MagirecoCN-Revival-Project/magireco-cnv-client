@@ -156,15 +156,23 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private TextView      vStatus;
     private TextView      vAggregate;
     private TextView      vOverallText;
+    private TextView      vTotalSpeed;     // 总进度行右侧速度标签
     private ProgressBar   pbOverall;
     private LinearLayout  slotContainer;
     private TextView      vVersionLeft;   // 左下角版本信息
     private TextView      vVersionRight;  // 右下角客户端类型
 
-    // ---- 槽位 widget（每次 initSlots(n) 重建） ----
-    private TextView[]    slotNameViews;
-    private ProgressBar[] slotBars;
-    private TextView[]    slotMetaViews;
+    // ---- 槽位 widget（每文件固定一个，保存在 slotList 里） ----
+    private static final class SlotViews {
+        final TextView  nameView;
+        final TextView  speedView;
+        final ProgressBar bar;
+        String phase = "pending";
+        SlotViews(TextView n, TextView s, ProgressBar b) {
+            nameView = n; speedView = s; bar = b;
+        }
+    }
+    private final java.util.List<SlotViews> slotList = new java.util.ArrayList<>();
 
     // ---- 浮动日志面板 ----
     private TextView   vLogPill;
@@ -413,12 +421,28 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         rightCol.addView(slotScroll, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
-        // 总进度条标签
+        // 总进度条标签行（"总进度" 左 + 速度 右）
+        LinearLayout totalRow = new LinearLayout(this);
+        totalRow.setOrientation(LinearLayout.HORIZONTAL);
+        totalRow.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams totalRowLp = lpRow(dp(8), dp(2));
+        rightCol.addView(totalRow, totalRowLp);
+
         vOverallText = new TextView(this);
-        vOverallText.setText("整体进度");
+        vOverallText.setText("总进度");
         vOverallText.setTextColor(COLOR_TEXT);
         vOverallText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f);
-        rightCol.addView(vOverallText, lpRow(dp(8), dp(2)));
+        totalRow.addView(vOverallText, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        vTotalSpeed = new TextView(this);
+        vTotalSpeed.setText("");
+        vTotalSpeed.setTextColor(COLOR_SUB);
+        vTotalSpeed.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f);
+        vTotalSpeed.setGravity(Gravity.END);
+        totalRow.addView(vTotalSpeed, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
 
         // 总进度条（较粗，视觉上更突出）
         pbOverall = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
@@ -426,7 +450,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         pbOverall.setProgress(0);
         tintBar(pbOverall, true);
         rightCol.addView(pbOverall, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(12)));
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(10)));
 
         // ── 第 3 层：顶部浮动按钮（LOG 左上 + 三个胶囊右上） ──
 
@@ -909,8 +933,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 .putBoolean(PREF_DARK_MODE, darkMode).apply();
         loadPalette(darkMode);
         setContentView(buildLayout());
-        if (slotNameViews != null) initSlots(slotNameViews.length);
-        else                       initSlots(1);
+        initSlots(Math.max(1, slotList.size()));
         log("INFO", "[UI] 切换主题：" + (darkMode ? "夜间" : "亮色"));
     }
 
@@ -954,39 +977,38 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
 
     private void rebuildSlots(int n) {
         slotContainer.removeAllViews();
-        slotNameViews = new TextView[n];
-        slotBars      = new ProgressBar[n];
-        slotMetaViews = new TextView[n];
+        slotList.clear();
         for (int i = 0; i < n; i++) {
             LinearLayout row = new LinearLayout(this);
             row.setOrientation(LinearLayout.VERTICAL);
-            LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT);
-            rowLp.bottomMargin = dp(6);
-            slotContainer.addView(row, rowLp);
-
-            LinearLayout headRow = new LinearLayout(this);
-            headRow.setOrientation(LinearLayout.HORIZONTAL);
-            row.addView(headRow, new LinearLayout.LayoutParams(
+            slotContainer.addView(row, new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT));
 
+            LinearLayout headRow = new LinearLayout(this);
+            headRow.setOrientation(LinearLayout.HORIZONTAL);
+            headRow.setGravity(Gravity.CENTER_VERTICAL);
+            LinearLayout.LayoutParams hrLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT);
+            hrLp.topMargin = dp(5);
+            row.addView(headRow, hrLp);
+
             TextView name = new TextView(this);
-            name.setText(n > 1 ? ("#" + (i + 1) + "  待命") : "--");
+            name.setText("--");
             name.setTextColor(COLOR_TEXT);
-            name.setTextSize(TypedValue.COMPLEX_UNIT_SP, n > 4 ? 11f : 13f);
+            name.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f);
             name.setSingleLine(true);
             name.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
             headRow.addView(name, new LinearLayout.LayoutParams(
                     0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
-            TextView meta = new TextView(this);
-            meta.setText("");
-            meta.setTextColor(COLOR_SUB);
-            meta.setTextSize(TypedValue.COMPLEX_UNIT_SP, n > 4 ? 10f : 11f);
-            meta.setGravity(Gravity.END);
-            headRow.addView(meta, new LinearLayout.LayoutParams(
+            TextView speed = new TextView(this);
+            speed.setText("");
+            speed.setTextColor(COLOR_SUB);
+            speed.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f);
+            speed.setGravity(Gravity.END);
+            headRow.addView(speed, new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT));
 
@@ -994,15 +1016,26 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                     android.R.attr.progressBarStyleHorizontal);
             bar.setMax(1000);
             bar.setProgress(0);
-            tintBar(bar, false);
+            if (Build.VERSION.SDK_INT >= 21) {
+                bar.setProgressTintList(
+                        android.content.res.ColorStateList.valueOf(0x55888888));
+                bar.setProgressBackgroundTintList(
+                        android.content.res.ColorStateList.valueOf(COLOR_BAR_BG));
+            }
             LinearLayout.LayoutParams barLp = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, dp(n > 4 ? 6 : 8));
+                    ViewGroup.LayoutParams.MATCH_PARENT, dp(6));
             barLp.topMargin = dp(2);
             row.addView(bar, barLp);
 
-            slotNameViews[i] = name;
-            slotBars[i]      = bar;
-            slotMetaViews[i] = meta;
+            // 灰色分隔线
+            View divider = new View(this);
+            divider.setBackgroundColor(darkMode ? 0x22FFFFFF : 0x18000000);
+            LinearLayout.LayoutParams divLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, 1);
+            divLp.topMargin = dp(4);
+            row.addView(divider, divLp);
+
+            slotList.add(new SlotViews(name, speed, bar));
         }
     }
 
@@ -1271,6 +1304,103 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     }
 
     /**
+     * 弹对话框询问用户是否立即更新（阻塞直到用户选择）。
+     * 返回 true = 立即更新，false = 退出。
+     */
+    private boolean askUserWantsInAppUpdate(final String title, final String message) {
+        final Object   lock = new Object();
+        final boolean[] result = { false };
+        final boolean[] done   = { false };
+        ui.post(() -> {
+            View[] frame = inflateDialogFrame();
+            FrameLayout overlay = (FrameLayout) frame[0];
+            LinearLayout card   = (LinearLayout) frame[1];
+            addDialogTitle(card, title);
+            addDialogMessage(card, message + "\n\n是否立即下载并安装新版本？");
+            LinearLayout row = addDialogButtonRow(card);
+            Button exitBtn   = addDialogButton(row, "退出",   false);
+            Button updateBtn = addDialogButton(row, "立即更新", true);
+            exitBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { result[0] = false; done[0] = true; lock.notifyAll(); }
+            });
+            updateBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { result[0] = true; done[0] = true; lock.notifyAll(); }
+            });
+            overlay.setVisibility(View.VISIBLE);
+        });
+        synchronized (lock) {
+            while (!done[0]) {
+                try { lock.wait(500); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt(); return false;
+                }
+            }
+            return result[0];
+        }
+    }
+
+    /**
+     * 下载新版客户端 APK 并启动系统安装器。在工作线程调用。
+     * 下载成功后通过 UpdateProvider 把文件 URI 传给安装器，然后退出 Activity。
+     */
+    private void downloadAndInstallClientUpdate(String url) {
+        setPhase("client-update");
+        setStatus("准备下载更新…");
+        ui.post(() -> {
+            initSlots(1);
+            setSlot(0, "client_update.apk", 0, -1, 0);
+            setSlotPhase(0, "downloading");
+        });
+
+        java.io.File apkFile = UpdateProvider.getStagedApk(this);
+        if (apkFile.exists()) apkFile.delete();
+
+        Net.ProgressSink sink = new Net.ProgressSink() {
+            @Override public void onProgress(long soFar, long total, long bps) {
+                setSlot(0, null, soFar, total, bps);
+                setOverallProgress(soFar, total > 0 ? total : Math.max(soFar, 1L));
+                setAggregate(0, 1, bps);
+            }
+            @Override public boolean isCancelled() { return false; }
+        };
+
+        try {
+            log("INFO", "开始下载客户端更新: " + url);
+            Net.downloadResume(url, apkFile, -1L, 30_000, sink);
+            log("INFO", "更新 APK 下载完成，大小: " + apkFile.length() + " bytes");
+        } catch (Exception e) {
+            log("ERROR", "下载更新失败: " + e.getMessage());
+            showFatalAndExit("下载更新失败",
+                    "APK 下载过程中出错：" + e.getMessage() + "\n\n请稍后重试。");
+            return;
+        }
+
+        setSlotPhase(0, "done");
+        setStatus("正在启动安装器…");
+        log("INFO", "启动系统安装器");
+
+        ui.post(() -> {
+            try {
+                android.net.Uri apkUri = UpdateProvider.uriForStagedApk();
+                Intent it = new Intent(Intent.ACTION_VIEW);
+                it.setDataAndType(apkUri, "application/vnd.android.package-archive");
+                it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                        | Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                startActivity(it);
+            } catch (Throwable t) {
+                log("ERROR", "启动安装器失败: " + t.getMessage());
+            }
+            ui.postDelayed(() -> {
+                try { finishAndRemoveTask(); } catch (Throwable ignore) {}
+                android.os.Process.killProcess(android.os.Process.myPid());
+            }, 800);
+        });
+    }
+
+    /**
      * 阻塞型对话框：让用户在「在线下载」和「离线包」之间二选一。
      * 返回 {@link ResourceFlow#MODE_ONLINE} / {@link ResourceFlow#MODE_OFFLINE}；用户取消时返回 null。
      */
@@ -1394,8 +1524,15 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             if (url != null && !url.isEmpty()) {
                 msg = "当前客户端版本 " + ResourceFlow.BUILD_VERSION
                     + " 已不在服务端允许的版本列表内。\n\n请下载最新"
-                    + channelName + " APK 后再启动。\n\n下载地址：\n" + url;
-                showFatalAndExitWithJump("客户端需要更新", msg, "去下载", url);
+                    + channelName + " APK 后再启动。";
+                if (askUserWantsInAppUpdate("客户端需要更新", msg)) {
+                    downloadAndInstallClientUpdate(url);
+                } else {
+                    ui.post(() -> {
+                        try { finishAndRemoveTask(); } catch (Throwable ignore) {}
+                        android.os.Process.killProcess(android.os.Process.myPid());
+                    });
+                }
             } else {
                 msg = "当前客户端版本 " + ResourceFlow.BUILD_VERSION
                     + " 已不在服务端允许的版本列表内，但服务端未下发"
@@ -1824,28 +1961,54 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     public void setSlot(final int slot, final String fileName,
                         final long soFar, final long total, final long instantBps) {
         ui.post(() -> {
-            if (slotNameViews == null || slot < 0 || slot >= slotNameViews.length) return;
-            int    n      = slotNameViews.length;
-            String prefix = n > 1 ? ("#" + (slot + 1) + "  ") : "";
-            slotNameViews[slot].setText(prefix + (fileName == null ? "--" : fileName));
+            if (slotList.isEmpty() || slot < 0 || slot >= slotList.size()) return;
+            SlotViews sv = slotList.get(slot);
+            if (fileName != null) {
+                // 仅显示文件名最后一段（去掉路径前缀）
+                int slash = fileName.lastIndexOf('/');
+                String shortName = (slash >= 0 && slash < fileName.length() - 1)
+                        ? fileName.substring(slash + 1) : fileName;
+                sv.nameView.setText(shortName.isEmpty() ? fileName : shortName);
+            }
             int pct = total > 0 ? (int) Math.min(1000L, soFar * 1000L / total) : 0;
-            slotBars[slot].setProgress(pct);
-            StringBuilder meta = new StringBuilder();
-            meta.append(formatBytes(soFar));
-            if (total > 0) meta.append(" / ").append(formatBytes(total));
-            if (instantBps > 0) meta.append("  ").append(formatSpeed(instantBps));
-            slotMetaViews[slot].setText(meta.toString());
+            sv.bar.setProgress(pct);
+            sv.speedView.setText(instantBps > 0 ? formatSpeed(instantBps) : "");
         });
     }
 
     @Override
     public void clearSlot(final int slot) {
+        setSlotPhase(slot, "done");
+    }
+
+    @Override
+    public void setSlotPhase(final int slot, final String phase) {
         ui.post(() -> {
-            if (slotNameViews == null || slot < 0 || slot >= slotNameViews.length) return;
-            int n = slotNameViews.length;
-            slotNameViews[slot].setText(n > 1 ? ("#" + (slot + 1) + "  待命") : "--");
-            slotBars[slot].setProgress(0);
-            slotMetaViews[slot].setText("");
+            if (slotList.isEmpty() || slot < 0 || slot >= slotList.size()) return;
+            SlotViews sv = slotList.get(slot);
+            sv.phase = phase;
+            int color;
+            switch (phase) {
+                case "downloading": color = COLOR_ACCENT;  break;
+                case "extracting":  color = 0xFF4FC3F7;    break;  // 蓝
+                case "done":        color = 0xFF66BB6A;    break;  // 绿
+                case "failed":      color = 0xFFE53935;    break;  // 红
+                default:            color = 0x55888888;    break;  // 灰（pending）
+            }
+            if (Build.VERSION.SDK_INT >= 21) {
+                sv.bar.setProgressTintList(
+                        android.content.res.ColorStateList.valueOf(color));
+            }
+            if ("done".equals(phase)) {
+                sv.bar.setProgress(1000);
+                sv.speedView.setText("✓");
+                sv.speedView.setTextColor(0xFF66BB6A);
+            } else if ("failed".equals(phase)) {
+                sv.speedView.setText("✗");
+                sv.speedView.setTextColor(0xFFE53935);
+            } else {
+                sv.speedView.setTextColor(COLOR_SUB);
+            }
         });
     }
 
@@ -1855,11 +2018,10 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         ui.post(() -> {
             StringBuilder sb = new StringBuilder();
             if (total > 0) sb.append(completed).append(" / ").append(total).append(" 文件");
-            if (instantBpsTotal > 0) {
-                if (sb.length() > 0) sb.append("  ");
-                sb.append("合计 ").append(formatSpeed(instantBpsTotal));
-            }
             vAggregate.setText(sb.toString());
+            if (vTotalSpeed != null) {
+                vTotalSpeed.setText(instantBpsTotal > 0 ? formatSpeed(instantBpsTotal) : "");
+            }
         });
     }
 
@@ -1868,8 +2030,11 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         ui.post(() -> {
             int pct = total > 0 ? (int) Math.min(1000L, soFar * 1000L / total) : 0;
             pbOverall.setProgress(pct);
-            vOverallText.setText("整体进度  "
-                    + formatBytes(soFar) + " / " + formatBytes(total));
+            String progressText = "总进度";
+            if (total > 0) {
+                progressText += "  " + formatBytes(soFar) + " / " + formatBytes(total);
+            }
+            vOverallText.setText(progressText);
         });
     }
 

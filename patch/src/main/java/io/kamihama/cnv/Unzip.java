@@ -60,6 +60,11 @@ public final class Unzip {
          */
         void onBytes(long bytesProcessed, long bytesTotal);
 
+        /** 当前条目每写出一批字节时回调（本条目写出字节数 / 未压缩总大小，-1=未知）。 */
+        default void onEntryBytes(long written, long uncompressedSize) {}
+        /** 当前条目已全部写出时回调。 */
+        default void onEntryDone(String name) {}
+
         /** UI 端反馈是否已取消。返回 {@code true} 解压会抛 IOException。 */
         boolean isCancelled();
     }
@@ -157,18 +162,21 @@ public final class Unzip {
                 File parent = out.getParentFile();
                 if (parent != null && !parent.exists()) parent.mkdirs();
                 try (OutputStream os = new BufferedOutputStream(new FileOutputStream(out), BUF_SIZE)) {
+                    long entryWritten = 0;
                     int n;
                     while ((n = zis.read(buf)) > 0) {
                         os.write(buf, 0, n);
-                        // 节流：约 200ms 报一次字节进度
+                        entryWritten += n;
                         long now = System.nanoTime();
                         if (sink != null && now - lastProgressNs > 200_000_000L) {
                             lastProgressNs = now;
+                            sink.onEntryBytes(entryWritten, ze.getSize());
                             sink.onBytes(counter.count, totalBytesHint);
                             if (sink.isCancelled()) throw new IOException("已取消");
                         }
                     }
                 }
+                if (sink != null) sink.onEntryDone(name);
                 zis.closeEntry();
             }
         }

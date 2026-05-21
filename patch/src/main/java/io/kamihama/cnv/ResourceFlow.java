@@ -12,9 +12,11 @@ import java.io.InputStream;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -96,6 +98,12 @@ public final class ResourceFlow {
 
         /** 把第 slot 个槽位复位为"待命"状态。 */
         void clearSlot(int slot);
+
+        /**
+         * 设置指定槽位的状态阶段，驱动进度条颜色变化。
+         * @param phase "pending" | "downloading" | "extracting" | "done" | "failed"
+         */
+        void setSlotPhase(int slot, String phase);
 
         /** 更新聚合进度（已完成文件数 / 总数 + 合计速率）。 */
         void setAggregate(int completed, int total, long instantBpsTotal);
@@ -212,9 +220,14 @@ public final class ResourceFlow {
         }
         reporter.log("INFO", "清单条目数=" + entries.size());
 
+        // 4. 预建所有文件槽位（每文件固定一个，灰色待命状态）
+        reporter.initSlots(entries.size());
+        for (int pi = 0; pi < entries.size(); pi++) {
+            reporter.setSlot(pi, entries.get(pi).key, 0, entries.get(pi).size, 0);
+        }
+
         // 5. 并发数
         int concurrency = reporter.requestConcurrency(Math.min(4, mirrors.size()));
-        reporter.initSlots(concurrency);
 
         // 6. 下载所有文件
         downloadAll(entries, mirrors, dlInfo.accessToken, concurrency);
@@ -310,9 +323,6 @@ public final class ResourceFlow {
         hbThread.setDaemon(true);
         hbThread.start();
 
-        // 共享槽位 — 用 AtomicInteger 在 workers 间轮转
-        AtomicInteger nextSlot = new AtomicInteger(0);
-
         ExecutorService pool = Executors.newFixedThreadPool(concurrency, r -> {
             Thread t = new Thread(r, "cnv-dl");
             t.setDaemon(true);
@@ -334,7 +344,7 @@ public final class ResourceFlow {
                 firstErr.compareAndSet(null, new java.io.IOException("已取消"));
                 continue;
             }
-            final int slot = nextSlot.getAndIncrement() % concurrency;
+            final int slot = i;
             pool.submit(() -> {
                 try {
                     if (firstErr.get() != null || reporter.isCancelled()) return;
@@ -344,7 +354,7 @@ public final class ResourceFlow {
                     File parent = target.getParentFile();
                     if (parent != null && !parent.exists()) parent.mkdirs();
 
-                    reporter.setSlot(slot, entry.key, 0, entry.size, 0);
+                    reporter.setSlotPhase(slot, "downloading");
 
                     // 带服务端换线重试的下载循环
                     while (true) {
@@ -377,7 +387,8 @@ public final class ResourceFlow {
                             state.status = DownloadState.Status.DONE;
                             int done = completed.incrementAndGet();
                             bytesFinished.addAndGet(Math.max(0, entry.size));
-                            reporter.clearSlot(slot);
+                            reporter.setSlotPhase(slot, "done");
+                            reporter.setSlot(slot, entry.key, entry.size, entry.size, 0);
                             reporter.setAggregate(done, total, 0);
                             reporter.setOverallProgress(bytesFinished.get(), totalBytesF);
                             reporter.log("INFO", "下载完成: " + entry.key);
@@ -552,7 +563,6 @@ public final class ResourceFlow {
         reporter.setPhase("init");
         reporter.setStatus("正在上报下载方式…");
 
-        // 上报用户选择的下载方式（忽略失败）
         try {
             ClientInit.postMethodSelect(ctx, MODE_OFFLINE);
         } catch (Throwable t) {
@@ -572,8 +582,21 @@ public final class ResourceFlow {
         reporter.setStatus("正在校验 zip 格式…");
         reporter.log("INFO", "离线包 URI: " + zipUri);
 
-        // 简单校验：能打开且包含至少一个条目
         verifyZip(zipUri);
+
+        // 预扫描条目以建立槽位
+        reporter.setStatus("正在扫描 zip 条目…");
+        List<String> entryNames = scanZipEntries(zipUri);
+        final Map<String, Integer> entrySlotMap = new HashMap<>();
+        if (!entryNames.isEmpty()) {
+            reporter.initSlots(entryNames.size());
+            for (int i = 0; i < entryNames.size(); i++) {
+                reporter.setSlot(i, entryNames.get(i), 0, -1, 0);
+                entrySlotMap.put(entryNames.get(i), i);
+            }
+        } else {
+            reporter.initSlots(1);
+        }
 
         reporter.setPhase("offline-extract");
         reporter.setStatus("正在解压资源…");
@@ -585,11 +608,18 @@ public final class ResourceFlow {
             if (is == null) throw new java.io.IOException("无法打开文件流");
 
             Unzip.extractFromStream(is, destDir, totalBytes, new Unzip.ProgressSink() {
-                long idx = 0;
+                int curSlot = 0;
                 @Override public void onEntry(String name, long entryIndex, long entryTotalEstimate) {
-                    idx = entryIndex;
+                    Integer slot = entrySlotMap.get(name);
+                    curSlot = slot != null ? slot : 0;
+                    reporter.setSlotPhase(curSlot, "extracting");
                     reporter.setStatus("解压: " + name);
-                    reporter.setSlot(0, name, 0, -1, 0);
+                }
+                @Override public void onEntryBytes(long written, long uncompressedSize) {
+                    reporter.setSlot(curSlot, null, written, uncompressedSize, 0);
+                }
+                @Override public void onEntryDone(String name) {
+                    reporter.setSlotPhase(curSlot, "done");
                 }
                 @Override public void onBytes(long bytesProcessed, long bytesTotal) {
                     reporter.setOverallProgress(bytesProcessed,
@@ -605,6 +635,27 @@ public final class ResourceFlow {
         reporter.setStatus("离线资源注入完成");
         reporter.log("INFO", "离线资源解压完成，写入 ready flag");
         writeReadyFlag();
+    }
+
+    /** 预扫描 zip 条目名列表（剥离 magica/ 前缀，跳过目录条目）。 */
+    private List<String> scanZipEntries(Uri uri) {
+        List<String> names = new ArrayList<>();
+        try (InputStream is = ctx.getContentResolver().openInputStream(uri)) {
+            if (is == null) return names;
+            java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(is);
+            java.util.zip.ZipEntry ze;
+            while ((ze = zis.getNextEntry()) != null) {
+                if (!ze.isDirectory()) {
+                    String name = ze.getName();
+                    if (name.startsWith("magica/")) name = name.substring(7);
+                    if (!name.isEmpty()) names.add(name);
+                }
+                try { zis.closeEntry(); } catch (Throwable ignore) {}
+            }
+        } catch (Throwable t) {
+            reporter.log("WARN", "zip 预扫描失败（忽略）: " + t.getMessage());
+        }
+        return names;
     }
 
     private void verifyZip(Uri uri) throws java.io.IOException {
