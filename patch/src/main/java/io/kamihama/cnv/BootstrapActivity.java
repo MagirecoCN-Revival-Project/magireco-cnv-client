@@ -301,16 +301,16 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
 
-        // ── 第 1 层：毛玻璃底板（覆盖中间内容区，四角按钮区在外） ──
+        // ── 第 1 层：毛玻璃底板（居中覆盖，浮动按钮叠在上方） ──
         // 使用异步 Stack Blur 处理背景图，初次显示前先用纯色半透明占位
         GlassPanelView glassPanel = new GlassPanelView(this, COLOR_GLASS, COLOR_GLASS_STK, dp(20));
         FrameLayout.LayoutParams glassLp = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT);
-        glassLp.leftMargin  = dp(56);   // 左上角 LOG 按钮宽度
-        glassLp.rightMargin = dp(10);
-        glassLp.topMargin   = dp(52);   // 顶部按钮高度
-        glassLp.bottomMargin= dp(28);   // 底部版本文字高度
+        glassLp.leftMargin   = dp(16);
+        glassLp.rightMargin  = dp(16);
+        glassLp.topMargin    = dp(16);
+        glassLp.bottomMargin = dp(16);
         root.addView(glassPanel, glassLp);
 
         // ── 第 2 层：主内容区（横向两列） ──
@@ -594,6 +594,12 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
 
         // 日志正文（等宽字体 + 可全选）
         vLogScroll = new ScrollView(this);
+        vLogScroll.setFillViewport(true);
+        GradientDrawable logScrollBg = new GradientDrawable();
+        logScrollBg.setColor(COLOR_BAR_BG);
+        logScrollBg.setCornerRadius(dp(8));
+        vLogScroll.setBackground(logScrollBg);
+        vLogScroll.setPadding(dp(8), dp(6), dp(8), dp(6));
         panel.addView(vLogScroll, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
         vLogFull = new TextView(this);
@@ -1091,7 +1097,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private void openLogFile() {
         synchronized (logFileLock) {
             try {
-                java.io.File logFile = new java.io.File(getFilesDir(), "lastest.log");
+                java.io.File logFile = new java.io.File(getFilesDir(), "latest.log");
                 logFileWriter = new java.io.BufferedWriter(new java.io.OutputStreamWriter(
                         new java.io.FileOutputStream(logFile, false), "UTF-8"));
                 String head = "==== Magireco CNV Bootstrap 日志 (开始于 "
@@ -1131,7 +1137,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         // 资源已齐时跳过对话框，用占位值发 init（服务端不关心 ready 场景的 method 字段）
         String userMethod;
         if (alreadyReady) {
-            userMethod = ClientInit.METHOD_ONLINE;
+            userMethod = ResourceFlow.MODE_ONLINE;
         } else {
             userMethod = askDownloadMethod();
             if (userMethod == null) {
@@ -1179,7 +1185,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
 
     /**
      * 阻塞型对话框：让用户在「在线下载」和「离线包」之间二选一。
-     * 返回 METHOD_ONLINE / METHOD_OFFLINE；用户取消时返回 null。
+     * 返回 {@link ResourceFlow#MODE_ONLINE} / {@link ResourceFlow#MODE_OFFLINE}；用户取消时返回 null。
      */
     private String askDownloadMethod() {
         final Object   lock   = new Object();
@@ -1198,7 +1204,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             b.setPositiveButton("确定", (d, w) -> {
                 synchronized (lock) {
                     result[0] = which[0] == 0
-                            ? ClientInit.METHOD_ONLINE : ClientInit.METHOD_OFFLINE;
+                            ? ResourceFlow.MODE_ONLINE : ResourceFlow.MODE_OFFLINE;
                     done[0] = true;
                     lock.notifyAll();
                 }
@@ -1212,7 +1218,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             while (!done[0]) {
                 try { lock.wait(500); } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
-                    return ClientInit.METHOD_ONLINE;
+                    return ResourceFlow.MODE_ONLINE;
                 }
             }
             return result[0];
@@ -1292,6 +1298,10 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                     "服务端 init 响应里 download.mirrors / access-token 为空——"
                   + "后续 ResourceFlow 接入云端 mirrors 时可能需要在此提前拦截");
         }
+
+        // 版本伪造：将服务端下发的 fake_version / fake_name 写入 Spoof 静态缓存，
+        // NativeBridge.getAppVersion() 会优先返回该值（null = 自动退化为真实版本）
+        Spoof.set(init.fakeName, init.fakeVersion);
 
         return true;
     }
@@ -1634,7 +1644,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             logBuffer.addLast(ts);
             while (logBuffer.size() > LOG_BUFFER_MAX) logBuffer.removeFirst();
         }
-        // 同步落盘到 lastest.log
+        // 同步落盘到 latest.log
         synchronized (logFileLock) {
             if (logFileWriter != null) {
                 try {
@@ -1642,7 +1652,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                     logFileWriter.write('\n');
                     logFileWriter.flush();
                 } catch (Throwable t) {
-                    android.util.Log.w(TAG, "lastest.log 写入失败: " + t);
+                    android.util.Log.w(TAG, "latest.log 写入失败: " + t);
                 }
             }
         }

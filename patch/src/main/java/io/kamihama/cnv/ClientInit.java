@@ -16,9 +16,6 @@ import java.util.List;
  */
 public final class ClientInit {
 
-    public static final String METHOD_ONLINE  = "online";
-    public static final String METHOD_OFFLINE = "offline";
-
     public static final class Response {
         public boolean      bannedFlag;
         public String       bannedReason;
@@ -35,6 +32,10 @@ public final class ClientInit {
         public List<String> downloadMirrors       = new ArrayList<>();
         public String       downloadAccessToken;
         public String       reportApi;
+        /** 向游戏 native 层伪造的版本号；null 表示服务端未配置，退化为真实版本。 */
+        public String       fakeVersion;
+        /** 向游戏 native 层伪造的应用名；null 表示服务端未配置。 */
+        public String       fakeName;
     }
 
     /**
@@ -84,6 +85,12 @@ public final class ClientInit {
             if (mirrors != null) for (int i = 0; i < mirrors.length(); i++) r.downloadMirrors.add(mirrors.getString(i));
             r.downloadAccessToken = dl.optString("access_token", null);
             r.reportApi           = dl.optString("report_api",   null);
+        }
+
+        JSONObject spoof = obj.optJSONObject("spoof");
+        if (spoof != null) {
+            r.fakeVersion = spoof.optString("fake_version", null);
+            r.fakeName    = spoof.optString("fake_name",    null);
         }
 
         return r;
