@@ -706,13 +706,13 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         final int inner = dp(10);  // 玻璃内壁到内容的内边距
 
         // 左右两侧取平均值，保证玻璃面板水平居中
-        // rawLeft = 左侧胶囊容器（LOG + BGM）右边缘；rawRight = 功能胶囊右侧到屏幕右边缘的距离
-        int rawLeft  = vLeftPills.getRight() + gap;
+        // rawLeft 以 LOG 胶囊（非整个左侧容器）的右边缘为基准，与之前调好的状态保持一致
+        int rawLeft  = vLeftPills.getLeft() + vLogPill.getRight() + gap;
         int rawRight = rootW - vHeadRight.getRight() + gap;
         int mLeft    = (rawLeft + rawRight) / 2;
         int mRight   = mLeft;
-        // 上：顶部按钮行（左侧胶囊容器与右侧功能胶囊组）的下侧
-        int mTop    = Math.max(vLeftPills.getBottom(), vHeadRight.getBottom()) + gap;
+        // 上：顶部按钮行的下侧（取 LOG 胶囊底部与右侧功能胶囊底部的较大值）
+        int mTop    = Math.max(vLeftPills.getTop() + vLogPill.getBottom(), vHeadRight.getBottom()) + gap;
         // 下：底部版本信息的上侧（转换为从下边缘算起的距离）
         int mBottom = rootH - Math.min(vVersionLeft.getTop(), vVersionRight.getTop()) + gap;
 
