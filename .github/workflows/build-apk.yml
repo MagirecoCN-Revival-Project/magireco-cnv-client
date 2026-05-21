@@ -1,0 +1,853 @@
+name: 🏗️ 构建并发布 APK
+
+# ╔════════════════════════════════════════════════════════════════════╗
+# ║   magireco-cnv-client  ——  APK 自动构建与发布                       ║
+# ╠════════════════════════════════════════════════════════════════════╣
+# ║                                                                    ║
+# ║ 版本规则                                                            ║
+# ║ ───────                                                            ║
+# ║   ▸ 每次 push 自动触发：修订号（patch）+1，VersionCode +1           ║
+# ║   ▸ 手动触发（workflow_dispatch，不勾选特殊选项）：                  ║
+# ║       次版本号（minor）+1，修订号归零，VersionCode +1               ║
+# ║   ▸ 手动触发（勾选 bump_major）：                                   ║
+# ║       主版本号（major）+1，次版本号与修订号归零，VersionCode +1      ║
+# ║                                                                    ║
+# ║ 构建流程                                                            ║
+# ║ ───────                                                            ║
+# ║   1. 读取 GitHub Variables 中的当前版本，按规则计算新版本            ║
+# ║   2. 编译 patch/src/main/java/ 下 Java 源码 → .class               ║
+# ║   3. d8 将 .class 转换为 classes3.dex                              ║
+# ║   4. baksmali 将 DEX 反编译为 smali_classes3/（apktool 所需）       ║
+# ║   5. 更新 apktool.yml 中的 versionCode/versionName                 ║
+# ║   6. apktool b 重组 APK                                            ║
+# ║   7. zipalign + apksigner 对齐并签名                                ║
+# ║   8. 创建 GitHub Release，上传签名 APK                              ║
+# ║   9. 将新版本号保存回 GitHub Variables                              ║
+# ║                                                                    ║
+# ║ 所需 Secrets                                                        ║
+# ║ ──────────                                                         ║
+# ║   GH_TOKEN          — 有 contents:write + variables:write 权限的   ║
+# ║                        Personal Access Token                       ║
+# ║   KEYSTORE_BASE64   — base64 编码的 JKS/PKCS12 签名 keystore       ║
+# ║                        （由 gen-signing-key.yml 生成）              ║
+# ║   KEY_STORE_PASSWORD — keystore 密码                               ║
+# ║   KEY_ALIAS         — key 别名                                     ║
+# ║   KEY_PASSWORD      — key 密码                                     ║
+# ║                                                                    ║
+# ║ 所需 Variables（首次运行会自动从 4.0.0 / VersionCode=1 开始）        ║
+# ║   APK_VERSION       — 当前版本号，如 "4.0.0"                       ║
+# ║   APK_VERSION_CODE  — 当前 Android VersionCode 整数                ║
+# ║                                                                    ║
+# ╚════════════════════════════════════════════════════════════════════╝
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      bump_major:
+        description: '大版本升级（主版本号+1，次版本号与修订号归零）'
+        required: false
+        default: 'false'
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONUNBUFFERED: "1"
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+      KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+      REPO: ${{ github.repository }}
+
+    steps:
+      - name: 🛡️ 安全护栏（校验仓库白名单）
+        # 硬刹车——确保本 workflow 只在预期仓库内运行，防止 fork 或误配置
+        # 触发非预期仓库时立即 fail-fast，不向外部发送任何请求。
+        run: |
+          python3 <<'SCRIPT_END'
+          import os, sys
+
+          ALLOWED = {"MagirecoCN-Revival-Project/magireco-cnv-client"}
+          repo = os.environ.get("REPO", "")
+
+          if repo not in ALLOWED:
+              print(f"::error::仓库 {repo!r} 不在白名单中")
+              print(f"::error::允许: {sorted(ALLOWED)}")
+              print("::error::如需在其他仓库使用，请修改白名单（.github/workflows/build-apk.yml）")
+              sys.exit(1)
+
+          print(f"✔ 仓库校验通过: {repo}")
+          SCRIPT_END
+
+      - name: 📦 检出仓库
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+
+      - name: 🔢 计算新版本号
+        id: version
+        run: |
+          python3 <<'SCRIPT_END'
+          import os, sys, subprocess
+
+          sys.stdout.reconfigure(line_buffering=True)
+
+          class C:
+              RESET         = "\033[0m"
+              BOLD          = "\033[1m"
+              DIM           = "\033[2m"
+              RED           = "\033[31m"
+              BRIGHT_GREEN  = "\033[92m"
+              BRIGHT_YELLOW = "\033[93m"
+              BRIGHT_BLUE   = "\033[94m"
+              BRIGHT_CYAN   = "\033[96m"
+              BRIGHT_WHITE  = "\033[97m"
+              CYAN          = "\033[36m"
+
+          def c(color, text): return f"{color}{text}{C.RESET}"
+          def header(text):
+              bar = "═" * 60
+              print(f"\n{c(C.BOLD + C.BRIGHT_BLUE, bar)}")
+              print(c(C.BOLD + C.BRIGHT_WHITE, f"  {text}"))
+              print(f"{c(C.BOLD + C.BRIGHT_BLUE, bar)}\n", flush=True)
+          def section(text): print(f"\n{c(C.BOLD + C.CYAN, '┌─ ' + text)}", flush=True)
+          def info(t):  print(f"  {c(C.BRIGHT_BLUE,   'ℹ')} {t}", flush=True)
+          def ok(t):    print(f"  {c(C.BRIGHT_GREEN,  '✔')} {t}", flush=True)
+          def warn(t):  print(f"  {c(C.BRIGHT_YELLOW, '⚠')} {t}", flush=True)
+
+          def set_output(key, value):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write(f"{key}={value}\n")
+
+          def gh_var_get(name, default=""):
+              r = subprocess.run(
+                  ["gh", "variable", "get", name, "--repo", os.environ["REPO"]],
+                  capture_output=True, text=True
+              )
+              return r.stdout.strip() if r.returncode == 0 else default
+
+          header("计算新版本号")
+
+          event_name = os.environ.get("GITHUB_EVENT_NAME", "push")
+          bump_major = os.environ.get("INPUT_BUMP_MAJOR", "false").lower() == "true"
+
+          section("读取当前版本（GitHub Variables）")
+          cur_version = gh_var_get("APK_VERSION", "4.0.0")
+          cur_code    = int(gh_var_get("APK_VERSION_CODE", "1"))
+          info(f"当前版本:  {c(C.BRIGHT_CYAN, cur_version)}")
+          info(f"当前 VersionCode: {c(C.BRIGHT_CYAN, str(cur_code))}")
+
+          parts = cur_version.split(".")
+          if len(parts) != 3 or not all(p.isdigit() for p in parts):
+              warn(f"版本格式异常 '{cur_version}'，重置为 4.0.0")
+              parts = ["4", "0", "0"]
+          major, minor, patch = int(parts[0]), int(parts[1]), int(parts[2])
+
+          section("计算版本增量")
+          if event_name == "push":
+              patch += 1
+              mode = "patch +1（自动构建·push 触发）"
+          elif bump_major:
+              major += 1
+              minor  = 0
+              patch  = 0
+              mode   = "major +1（手动大版本升级）"
+          else:
+              minor += 1
+              patch  = 0
+              mode   = "minor +1（手动构建）"
+
+          new_code    = cur_code + 1
+          new_version = f"{major}.{minor}.{patch}"
+          tag_name    = f"v{new_version}"
+          apk_name    = f"magireco-cn-{tag_name}.apk"
+
+          ok(f"升级模式:   {mode}")
+          ok(f"新版本号:   {c(C.BRIGHT_GREEN, new_version)}")
+          ok(f"新 VersionCode: {c(C.BRIGHT_GREEN, str(new_code))}")
+          ok(f"Release 标签:   {c(C.BRIGHT_GREEN, tag_name)}")
+          ok(f"APK 文件名:     {c(C.BRIGHT_GREEN, apk_name)}")
+
+          set_output("new_version", new_version)
+          set_output("new_code",    str(new_code))
+          set_output("tag_name",    tag_name)
+          set_output("apk_name",    apk_name)
+          SCRIPT_END
+        env:
+          INPUT_BUMP_MAJOR: ${{ inputs.bump_major }}
+
+      - name: ☕ 设置 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: 🔧 安装构建工具（apktool / baksmali / SDK）
+        id: tools
+        run: |
+          python3 <<'SCRIPT_END'
+          import subprocess, os, sys, urllib.request, glob
+
+          sys.stdout.reconfigure(line_buffering=True)
+
+          class C:
+              RESET         = "\033[0m"
+              BOLD          = "\033[1m"
+              DIM           = "\033[2m"
+              RED           = "\033[31m"
+              BRIGHT_GREEN  = "\033[92m"
+              BRIGHT_YELLOW = "\033[93m"
+              BRIGHT_BLUE   = "\033[94m"
+              BRIGHT_CYAN   = "\033[96m"
+              BRIGHT_WHITE  = "\033[97m"
+              CYAN          = "\033[36m"
+
+          def c(color, text): return f"{color}{text}{C.RESET}"
+          def header(text):
+              bar = "═" * 60
+              print(f"\n{c(C.BOLD + C.BRIGHT_BLUE, bar)}")
+              print(c(C.BOLD + C.BRIGHT_WHITE, f"  {text}"))
+              print(f"{c(C.BOLD + C.BRIGHT_BLUE, bar)}\n", flush=True)
+          def section(text): print(f"\n{c(C.BOLD + C.CYAN, '┌─ ' + text)}", flush=True)
+          def info(t):  print(f"  {c(C.BRIGHT_BLUE,   'ℹ')} {t}", flush=True)
+          def ok(t):    print(f"  {c(C.BRIGHT_GREEN,  '✔')} {t}", flush=True)
+          def warn(t):  print(f"  {c(C.BRIGHT_YELLOW, '⚠')} {t}", flush=True)
+          def err(t):   print(f"  {c(C.RED,           '✘')} {t}", flush=True)
+
+          def set_output(key, value):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write(f"{key}={value}\n")
+
+          def run(cmd, **kw):
+              r = subprocess.run(cmd, shell=True, capture_output=True, text=True, **kw)
+              if r.returncode != 0:
+                  err(f"命令失败: {cmd}")
+                  err(r.stderr.strip())
+                  sys.exit(1)
+              return r.stdout.strip()
+
+          header("安装构建工具")
+
+          # ── apktool 2.9.3 ────────────────────────────────────────────
+          section("下载 apktool 2.9.3")
+          APKTOOL_JAR = "/usr/local/bin/apktool.jar"
+          APKTOOL_URL = (
+              "https://github.com/iBotPeaches/Apktool/releases/download"
+              "/v2.9.3/apktool_2.9.3.jar"
+          )
+          urllib.request.urlretrieve(APKTOOL_URL, APKTOOL_JAR)
+          with open("/usr/local/bin/apktool", "w") as f:
+              f.write("#!/bin/bash\nexec java -jar /usr/local/bin/apktool.jar \"$@\"\n")
+          run("chmod +x /usr/local/bin/apktool")
+          ok("apktool 2.9.3 已安装")
+
+          # ── baksmali 2.5.2 ───────────────────────────────────────────
+          section("下载 baksmali 2.5.2")
+          BAKSMALI_JAR = "/usr/local/bin/baksmali.jar"
+          BAKSMALI_URL = (
+              "https://github.com/JesusFreke/smali/releases/download"
+              "/v2.5.2/baksmali-2.5.2.jar"
+          )
+          urllib.request.urlretrieve(BAKSMALI_URL, BAKSMALI_JAR)
+          with open("/usr/local/bin/baksmali", "w") as f:
+              f.write("#!/bin/bash\nexec java -jar /usr/local/bin/baksmali.jar \"$@\"\n")
+          run("chmod +x /usr/local/bin/baksmali")
+          ok("baksmali 2.5.2 已安装")
+
+          # ── Android SDK：build-tools（d8 / apksigner / zipalign）────
+          section("定位 Android SDK build-tools")
+          android_home = os.environ.get("ANDROID_HOME", "/usr/local/lib/android/sdk")
+          info(f"ANDROID_HOME: {android_home}")
+
+          bt_dirs = sorted(glob.glob(f"{android_home}/build-tools/*/"), reverse=True)
+          if not bt_dirs:
+              warn("未找到 build-tools，尝试通过 sdkmanager 安装 34.0.0 ...")
+              sdkmanager = (
+                  f"{android_home}/cmdline-tools/latest/bin/sdkmanager"
+              )
+              run(f'yes | "{sdkmanager}" "build-tools;34.0.0" > /dev/null')
+              bt_dirs = sorted(glob.glob(f"{android_home}/build-tools/*/"), reverse=True)
+
+          bt_dir = bt_dirs[0].rstrip("/")
+          ok(f"build-tools 路径: {bt_dir}")
+
+          # ── Android SDK：platforms（android.jar）────────────────────
+          section("定位 android.jar")
+          plat_dirs = sorted(glob.glob(f"{android_home}/platforms/android-*/"), reverse=True)
+          if not plat_dirs:
+              warn("未找到 platforms，尝试安装 android-34 ...")
+              sdkmanager = (
+                  f"{android_home}/cmdline-tools/latest/bin/sdkmanager"
+              )
+              run(f'yes | "{sdkmanager}" "platforms;android-34" > /dev/null')
+              plat_dirs = sorted(glob.glob(f"{android_home}/platforms/android-*/"), reverse=True)
+
+          android_jar = plat_dirs[0].rstrip("/") + "/android.jar"
+          if not os.path.exists(android_jar):
+              err(f"android.jar 不存在: {android_jar}")
+              sys.exit(1)
+          ok(f"android.jar: {android_jar}")
+
+          set_output("bt_dir",      bt_dir)
+          set_output("android_jar", android_jar)
+
+          # ── OkHttp3 编译期依赖（仅编译用，运行时由现有 DEX 提供）──────
+          section("下载 OkHttp3 编译依赖（Maven Central）")
+          os.makedirs("/tmp/compile_deps", exist_ok=True)
+          deps = {
+              "okhttp-3.12.13.jar": (
+                  "https://repo1.maven.org/maven2/com/squareup/okhttp3"
+                  "/okhttp/3.12.13/okhttp-3.12.13.jar"
+              ),
+              "okio-1.17.5.jar": (
+                  "https://repo1.maven.org/maven2/com/squareup/okio"
+                  "/okio/1.17.5/okio-1.17.5.jar"
+              ),
+          }
+          for name, url in deps.items():
+              urllib.request.urlretrieve(url, f"/tmp/compile_deps/{name}")
+              ok(f"已下载: {name}")
+
+          SCRIPT_END
+
+      - name: ☕ 编译 Java 补丁源码
+        run: |
+          python3 <<'SCRIPT_END'
+          import subprocess, os, sys, glob
+
+          sys.stdout.reconfigure(line_buffering=True)
+
+          class C:
+              RESET         = "\033[0m"
+              BOLD          = "\033[1m"
+              RED           = "\033[31m"
+              BRIGHT_GREEN  = "\033[92m"
+              BRIGHT_YELLOW = "\033[93m"
+              BRIGHT_BLUE   = "\033[94m"
+              BRIGHT_WHITE  = "\033[97m"
+              CYAN          = "\033[36m"
+
+          def c(color, text): return f"{color}{text}{C.RESET}"
+          def header(text):
+              bar = "═" * 60
+              print(f"\n{c(C.BOLD + C.BRIGHT_BLUE, bar)}")
+              print(c(C.BOLD + C.BRIGHT_WHITE, f"  {text}"))
+              print(f"{c(C.BOLD + C.BRIGHT_BLUE, bar)}\n", flush=True)
+          def section(text): print(f"\n{c(C.BOLD + C.CYAN, '┌─ ' + text)}", flush=True)
+          def info(t):  print(f"  {c(C.BRIGHT_BLUE,  'ℹ')} {t}", flush=True)
+          def ok(t):    print(f"  {c(C.BRIGHT_GREEN, '✔')} {t}", flush=True)
+          def err(t):   print(f"  {c(C.RED,          '✘')} {t}", flush=True)
+
+          def run(cmd, **kw):
+              r = subprocess.run(cmd, shell=True, capture_output=True, text=True, **kw)
+              if r.returncode != 0:
+                  err(f"编译失败")
+                  print(r.stdout)
+                  print(r.stderr)
+                  sys.exit(1)
+              return r.stdout.strip()
+
+          header("编译 Java 补丁源码")
+
+          android_jar = os.environ["ANDROID_JAR"]
+          src_dir     = "patch/src/main/java"
+          out_dir     = "/tmp/patch_classes"
+          os.makedirs(out_dir, exist_ok=True)
+
+          deps_jars = ":".join(sorted(glob.glob("/tmp/compile_deps/*.jar")))
+          classpath  = f"{android_jar}:{deps_jars}"
+
+          java_files = sorted(glob.glob(f"{src_dir}/**/*.java", recursive=True))
+          section(f"发现 {len(java_files)} 个 .java 源文件")
+          for jf in java_files:
+              info(jf)
+
+          if not java_files:
+              err(f"在 {src_dir} 下未找到任何 .java 文件")
+              sys.exit(1)
+
+          section("运行 javac（source/target 8，兼容 Android minSdk 21）")
+          files_arg = " ".join(f'"{jf}"' for jf in java_files)
+          run(
+              f'javac -source 8 -target 8 '
+              f'-cp "{classpath}" '
+              f'-d "{out_dir}" '
+              f'-Xlint:none '
+              f'{files_arg}'
+          )
+
+          class_files = glob.glob(f"{out_dir}/**/*.class", recursive=True)
+          ok(f"编译成功，生成 {len(class_files)} 个 .class 文件")
+          SCRIPT_END
+        env:
+          ANDROID_JAR: ${{ steps.tools.outputs.android_jar }}
+
+      - name: 📦 将 .class 转换为 classes3.dex（d8）
+        run: |
+          python3 <<'SCRIPT_END'
+          import subprocess, os, sys, glob, shutil
+
+          sys.stdout.reconfigure(line_buffering=True)
+
+          class C:
+              RESET         = "\033[0m"
+              BOLD          = "\033[1m"
+              RED           = "\033[31m"
+              BRIGHT_GREEN  = "\033[92m"
+              BRIGHT_BLUE   = "\033[94m"
+              BRIGHT_WHITE  = "\033[97m"
+              CYAN          = "\033[36m"
+
+          def c(color, text): return f"{color}{text}{C.RESET}"
+          def header(text):
+              bar = "═" * 60
+              print(f"\n{c(C.BOLD + C.BRIGHT_BLUE, bar)}")
+              print(c(C.BOLD + C.BRIGHT_WHITE, f"  {text}"))
+              print(f"{c(C.BOLD + C.BRIGHT_BLUE, bar)}\n", flush=True)
+          def section(text): print(f"\n{c(C.BOLD + C.CYAN, '┌─ ' + text)}", flush=True)
+          def info(t):  print(f"  {c(C.BRIGHT_BLUE,  'ℹ')} {t}", flush=True)
+          def ok(t):    print(f"  {c(C.BRIGHT_GREEN, '✔')} {t}", flush=True)
+          def err(t):   print(f"  {c(C.RED,          '✘')} {t}", flush=True)
+
+          def run(cmd, **kw):
+              r = subprocess.run(cmd, shell=True, capture_output=True, text=True, **kw)
+              if r.returncode != 0:
+                  err(f"命令失败: {cmd}")
+                  print(r.stderr)
+                  sys.exit(1)
+              return r.stdout.strip()
+
+          header("生成 classes3.dex（d8）")
+
+          bt_dir      = os.environ["BT_DIR"]
+          class_dir   = "/tmp/patch_classes"
+          dex_out_dir = "/tmp/dex_out"
+          dex_final   = "/tmp/classes3.dex"
+
+          class_files = sorted(glob.glob(f"{class_dir}/**/*.class", recursive=True))
+          section(f"待转换 .class 文件：{len(class_files)} 个")
+
+          os.makedirs(dex_out_dir, exist_ok=True)
+          files_arg = " ".join(f'"{cf}"' for cf in class_files)
+
+          section("运行 d8（--min-api 21 匹配 minSdkVersion）")
+          run(
+              f'"{bt_dir}/d8" '
+              f'--output "{dex_out_dir}" '
+              f'--min-api 21 '
+              f'{files_arg}'
+          )
+
+          # d8 输出目录中固定产生 classes.dex，重命名为 classes3.dex
+          shutil.move(f"{dex_out_dir}/classes.dex", dex_final)
+          ok(f"生成: {dex_final}（{os.path.getsize(dex_final):,} bytes）")
+          SCRIPT_END
+        env:
+          BT_DIR: ${{ steps.tools.outputs.bt_dir }}
+
+      - name: 🔍 反编译 DEX 为 smali_classes3/（baksmali）
+        run: |
+          python3 <<'SCRIPT_END'
+          import subprocess, os, sys, shutil, glob
+
+          sys.stdout.reconfigure(line_buffering=True)
+
+          class C:
+              RESET         = "\033[0m"
+              BOLD          = "\033[1m"
+              RED           = "\033[31m"
+              BRIGHT_GREEN  = "\033[92m"
+              BRIGHT_BLUE   = "\033[94m"
+              BRIGHT_WHITE  = "\033[97m"
+              CYAN          = "\033[36m"
+
+          def c(color, text): return f"{color}{text}{C.RESET}"
+          def header(text):
+              bar = "═" * 60
+              print(f"\n{c(C.BOLD + C.BRIGHT_BLUE, bar)}")
+              print(c(C.BOLD + C.BRIGHT_WHITE, f"  {text}"))
+              print(f"{c(C.BOLD + C.BRIGHT_BLUE, bar)}\n", flush=True)
+          def section(text): print(f"\n{c(C.BOLD + C.CYAN, '┌─ ' + text)}", flush=True)
+          def info(t):  print(f"  {c(C.BRIGHT_BLUE,  'ℹ')} {t}", flush=True)
+          def ok(t):    print(f"  {c(C.BRIGHT_GREEN, '✔')} {t}", flush=True)
+          def err(t):   print(f"  {c(C.RED,          '✘')} {t}", flush=True)
+
+          def run(cmd, **kw):
+              r = subprocess.run(cmd, shell=True, capture_output=True, text=True, **kw)
+              if r.returncode != 0:
+                  err(f"命令失败: {cmd}")
+                  print(r.stderr)
+                  sys.exit(1)
+              return r.stdout.strip()
+
+          header("反编译 DEX → smali_classes3/（供 apktool 构建）")
+
+          dex_file  = "/tmp/classes3.dex"
+          smali_tmp = "/tmp/smali_classes3_tmp"
+          smali_dst = "smali_classes3"
+
+          section("运行 baksmali")
+          if os.path.exists(smali_tmp):
+              shutil.rmtree(smali_tmp)
+          run(f"baksmali d {dex_file} -o {smali_tmp}")
+
+          smali_files = glob.glob(f"{smali_tmp}/**/*.smali", recursive=True)
+          ok(f"反编译完成，生成 {len(smali_files)} 个 .smali 文件")
+
+          section("同步到工作区 smali_classes3/")
+          if os.path.exists(smali_dst):
+              shutil.rmtree(smali_dst)
+          shutil.copytree(smali_tmp, smali_dst)
+          ok(f"smali_classes3/ 已更新（{len(smali_files)} 个文件）")
+          for f in sorted(smali_files)[:5]:
+              info(f.replace(smali_tmp + "/", ""))
+          if len(smali_files) > 5:
+              info(f"... 共 {len(smali_files)} 个")
+          SCRIPT_END
+
+      - name: ✏️ 更新 apktool.yml 版本信息
+        run: |
+          python3 <<'SCRIPT_END'
+          import re, os, sys
+
+          sys.stdout.reconfigure(line_buffering=True)
+
+          class C:
+              RESET         = "\033[0m"
+              BOLD          = "\033[1m"
+              RED           = "\033[31m"
+              BRIGHT_GREEN  = "\033[92m"
+              BRIGHT_BLUE   = "\033[94m"
+              BRIGHT_WHITE  = "\033[97m"
+              CYAN          = "\033[36m"
+
+          def c(color, text): return f"{color}{text}{C.RESET}"
+          def header(text):
+              bar = "═" * 60
+              print(f"\n{c(C.BOLD + C.BRIGHT_BLUE, bar)}")
+              print(c(C.BOLD + C.BRIGHT_WHITE, f"  {text}"))
+              print(f"{c(C.BOLD + C.BRIGHT_BLUE, bar)}\n", flush=True)
+          def info(t): print(f"  {c(C.BRIGHT_BLUE,  'ℹ')} {t}", flush=True)
+          def ok(t):   print(f"  {c(C.BRIGHT_GREEN, '✔')} {t}", flush=True)
+          def err(t):  print(f"  {c(C.RED,          '✘')} {t}", flush=True)
+
+          header("更新 apktool.yml 版本信息")
+
+          new_version = os.environ["NEW_VERSION"]
+          new_code    = os.environ["NEW_CODE"]
+
+          with open("apktool.yml", "r", encoding="utf-8") as f:
+              content = f.read()
+
+          info(f"注入 versionCode  = {new_code}")
+          info(f"注入 versionName  = {new_version}")
+
+          content = re.sub(r'(versionCode:\s*).*', rf'\g<1>{new_code}',    content)
+          content = re.sub(r'(versionName:\s*).*', rf'\g<1>{new_version}', content)
+
+          with open("apktool.yml", "w", encoding="utf-8") as f:
+              f.write(content)
+
+          ok("apktool.yml 已更新")
+          SCRIPT_END
+        env:
+          NEW_VERSION: ${{ steps.version.outputs.new_version }}
+          NEW_CODE:    ${{ steps.version.outputs.new_code }}
+
+      - name: 🔨 重组 APK（apktool b）
+        run: |
+          python3 <<'SCRIPT_END'
+          import subprocess, os, sys
+
+          sys.stdout.reconfigure(line_buffering=True)
+
+          class C:
+              RESET         = "\033[0m"
+              BOLD          = "\033[1m"
+              RED           = "\033[31m"
+              BRIGHT_GREEN  = "\033[92m"
+              BRIGHT_BLUE   = "\033[94m"
+              BRIGHT_WHITE  = "\033[97m"
+              CYAN          = "\033[36m"
+
+          def c(color, text): return f"{color}{text}{C.RESET}"
+          def header(text):
+              bar = "═" * 60
+              print(f"\n{c(C.BOLD + C.BRIGHT_BLUE, bar)}")
+              print(c(C.BOLD + C.BRIGHT_WHITE, f"  {text}"))
+              print(f"{c(C.BOLD + C.BRIGHT_BLUE, bar)}\n", flush=True)
+          def section(text): print(f"\n{c(C.BOLD + C.CYAN, '┌─ ' + text)}", flush=True)
+          def ok(t):   print(f"  {c(C.BRIGHT_GREEN, '✔')} {t}", flush=True)
+          def err(t):  print(f"  {c(C.RED,          '✘')} {t}", flush=True)
+
+          def run(cmd, **kw):
+              r = subprocess.run(cmd, shell=True, text=True, **kw)
+              if r.returncode != 0:
+                  err(f"命令失败: {cmd}")
+                  sys.exit(1)
+              return r
+
+          header("重组 APK（apktool b）")
+          os.makedirs("build", exist_ok=True)
+
+          section("运行 apktool b")
+          run("apktool b . -o build/modified.apk")
+
+          size = os.path.getsize("build/modified.apk")
+          ok(f"APK 构建完成: build/modified.apk（{size:,} bytes）")
+          SCRIPT_END
+
+      - name: 📐 对齐 APK（zipalign）
+        run: |
+          "${{ steps.tools.outputs.bt_dir }}/zipalign" -v -p 4 \
+            build/modified.apk build/aligned.apk
+          echo "zipalign 完成: build/aligned.apk"
+
+      - name: 🔏 签名 APK（apksigner）
+        id: sign
+        run: |
+          python3 <<'SCRIPT_END'
+          import subprocess, os, sys, base64
+
+          sys.stdout.reconfigure(line_buffering=True)
+
+          class C:
+              RESET         = "\033[0m"
+              BOLD          = "\033[1m"
+              RED           = "\033[31m"
+              BRIGHT_GREEN  = "\033[92m"
+              BRIGHT_YELLOW = "\033[93m"
+              BRIGHT_BLUE   = "\033[94m"
+              BRIGHT_WHITE  = "\033[97m"
+              CYAN          = "\033[36m"
+
+          def c(color, text): return f"{color}{text}{C.RESET}"
+          def header(text):
+              bar = "═" * 60
+              print(f"\n{c(C.BOLD + C.BRIGHT_BLUE, bar)}")
+              print(c(C.BOLD + C.BRIGHT_WHITE, f"  {text}"))
+              print(f"{c(C.BOLD + C.BRIGHT_BLUE, bar)}\n", flush=True)
+          def section(text): print(f"\n{c(C.BOLD + C.CYAN, '┌─ ' + text)}", flush=True)
+          def info(t):  print(f"  {c(C.BRIGHT_BLUE,   'ℹ')} {t}", flush=True)
+          def ok(t):    print(f"  {c(C.BRIGHT_GREEN,  '✔')} {t}", flush=True)
+          def warn(t):  print(f"  {c(C.BRIGHT_YELLOW, '⚠')} {t}", flush=True)
+          def err(t):   print(f"  {c(C.RED,           '✘')} {t}", flush=True)
+
+          def set_output(key, value):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write(f"{key}={value}\n")
+
+          def run(cmd, **kw):
+              r = subprocess.run(cmd, shell=True, capture_output=True, text=True, **kw)
+              if r.returncode != 0:
+                  err(f"命令失败: {cmd}")
+                  err(r.stderr.strip())
+                  sys.exit(1)
+              return r.stdout.strip()
+
+          header("签名 APK（apksigner）")
+
+          bt_dir   = os.environ["BT_DIR"]
+          apk_name = os.environ["APK_NAME"]
+          ks_b64   = os.environ.get("KEYSTORE_BASE64", "")
+          ks_pass  = os.environ.get("KEY_STORE_PASSWORD", "")
+          k_alias  = os.environ.get("KEY_ALIAS", "")
+          k_pass   = os.environ.get("KEY_PASSWORD", "")
+
+          if not ks_b64.strip():
+              warn("未配置 KEYSTORE_BASE64 secret，跳过签名步骤")
+              warn("请先运行 gen-signing-key.yml 生成签名密钥，再配置 Secrets")
+              set_output("signed_apk", "")
+              sys.exit(0)
+
+          section("解码 keystore")
+          ks_path = "/tmp/release.keystore"
+          with open(ks_path, "wb") as f:
+              f.write(base64.b64decode(ks_b64))
+          info(f"keystore 已写入: {ks_path}（{os.path.getsize(ks_path):,} bytes）")
+
+          section("运行 apksigner")
+          signed_apk = f"build/{apk_name}"
+          run(
+              f'"{bt_dir}/apksigner" sign '
+              f'--ks "{ks_path}" '
+              f'--ks-pass "pass:{ks_pass}" '
+              f'--ks-key-alias "{k_alias}" '
+              f'--key-pass "pass:{k_pass}" '
+              f'--out "{signed_apk}" '
+              f'build/aligned.apk'
+          )
+
+          ok(f"签名完成: {signed_apk}（{os.path.getsize(signed_apk):,} bytes）")
+          set_output("signed_apk", signed_apk)
+          SCRIPT_END
+        env:
+          BT_DIR:             ${{ steps.tools.outputs.bt_dir }}
+          APK_NAME:           ${{ steps.version.outputs.apk_name }}
+          KEYSTORE_BASE64:    ${{ secrets.KEYSTORE_BASE64 }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_ALIAS:          ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD:       ${{ secrets.KEY_PASSWORD }}
+
+      - name: 🚀 发布到 GitHub Release
+        if: steps.sign.outputs.signed_apk != ''
+        run: |
+          python3 <<'SCRIPT_END'
+          import subprocess, os, sys
+
+          sys.stdout.reconfigure(line_buffering=True)
+
+          class C:
+              RESET         = "\033[0m"
+              BOLD          = "\033[1m"
+              RED           = "\033[31m"
+              BRIGHT_GREEN  = "\033[92m"
+              BRIGHT_YELLOW = "\033[93m"
+              BRIGHT_BLUE   = "\033[94m"
+              BRIGHT_WHITE  = "\033[97m"
+              CYAN          = "\033[36m"
+
+          def c(color, text): return f"{color}{text}{C.RESET}"
+          def header(text):
+              bar = "═" * 60
+              print(f"\n{c(C.BOLD + C.BRIGHT_BLUE, bar)}")
+              print(c(C.BOLD + C.BRIGHT_WHITE, f"  {text}"))
+              print(f"{c(C.BOLD + C.BRIGHT_BLUE, bar)}\n", flush=True)
+          def section(text): print(f"\n{c(C.BOLD + C.CYAN, '┌─ ' + text)}", flush=True)
+          def info(t):  print(f"  {c(C.BRIGHT_BLUE,   'ℹ')} {t}", flush=True)
+          def ok(t):    print(f"  {c(C.BRIGHT_GREEN,  '✔')} {t}", flush=True)
+          def warn(t):  print(f"  {c(C.BRIGHT_YELLOW, '⚠')} {t}", flush=True)
+          def err(t):   print(f"  {c(C.RED,           '✘')} {t}", flush=True)
+
+          def run(cmd, **kw):
+              r = subprocess.run(cmd, shell=True, capture_output=True, text=True, **kw)
+              return r
+
+          header("发布到 GitHub Release")
+
+          tag_name    = os.environ["TAG_NAME"]
+          new_version = os.environ["NEW_VERSION"]
+          new_code    = os.environ["NEW_CODE"]
+          apk_name    = os.environ["APK_NAME"]
+          signed_apk  = os.environ["SIGNED_APK"]
+          repo        = os.environ["REPO"]
+          event_name  = os.environ.get("GITHUB_EVENT_NAME", "push")
+          bump_major  = os.environ.get("INPUT_BUMP_MAJOR", "false").lower() == "true"
+          commit_sha  = os.environ.get("GITHUB_SHA", "unknown")[:7]
+
+          if event_name == "push":
+              trigger_note = "自动构建（push 触发）"
+          elif bump_major:
+              trigger_note = "手动大版本升级"
+          else:
+              trigger_note = "手动构建"
+
+          release_notes = "\n".join([
+              f"## 魔法纪录：Magia☆Record（国内加速版）{new_version}",
+              "",
+              f"| 字段 | 值 |",
+              f"|------|-----|",
+              f"| 版本号 | `{new_version}` |",
+              f"| VersionCode | `{new_code}` |",
+              f"| 构建方式 | {trigger_note} |",
+              f"| 源码提交 | `{commit_sha}` |",
+              "",
+              "### 安装说明",
+              f"1. 下载 `{apk_name}` 并安装到 Android 设备",
+              "2. 首次启动将自动下载国服资源（请确保网络畅通）",
+              "3. 资源下载完成后即可正常游戏",
+          ])
+
+          section(f"创建 Release {tag_name}")
+          r = run(
+              f'gh release create "{tag_name}" '
+              f'--title "魔法纪录CN {new_version}" '
+              f'--notes \'{release_notes}\' '
+              f'--repo "{repo}"'
+          )
+          if r.returncode != 0:
+              if "already exists" in r.stderr or "already_exists" in r.stderr:
+                  warn(f"Release {tag_name} 已存在，仅上传新 APK")
+              else:
+                  err(f"创建 Release 失败:\n{r.stderr}")
+                  sys.exit(1)
+          else:
+              ok(f"Release {tag_name} 已创建")
+
+          section(f"上传 APK：{apk_name}")
+          r = run(
+              f'gh release upload "{tag_name}" "{signed_apk}" '
+              f'--clobber '
+              f'--repo "{repo}"'
+          )
+          if r.returncode != 0:
+              err(f"上传 APK 失败:\n{r.stderr}")
+              sys.exit(1)
+          ok(f"APK 上传完成: {apk_name}")
+          SCRIPT_END
+        env:
+          TAG_NAME:         ${{ steps.version.outputs.tag_name }}
+          NEW_VERSION:      ${{ steps.version.outputs.new_version }}
+          NEW_CODE:         ${{ steps.version.outputs.new_code }}
+          APK_NAME:         ${{ steps.version.outputs.apk_name }}
+          SIGNED_APK:       ${{ steps.sign.outputs.signed_apk }}
+          INPUT_BUMP_MAJOR: ${{ inputs.bump_major }}
+
+      - name: 💾 保存新版本号到 GitHub Variables
+        if: steps.sign.outputs.signed_apk != ''
+        run: |
+          python3 <<'SCRIPT_END'
+          import subprocess, os, sys
+
+          sys.stdout.reconfigure(line_buffering=True)
+
+          class C:
+              RESET         = "\033[0m"
+              BOLD          = "\033[1m"
+              RED           = "\033[31m"
+              BRIGHT_GREEN  = "\033[92m"
+              BRIGHT_BLUE   = "\033[94m"
+              BRIGHT_WHITE  = "\033[97m"
+              CYAN          = "\033[36m"
+
+          def c(color, text): return f"{color}{text}{C.RESET}"
+          def header(text):
+              bar = "═" * 60
+              print(f"\n{c(C.BOLD + C.BRIGHT_BLUE, bar)}")
+              print(c(C.BOLD + C.BRIGHT_WHITE, f"  {text}"))
+              print(f"{c(C.BOLD + C.BRIGHT_BLUE, bar)}\n", flush=True)
+          def ok(t):  print(f"  {c(C.BRIGHT_GREEN, '✔')} {t}", flush=True)
+          def err(t): print(f"  {c(C.RED,          '✘')} {t}", flush=True)
+
+          def run(cmd, **kw):
+              r = subprocess.run(cmd, shell=True, capture_output=True, text=True, **kw)
+              if r.returncode != 0:
+                  err(f"命令失败: {cmd}\n{r.stderr.strip()}")
+                  sys.exit(1)
+              return r.stdout.strip()
+
+          header("保存版本号到 GitHub Variables")
+
+          repo        = os.environ["REPO"]
+          new_version = os.environ["NEW_VERSION"]
+          new_code    = os.environ["NEW_CODE"]
+
+          run(f'gh variable set APK_VERSION      --body "{new_version}" --repo "{repo}"')
+          run(f'gh variable set APK_VERSION_CODE --body "{new_code}"    --repo "{repo}"')
+
+          ok(f"APK_VERSION      → {new_version}")
+          ok(f"APK_VERSION_CODE → {new_code}")
+          SCRIPT_END
+        env:
+          NEW_VERSION: ${{ steps.version.outputs.new_version }}
+          NEW_CODE:    ${{ steps.version.outputs.new_code }}
