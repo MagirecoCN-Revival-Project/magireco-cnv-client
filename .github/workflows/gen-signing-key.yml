@@ -38,12 +38,7 @@ on:
         default: 'android'
         type: string
       store_password:
-        description: 'Keystore 密码（KEY_STORE_PASSWORD）— 留空则自动生成 32 位强密码'
-        required: false
-        default: ''
-        type: string
-      key_password:
-        description: 'Key 密码（KEY_PASSWORD）— 留空则自动生成 32 位强密码（可与上方相同）'
+        description: 'Keystore 与 Key 共用密码（KEY_STORE_PASSWORD / KEY_PASSWORD）— 留空则自动生成 32 位强密码'
         required: false
         default: ''
         type: string
@@ -112,7 +107,6 @@ jobs:
 
           alias       = os.environ.get("INPUT_KEY_ALIAS", "").strip()
           ks_pass     = os.environ.get("INPUT_STORE_PASSWORD", "").strip()
-          key_pass    = os.environ.get("INPUT_KEY_PASSWORD", "").strip()
           validity    = os.environ.get("INPUT_VALIDITY_YEARS", "27").strip()
           dn          = os.environ.get("INPUT_DISTINGUISHED_NAME", "").strip()
           auto_save   = os.environ.get("INPUT_AUTO_SAVE_SECRETS", "false").lower() == "true"
@@ -140,20 +134,12 @@ jobs:
 
           section("密码参数")
           if not ks_pass:
-              info("store_password 未填写 → 将自动生成 32 位强密码")
+              info("store_password 未填写 → 将自动生成 32 位强密码（Keystore 与 Key 共用）")
           elif len(ks_pass) < 6:
               err(f"store_password 长度不足 6 位（当前 {len(ks_pass)} 位）")
               failed = True
           else:
-              ok(f"store_password: 已提供（{'*' * len(ks_pass)}）")
-
-          if not key_pass:
-              info("key_password 未填写 → 将自动生成 32 位强密码")
-          elif len(key_pass) < 6:
-              err(f"key_password 长度不足 6 位（当前 {len(key_pass)} 位）")
-              failed = True
-          else:
-              ok(f"key_password: 已提供（{'*' * len(key_pass)}）")
+              ok(f"store_password: 已提供（{'*' * len(ks_pass)}），Keystore 与 Key 共用此密码")
 
           section("自动写入 Secrets")
           if auto_save:
@@ -174,7 +160,6 @@ jobs:
         env:
           INPUT_KEY_ALIAS:           ${{ inputs.key_alias }}
           INPUT_STORE_PASSWORD:      ${{ inputs.store_password }}
-          INPUT_KEY_PASSWORD:        ${{ inputs.key_password }}
           INPUT_VALIDITY_YEARS:      ${{ inputs.validity_years }}
           INPUT_DISTINGUISHED_NAME:  ${{ inputs.distinguished_name }}
           INPUT_AUTO_SAVE_SECRETS:   ${{ inputs.auto_save_secrets }}
@@ -238,25 +223,21 @@ jobs:
 
           alias      = os.environ["INPUT_KEY_ALIAS"].strip()
           ks_pass    = os.environ.get("INPUT_STORE_PASSWORD", "").strip()
-          key_pass   = os.environ.get("INPUT_KEY_PASSWORD", "").strip()
           validity_y = int(os.environ.get("INPUT_VALIDITY_YEARS", "27").strip())
           dn         = os.environ["INPUT_DISTINGUISHED_NAME"].strip()
           ks_path    = "/tmp/release.keystore"
           validity_d = validity_y * 365
 
-          # ── 密码处理：留空则自动生成 ──────────────────────────────────
+          # ── 密码处理：Keystore 与 Key 共用同一密码，留空则自动生成 ──────
           section("密码处理")
           if not ks_pass:
               ks_pass = gen_strong_password()
-              ok(f"store_password 已自动生成（32 位强密码）: {c(C.BRIGHT_CYAN, ks_pass)}")
+              ok(f"密码已自动生成（32 位强密码）: {c(C.BRIGHT_CYAN, ks_pass)}")
           else:
-              ok(f"store_password: 使用用户提供值（{'*' * len(ks_pass)}）")
-
-          if not key_pass:
-              key_pass = gen_strong_password()
-              ok(f"key_password   已自动生成（32 位强密码）: {c(C.BRIGHT_CYAN, key_pass)}")
-          else:
-              ok(f"key_password:  使用用户提供值（{'*' * len(key_pass)}）")
+              ok(f"密码: 使用用户提供值（{'*' * len(ks_pass)}）")
+          # Keystore 密码与 Key 密码必须相同，统一使用 ks_pass
+          key_pass = ks_pass
+          info("KEY_PASSWORD = KEY_STORE_PASSWORD（Android 要求两者一致）")
 
           # ── keytool 生成密钥对 ────────────────────────────────────────
           section("运行 keytool 生成 RSA-2048 密钥对")
@@ -299,7 +280,6 @@ jobs:
         env:
           INPUT_KEY_ALIAS:          ${{ inputs.key_alias }}
           INPUT_STORE_PASSWORD:     ${{ inputs.store_password }}
-          INPUT_KEY_PASSWORD:       ${{ inputs.key_password }}
           INPUT_VALIDITY_YEARS:     ${{ inputs.validity_years }}
           INPUT_DISTINGUISHED_NAME: ${{ inputs.distinguished_name }}
 
@@ -428,8 +408,7 @@ jobs:
           section("密钥信息")
           ok(f"Keystore 大小:  {ks_size} bytes")
           ok(f"Key 别名:       {ks_alias}")
-          ok(f"KEY_STORE_PASSWORD: {c(C.BRIGHT_CYAN, ks_pass)}")
-          ok(f"KEY_PASSWORD:       {c(C.BRIGHT_CYAN, key_pass)}")
+          ok(f"共用密码（KEY_STORE_PASSWORD = KEY_PASSWORD）: {c(C.BRIGHT_CYAN, ks_pass)}")
           ok(f"目标仓库:       {repo}")
 
           if auto_saved:
@@ -496,7 +475,7 @@ jobs:
                   f"| `KEYSTORE_BASE64` | 下方 Base64 内容（完整复制） |\n"
                   f"| `KEY_STORE_PASSWORD` | `{ks_pass}` |\n"
                   f"| `KEY_ALIAS` | `{ks_alias}` |\n"
-                  f"| `KEY_PASSWORD` | `{key_pass}` |\n"
+                  f"| `KEY_PASSWORD` | `{ks_pass}`（与 KEY_STORE_PASSWORD 相同） |\n"
               )
 
           lines = [
@@ -508,8 +487,7 @@ jobs:
               f"|------|-----|",
               f"| Key 别名 | `{ks_alias}` |",
               f"| Keystore 大小 | {ks_size} bytes |",
-              f"| KEY_STORE_PASSWORD | `{ks_pass}` |",
-              f"| KEY_PASSWORD | `{key_pass}` |",
+              f"| 共用密码（KEY_STORE_PASSWORD = KEY_PASSWORD） | `{ks_pass}` |",
               f"| 目标仓库 | `{repo}` |",
               "",
               "### Secrets 配置",
