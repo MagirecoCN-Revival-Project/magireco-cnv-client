@@ -16,9 +16,6 @@ import java.util.List;
  */
 public final class ClientInit {
 
-    public static final String METHOD_ONLINE  = "online";
-    public static final String METHOD_OFFLINE = "offline";
-
     public static final class Response {
         public boolean      bannedFlag;
         public String       bannedReason;

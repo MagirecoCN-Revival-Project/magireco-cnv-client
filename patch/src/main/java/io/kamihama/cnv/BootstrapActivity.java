@@ -1137,7 +1137,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         // 资源已齐时跳过对话框，用占位值发 init（服务端不关心 ready 场景的 method 字段）
         String userMethod;
         if (alreadyReady) {
-            userMethod = ClientInit.METHOD_ONLINE;
+            userMethod = ResourceFlow.MODE_ONLINE;
         } else {
             userMethod = askDownloadMethod();
             if (userMethod == null) {
@@ -1185,7 +1185,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
 
     /**
      * 阻塞型对话框：让用户在「在线下载」和「离线包」之间二选一。
-     * 返回 METHOD_ONLINE / METHOD_OFFLINE；用户取消时返回 null。
+     * 返回 {@link ResourceFlow#MODE_ONLINE} / {@link ResourceFlow#MODE_OFFLINE}；用户取消时返回 null。
      */
     private String askDownloadMethod() {
         final Object   lock   = new Object();
@@ -1204,7 +1204,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             b.setPositiveButton("确定", (d, w) -> {
                 synchronized (lock) {
                     result[0] = which[0] == 0
-                            ? ClientInit.METHOD_ONLINE : ClientInit.METHOD_OFFLINE;
+                            ? ResourceFlow.MODE_ONLINE : ResourceFlow.MODE_OFFLINE;
                     done[0] = true;
                     lock.notifyAll();
                 }
@@ -1218,7 +1218,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             while (!done[0]) {
                 try { lock.wait(500); } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
-                    return ClientInit.METHOD_ONLINE;
+                    return ResourceFlow.MODE_ONLINE;
                 }
             }
             return result[0];
