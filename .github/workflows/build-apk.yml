@@ -92,7 +92,7 @@ jobs:
       - name: 📦 检出仓库
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GH_TOKEN }}
+          token: ${{ secrets.GH_TOKEN || github.token }}
 
       - name: 🔢 计算新版本号
         id: version
