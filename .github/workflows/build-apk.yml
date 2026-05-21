@@ -721,14 +721,54 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 安装 vgmstream-cli 与 ffmpeg
+          # 安装 ffmpeg
           sudo apt-get install -y ffmpeg > /dev/null 2>&1
 
-          # 从 GitHub Releases 下载最新 vgmstream-cli
-          VGMS_URL="https://github.com/vgmstream/vgmstream/releases/latest/download/vgmstream-linux-cli.tar.gz"
-          curl -fsSL "$VGMS_URL" -o /tmp/vgmstream.tar.gz
-          tar -xzf /tmp/vgmstream.tar.gz -C /tmp
-          VGMS_BIN="$(find /tmp -name 'vgmstream-cli' -type f | head -1)"
+          # 通过 GitHub releases API 动态获取 vgmstream 最新 Linux CLI 资产链接
+          # （不硬编码文件名，避免发布者改名后 404）
+          echo "[vgmstream] 查询最新 release..."
+          curl -fsSL "https://api.github.com/repos/vgmstream/vgmstream/releases/latest" \
+              -o /tmp/vgms_release.json
+
+          VGMS_URL=$(python3 << 'PYEOF'
+import json, sys
+with open('/tmp/vgms_release.json') as f:
+    data = json.load(f)
+for asset in data.get('assets', []):
+    name = asset['name'].lower()
+    if 'linux' in name and name.endswith('.tar.gz') and '.sig' not in name:
+        print(asset['browser_download_url'])
+        sys.exit(0)
+# 找不到 tar.gz，尝试 zip
+for asset in data.get('assets', []):
+    name = asset['name'].lower()
+    if 'linux' in name and name.endswith('.zip') and '.sig' not in name:
+        print(asset['browser_download_url'])
+        sys.exit(0)
+PYEOF
+          )
+
+          if [ -z "$VGMS_URL" ]; then
+            echo "::warning::找不到 vgmstream Linux release 资产，跳过 HCA 转换"
+            exit 0
+          fi
+
+          echo "[vgmstream] 下载: $VGMS_URL"
+          curl -fsSL "$VGMS_URL" -o /tmp/vgmstream_pkg
+
+          # 自动判断压缩格式解包
+          if echo "$VGMS_URL" | grep -q '\.zip$'; then
+            unzip -o /tmp/vgmstream_pkg -d /tmp/vgmstream_dir
+          else
+            mkdir -p /tmp/vgmstream_dir
+            tar -xzf /tmp/vgmstream_pkg -C /tmp/vgmstream_dir
+          fi
+
+          VGMS_BIN="$(find /tmp/vgmstream_dir -name 'vgmstream-cli' -type f | head -1)"
+          if [ -z "$VGMS_BIN" ]; then
+            echo "::warning::解包后找不到 vgmstream-cli 可执行文件，跳过 HCA 转换"
+            exit 0
+          fi
           chmod +x "$VGMS_BIN"
           echo "[vgmstream] 使用: $VGMS_BIN"
 
