@@ -855,11 +855,15 @@ jobs:
               "3. 资源下载完成后即可正常游戏",
           ])
 
-          section(f"创建 Release {tag_name}")
+          # push 自动触发 → Pre-release；手动触发 → 正式 Release
+          prerelease_flag = "--prerelease" if event_name == "push" else ""
+
+          section(f"创建 Release {tag_name}{'（预发布）' if prerelease_flag else '（正式发布）'}")
           r = run(
               f'gh release create "{tag_name}" '
               f'--title "魔法纪录CN {new_version}" '
               f'--notes \'{release_notes}\' '
+              f'{prerelease_flag} '
               f'--repo "{repo}"'
           )
           if r.returncode != 0:
@@ -883,6 +887,8 @@ jobs:
           ok(f"APK 上传完成: {apk_name}")
           SCRIPT_END
         env:
+          # 覆盖 job 级 GH_TOKEN，强制以 github-actions[bot] 身份发布 Release
+          GH_TOKEN:         ${{ github.token }}
           TAG_NAME:         ${{ steps.version.outputs.tag_name }}
           NEW_VERSION:      ${{ steps.version.outputs.new_version }}
           NEW_CODE:         ${{ steps.version.outputs.new_code }}
