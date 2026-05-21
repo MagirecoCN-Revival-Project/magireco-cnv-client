@@ -594,6 +594,12 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
 
         // 日志正文（等宽字体 + 可全选）
         vLogScroll = new ScrollView(this);
+        vLogScroll.setFillViewport(true);
+        GradientDrawable logScrollBg = new GradientDrawable();
+        logScrollBg.setColor(COLOR_BAR_BG);
+        logScrollBg.setCornerRadius(dp(8));
+        vLogScroll.setBackground(logScrollBg);
+        vLogScroll.setPadding(dp(8), dp(6), dp(8), dp(6));
         panel.addView(vLogScroll, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
         vLogFull = new TextView(this);
