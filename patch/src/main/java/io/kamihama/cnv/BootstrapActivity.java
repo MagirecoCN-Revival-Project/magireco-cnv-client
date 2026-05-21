@@ -1199,16 +1199,23 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             }
         }
 
-        // 第 0c 步：与云端 /client/init 握手（封禁 / 维护 / 版本闸门）
+        // 第 0c 步：检查本地封禁记录（心跳写入，早于 init 网络请求）
+        BanInfo localBan = BanInfo.load(this);
+        if (localBan != null && localBan.isActive()) {
+            showFatalAndExit("账号已被封禁", localBan.buildMessage());
+            return;
+        }
+
+        // 第 0d 步：与云端 /client/init 握手（封禁 / 维护 / 版本闸门）
         if (!handleCloudInit()) return;
 
-        // 第 0d 步：资源已齐则直接启动游戏
+        // 第 0e 步：资源已齐则直接启动游戏
         if (alreadyReady) {
             ui.post(this::launchGame);
             return;
         }
 
-        // 第 0e 步：启动资源下载流程
+        // 第 0f 步：启动资源下载流程
         try {
             new ResourceFlow(this, this, userMethod).run();
         } catch (ResourceFlow.FatalConfigException fce) {
