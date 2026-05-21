@@ -1,5 +1,5 @@
 version: 2.9.3
-apkFileName: totentanz.apk
+apkFileName: modified.apk
 isFrameworkApk: false
 usesFramework:
   ids:
@@ -42,7 +42,7 @@ unknownFiles:
   com/android/vending/billing/IInAppBillingService.aidl: 8
 doNotCompress:
 - resources.arsc
-- png
-- jpg
 - assets/dexopt/baseline.prof
 - assets/dexopt/baseline.profm
+- png
+- jpg
