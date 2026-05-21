@@ -677,8 +677,9 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         int mLeft   = vLogPill.getRight() + gap;
         // 上：顶部按钮行（LOG 胶囊与功能胶囊组）的下侧
         int mTop    = Math.max(vLogPill.getBottom(), vHeadRight.getBottom()) + gap;
-        // 右：右侧功能胶囊组的左侧（转换为从右边缘算起的距离）
-        int mRight  = rootW - vHeadRight.getLeft() + gap;
+        // 右：右侧功能胶囊组的右侧到屏幕右边缘的距离（胶囊组已由 mTop 在垂直方向避开，
+        // 此处只需留出胶囊组本身的右侧边距，不应以胶囊组左侧为基准，否则会大幅压缩玻璃宽度）
+        int mRight  = rootW - vHeadRight.getRight() + gap;
         // 下：底部版本信息的上侧（转换为从下边缘算起的距离）
         int mBottom = rootH - Math.min(vVersionLeft.getTop(), vVersionRight.getTop()) + gap;
 
