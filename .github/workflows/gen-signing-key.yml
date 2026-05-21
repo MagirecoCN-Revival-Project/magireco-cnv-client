@@ -229,12 +229,14 @@ jobs:
           validity_d = validity_y * 365
 
           # ── 密码处理：Keystore 与 Key 共用同一密码，留空则自动生成 ──────
+          # 安全原则：密码绝不写入控制台日志，只通过加密 GITHUB_OUTPUT 传递给后续步骤，
+          # 最终仅在 Job Summary 中呈现（受 GitHub 访问控制保护）。
           section("密码处理")
           if not ks_pass:
               ks_pass = gen_strong_password()
-              ok(f"密码已自动生成（32 位强密码）: {c(C.BRIGHT_CYAN, ks_pass)}")
+              ok("密码已自动生成（32 位强密码）——不在日志中显示，仅写入 Job Summary")
           else:
-              ok(f"密码: 使用用户提供值（{'*' * len(ks_pass)}）")
+              ok(f"密码: 使用用户提供值（长度 {len(ks_pass)} 位）——不在日志中回显")
           # Keystore 密码与 Key 密码必须相同，统一使用 ks_pass
           key_pass = ks_pass
           info("KEY_PASSWORD = KEY_STORE_PASSWORD（Android 要求两者一致）")
@@ -365,7 +367,8 @@ jobs:
           KS_ALIAS: ${{ steps.keygen.outputs.ks_alias }}
           KEY_PASS: ${{ steps.keygen.outputs.key_pass }}
 
-      - name: 📋 输出配置说明（日志）
+      - name: 📋 生成完成（非敏感信息汇总）
+        # 日志中只打印非敏感信息；密码和 keystore 内容仅写入 Job Summary。
         run: |
           python3 <<'SCRIPT_END'
           import os, sys
@@ -375,12 +378,10 @@ jobs:
           class C:
               RESET         = "\033[0m"
               BOLD          = "\033[1m"
-              DIM           = "\033[2m"
               RED           = "\033[31m"
               BRIGHT_GREEN  = "\033[92m"
               BRIGHT_YELLOW = "\033[93m"
               BRIGHT_BLUE   = "\033[94m"
-              BRIGHT_CYAN   = "\033[96m"
               BRIGHT_WHITE  = "\033[97m"
               CYAN          = "\033[36m"
 
@@ -390,57 +391,26 @@ jobs:
               print(f"\n{c(C.BOLD + C.BRIGHT_BLUE, bar)}")
               print(c(C.BOLD + C.BRIGHT_WHITE, f"  {text}"))
               print(f"{c(C.BOLD + C.BRIGHT_BLUE, bar)}\n", flush=True)
-          def section(text): print(f"\n{c(C.BOLD + C.CYAN, '┌─ ' + text)}", flush=True)
-          def info(t):  print(f"  {c(C.BRIGHT_BLUE,   'ℹ')} {t}", flush=True)
-          def ok(t):    print(f"  {c(C.BRIGHT_GREEN,  '✔')} {t}", flush=True)
-          def warn(t):  print(f"  {c(C.BRIGHT_YELLOW, '⚠')} {t}", flush=True)
+          def ok(t):   print(f"  {c(C.BRIGHT_GREEN,  '✔')} {t}", flush=True)
+          def warn(t): print(f"  {c(C.BRIGHT_YELLOW, '⚠')} {t}", flush=True)
 
-          header("生成结果汇总")
+          header("Keystore 生成完成")
 
-          ks_b64      = os.environ["KS_B64"]
-          ks_alias    = os.environ["KS_ALIAS"]
-          ks_pass     = os.environ["KS_PASS"]
-          key_pass    = os.environ["KEY_PASS"]
-          ks_size     = os.environ["KS_SIZE"]
-          repo        = os.environ.get("REPO", "")
-          auto_saved  = os.environ.get("INPUT_AUTO_SAVE_SECRETS", "false").lower() == "true"
+          ks_alias   = os.environ["KS_ALIAS"]
+          ks_size    = os.environ["KS_SIZE"]
+          auto_saved = os.environ.get("INPUT_AUTO_SAVE_SECRETS", "false").lower() == "true"
 
-          section("密钥信息")
-          ok(f"Keystore 大小:  {ks_size} bytes")
-          ok(f"Key 别名:       {ks_alias}")
-          ok(f"共用密码（KEY_STORE_PASSWORD = KEY_PASSWORD）: {c(C.BRIGHT_CYAN, ks_pass)}")
-          ok(f"目标仓库:       {repo}")
+          ok(f"Key 别名:      {ks_alias}")
+          ok(f"Keystore 大小: {ks_size} bytes")
 
           if auto_saved:
-              section("Secrets 状态")
               ok("所有 4 个 Secret 已自动写入仓库，build-apk.yml 可立即使用")
           else:
-              section("手动配置步骤")
-              info("前往 Settings → Secrets and variables → Actions → Secrets，添加：")
-              print(flush=True)
-              secrets = [
-                  ("KEYSTORE_BASE64",    "<见下方 Base64 内容>",  "Base64 编码的 Keystore 文件"),
-                  ("KEY_STORE_PASSWORD", ks_pass,                 "Keystore 密码（已在上方显示）"),
-                  ("KEY_ALIAS",          ks_alias,                "Key 别名"),
-                  ("KEY_PASSWORD",       key_pass,                "Key 密码（已在上方显示）"),
-              ]
-              for name, hint, desc in secrets:
-                  print(f"  {c(C.BOLD + C.BRIGHT_WHITE, name)}")
-                  print(f"    值:  {c(C.BRIGHT_CYAN, hint)}")
-                  print(f"    说明: {c(C.DIM, desc)}", flush=True)
-
-          section("KEYSTORE_BASE64 内容（完整复制，不含多余空白）")
-          print(flush=True)
-          print(ks_b64)
-          print(flush=True)
-
-          warn("密钥是不可逆签名凭证，一旦丢失将无法为同一 App 发布更新，请务必备份！")
+              warn("Secrets 尚未配置——密码和 Keystore 内容已写入 Job Summary（受 GitHub 访问控制保护）")
+              warn("完成 Secrets 配置后，建议删除本次 workflow 运行记录以减少敏感信息暴露时间")
           SCRIPT_END
         env:
-          KS_B64:                  ${{ steps.keygen.outputs.ks_b64 }}
           KS_ALIAS:                ${{ steps.keygen.outputs.ks_alias }}
-          KS_PASS:                 ${{ steps.keygen.outputs.ks_pass }}
-          KEY_PASS:                ${{ steps.keygen.outputs.key_pass }}
           KS_SIZE:                 ${{ steps.keygen.outputs.ks_size }}
           INPUT_AUTO_SAVE_SECRETS: ${{ inputs.auto_save_secrets }}
 
@@ -449,59 +419,76 @@ jobs:
           python3 <<'SCRIPT_END'
           import os
 
-          ks_b64      = os.environ["KS_B64"]
-          ks_alias    = os.environ["KS_ALIAS"]
-          ks_pass     = os.environ["KS_PASS"]
-          key_pass    = os.environ["KEY_PASS"]
-          ks_size     = os.environ["KS_SIZE"]
-          repo        = os.environ.get("REPO", "")
-          auto_saved  = os.environ.get("INPUT_AUTO_SAVE_SECRETS", "false").lower() == "true"
-          summary_f   = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null")
+          ks_b64     = os.environ["KS_B64"]
+          ks_alias   = os.environ["KS_ALIAS"]
+          ks_pass    = os.environ["KS_PASS"]
+          ks_size    = os.environ["KS_SIZE"]
+          repo       = os.environ.get("REPO", "")
+          auto_saved = os.environ.get("INPUT_AUTO_SAVE_SECRETS", "false").lower() == "true"
+          summary_f  = os.environ["GITHUB_STEP_SUMMARY"]
 
           if auto_saved:
-              secrets_note = (
-                  "✅ **所有 Secret 已自动写入仓库**，`build-apk.yml` 可立即使用。\n\n"
-                  "以下 4 个 Secret 已配置完成：\n"
-                  "- `KEYSTORE_BASE64`\n"
-                  "- `KEY_STORE_PASSWORD`\n"
-                  "- `KEY_ALIAS`\n"
-                  "- `KEY_PASSWORD`\n"
-              )
+              # 所有敏感值已加密存入 GitHub Secrets，Summary 中不再展示
+              secrets_section = "\n".join([
+                  "### ✅ Secrets 已自动写入",
+                  "",
+                  "以下 4 个 Secret 已写入仓库，`build-apk.yml` 可立即使用：",
+                  "",
+                  "| Secret 名称 | 状态 |",
+                  "|-------------|------|",
+                  "| `KEYSTORE_BASE64` | ✅ 已写入 |",
+                  "| `KEY_STORE_PASSWORD` | ✅ 已写入 |",
+                  "| `KEY_ALIAS` | ✅ 已写入 |",
+                  "| `KEY_PASSWORD` | ✅ 已写入 |",
+                  "",
+                  "> 密码和 Keystore 内容已加密存储，不在 Summary 中展示。",
+                  "> **请务必在安全位置备份 Keystore 文件**——若 Secret 被误删且无备份，将无法继续为该 App 签名。",
+              ])
+              keystore_section = ""
           else:
-              secrets_note = (
-                  "⚠️ **需手动配置 Secrets**（Settings → Secrets and variables → Actions → Secrets）：\n\n"
-                  "| Secret 名称 | 值 |\n"
-                  "|-------------|-----|\n"
-                  f"| `KEYSTORE_BASE64` | 下方 Base64 内容（完整复制） |\n"
-                  f"| `KEY_STORE_PASSWORD` | `{ks_pass}` |\n"
-                  f"| `KEY_ALIAS` | `{ks_alias}` |\n"
-                  f"| `KEY_PASSWORD` | `{ks_pass}`（与 KEY_STORE_PASSWORD 相同） |\n"
-              )
+              # 未自动写入：Summary 是唯一安全展示通道（受 GitHub 登录保护）
+              secrets_section = "\n".join([
+                  "### ⚠️ 需手动配置 Secrets",
+                  "",
+                  "前往 **Settings → Secrets and variables → Actions → New repository secret**，",
+                  "依次添加以下 4 个 Secret：",
+                  "",
+                  "| Secret 名称 | 值 |",
+                  "|-------------|-----|",
+                  f"| `KEYSTORE_BASE64` | 见下方「Keystore 内容」代码块 |",
+                  f"| `KEY_STORE_PASSWORD` | `{ks_pass}` |",
+                  f"| `KEY_ALIAS` | `{ks_alias}` |",
+                  f"| `KEY_PASSWORD` | `{ks_pass}` |",
+                  "",
+                  "> ⚠️ **安全提示**：配置完成后，请删除本次 workflow 运行记录",
+                  "> （Actions → 本次运行 → ··· → Delete workflow run），",
+                  "> 减少敏感信息在 GitHub UI 中的暴露时间。",
+              ])
+              keystore_section = "\n".join([
+                  "",
+                  "### Keystore 内容（KEYSTORE_BASE64）",
+                  "",
+                  "```",
+                  ks_b64,
+                  "```",
+                  "",
+                  "> **重要**：请将以上 Base64 内容备份到安全位置（密码管理器或离线存储）。",
+                  "> 密钥一旦丢失，将无法为同一 App 发布后续更新。",
+              ])
 
           lines = [
               "## 🔑 APK 签名 Keystore 已生成",
               "",
-              "### 密钥信息",
+              "### 基本信息",
               "",
-              f"| 字段 | 值 |",
-              f"|------|-----|",
+              "| 字段 | 值 |",
+              "|------|-----|",
               f"| Key 别名 | `{ks_alias}` |",
               f"| Keystore 大小 | {ks_size} bytes |",
-              f"| 共用密码（KEY_STORE_PASSWORD = KEY_PASSWORD） | `{ks_pass}` |",
               f"| 目标仓库 | `{repo}` |",
               "",
-              "### Secrets 配置",
-              "",
-              secrets_note,
-              "",
-              "### KEYSTORE_BASE64 内容",
-              "",
-              "```",
-              ks_b64,
-              "```",
-              "",
-              "> ⚠️ **重要**：请将以上 Base64 内容备份到安全位置。",
-              "> 密钥一旦丢失，将无法为同一 App 发布后续更新。",
+              secrets_section,
+              keystore_section,
           ]
 
           with open(summary_f, "w", encoding="utf-8") as f:
@@ -511,6 +498,5 @@ jobs:
           KS_B64:                  ${{ steps.keygen.outputs.ks_b64 }}
           KS_ALIAS:                ${{ steps.keygen.outputs.ks_alias }}
           KS_PASS:                 ${{ steps.keygen.outputs.ks_pass }}
-          KEY_PASS:                ${{ steps.keygen.outputs.key_pass }}
           KS_SIZE:                 ${{ steps.keygen.outputs.ks_size }}
           INPUT_AUTO_SAVE_SECRETS: ${{ inputs.auto_save_secrets }}
