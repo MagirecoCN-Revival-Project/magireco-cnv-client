@@ -251,18 +251,21 @@ jobs:
           run("chmod +x /usr/local/bin/apktool")
           ok("apktool 2.9.3 已安装")
 
-          # ── baksmali 2.5.2 ───────────────────────────────────────────
-          section("下载 baksmali 2.5.2")
+          # ── baksmali 3.0.9（Google 官方 fork，不带 v 前缀的 tag）────────
+          # 原 JesusFreke/smali repo 已无 Release；
+          # baksmali/smali 是 Google 维护的延续版本，tag 格式为 "3.0.9"（无 v）。
+          # URL 已通过 curl -I HTTP 302 实测验证。
+          section("下载 baksmali 3.0.9")
           BAKSMALI_JAR = "/usr/local/bin/baksmali.jar"
           BAKSMALI_URL = (
-              "https://github.com/JesusFreke/smali/releases/download"
-              "/v2.5.2/baksmali-2.5.2.jar"
+              "https://github.com/baksmali/smali/releases/download"
+              "/3.0.9/baksmali-3.0.9-fat-release.jar"
           )
           urllib.request.urlretrieve(BAKSMALI_URL, BAKSMALI_JAR)
           with open("/usr/local/bin/baksmali", "w") as f:
               f.write("#!/bin/bash\nexec java -jar /usr/local/bin/baksmali.jar \"$@\"\n")
           run("chmod +x /usr/local/bin/baksmali")
-          ok("baksmali 2.5.2 已安装")
+          ok("baksmali 3.0.9 已安装")
 
           # ── Android SDK：build-tools（d8 / apksigner / zipalign）────
           section("定位 Android SDK build-tools")
