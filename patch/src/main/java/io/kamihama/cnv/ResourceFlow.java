@@ -3,12 +3,18 @@ package io.kamihama.cnv;
 import android.content.Context;
 import android.net.Uri;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -265,7 +271,7 @@ public final class ResourceFlow {
         }
     }
 
-    /** 多线程并发下载所有条目。 */
+    /** 多线程并发下载所有条目，同时启动心跳线程向服务端汇报进度。 */
     private void downloadAll(List<S3List.Entry> entries,
                              List<String> mirrors,
                              String token,
@@ -279,8 +285,22 @@ public final class ResourceFlow {
         AtomicInteger completed     = new AtomicInteger(0);
         AtomicLong    bytesFinished = new AtomicLong(0L);
         AtomicLong    instantBpsAll = new AtomicLong(0L);
-        AtomicInteger mirrorIdx     = new AtomicInteger(0);
         AtomicReference<Exception> firstErr = new AtomicReference<>(null);
+
+        // 每个文件的下载状态（心跳读取；download worker 写入）
+        ConcurrentHashMap<String, DownloadState> fileStates = new ConcurrentHashMap<>();
+        String defaultMirror = mirrors.get(0);
+        for (S3List.Entry e : entries) {
+            fileStates.put(e.key, new DownloadState(e.key, defaultMirror));
+        }
+
+        // 启动心跳线程
+        String deviceId;
+        try { deviceId = DeviceId.get(ctx); } catch (Throwable t) { deviceId = ""; }
+        HeartbeatSender hb = new HeartbeatSender(fileStates, deviceId);
+        Thread hbThread = new Thread(hb, "cnv-heartbeat");
+        hbThread.setDaemon(true);
+        hbThread.start();
 
         // 共享槽位 — 用 AtomicInteger 在 workers 间轮转
         AtomicInteger nextSlot = new AtomicInteger(0);
@@ -291,16 +311,13 @@ public final class ResourceFlow {
             return t;
         });
 
-        // 每个条目对应一个独立 Future；pool 以 concurrency 限制并发。
-        // 用 BlockingQueue + semaphore-style submit 保证不超过 concurrency 个同时在飞。
         java.util.concurrent.Semaphore sem = new java.util.concurrent.Semaphore(concurrency);
         CountDownLatch latch = new CountDownLatch(total);
 
         for (int i = 0; i < total; i++) {
             final S3List.Entry entry = entries.get(i);
-            // 如果已经出错，把剩余任务的 latch 全部减掉后退出
             if (firstErr.get() != null || reporter.isCancelled()) {
-                latch.countDown();   // for this entry
+                latch.countDown();
                 continue;
             }
             try { sem.acquire(); } catch (InterruptedException ie) {
@@ -314,34 +331,64 @@ public final class ResourceFlow {
                 try {
                     if (firstErr.get() != null || reporter.isCancelled()) return;
 
-                    int mi = mirrorIdx.get() % mirrors.size();
-                    String baseUrl = mirrors.get(mi);
-                    String fileUrl = (baseUrl.endsWith("/") ? baseUrl : baseUrl + "/") + entry.key;
-
+                    DownloadState state = fileStates.get(entry.key);
                     File target = new File(destDir, entry.key);
                     File parent = target.getParentFile();
                     if (parent != null && !parent.exists()) parent.mkdirs();
 
                     reporter.setSlot(slot, entry.key, 0, entry.size, 0);
 
-                    Net.ProgressSink sink = new Net.ProgressSink() {
-                        @Override public void onProgress(long soFar, long total2, long bps) {
-                            reporter.setSlot(slot, entry.key, soFar, total2, bps);
-                            instantBpsAll.set(bps);
-                            reporter.setOverallProgress(bytesFinished.get() + soFar, totalBytesF);
-                            reporter.setAggregate(completed.get(), total, instantBpsAll.get());
+                    // 带服务端换线重试的下载循环
+                    while (true) {
+                        if (firstErr.get() != null || reporter.isCancelled()) return;
+                        state.status = DownloadState.Status.DOWNLOADING;
+
+                        String baseUrl = state.currentMirror;
+                        String fileUrl = (baseUrl.endsWith("/") ? baseUrl : baseUrl + "/") + entry.key;
+
+                        try {
+                            Net.ProgressSink sink = new Net.ProgressSink() {
+                                @Override public void onProgress(long soFar, long total2, long bps) {
+                                    state.soFar = soFar;
+                                    state.total = total2 > 0 ? total2 : entry.size;
+                                    state.bps   = bps;
+                                    reporter.setSlot(slot, entry.key, soFar, total2, bps);
+                                    instantBpsAll.set(bps);
+                                    reporter.setOverallProgress(
+                                            bytesFinished.get() + soFar, totalBytesF);
+                                    reporter.setAggregate(
+                                            completed.get(), total, instantBpsAll.get());
+                                }
+                                @Override public boolean isCancelled() {
+                                    return reporter.isCancelled() || state.switchPending;
+                                }
+                            };
+                            Net.downloadResume(fileUrl, target, entry.size, 15_000, sink);
+
+                            // 下载成功
+                            state.status = DownloadState.Status.DONE;
+                            int done = completed.incrementAndGet();
+                            bytesFinished.addAndGet(Math.max(0, entry.size));
+                            reporter.clearSlot(slot);
+                            reporter.setAggregate(done, total, 0);
+                            reporter.setOverallProgress(bytesFinished.get(), totalBytesF);
+                            reporter.log("INFO", "下载完成: " + entry.key);
+                            break;
+
+                        } catch (java.io.IOException ioEx) {
+                            if (state.switchPending && !reporter.isCancelled()) {
+                                // 服务端心跳触发换线：清标志，用新镜像重试
+                                state.switchPending = false;
+                                reporter.log("INFO",
+                                        "心跳换线: " + entry.key + " → " + state.currentMirror);
+                                // 继续 while 循环，用更新后的 currentMirror 重试
+                            } else {
+                                // 真实网络错误或用户取消
+                                state.status = DownloadState.Status.FAILED;
+                                throw ioEx;
+                            }
                         }
-                        @Override public boolean isCancelled() { return reporter.isCancelled(); }
-                    };
-
-                    Net.downloadResume(fileUrl, target, entry.size, 15_000, sink);
-
-                    int done = completed.incrementAndGet();
-                    bytesFinished.addAndGet(Math.max(0, entry.size));
-                    reporter.clearSlot(slot);
-                    reporter.setAggregate(done, total, 0);
-                    reporter.setOverallProgress(bytesFinished.get(), totalBytesF);
-                    reporter.log("INFO", "下载完成: " + entry.key);
+                    }
                 } catch (Exception e) {
                     if (!reporter.isCancelled()) {
                         reporter.log("WARN", "下载失败(" + entry.key + "): " + e.getMessage());
@@ -349,7 +396,8 @@ public final class ResourceFlow {
                     firstErr.compareAndSet(null,
                             reporter.isCancelled()
                                     ? new java.io.IOException("已取消")
-                                    : new java.io.IOException("下载失败: " + entry.key + ": " + e.getMessage()));
+                                    : new java.io.IOException(
+                                            "下载失败: " + entry.key + ": " + e.getMessage()));
                 } finally {
                     sem.release();
                     latch.countDown();
@@ -362,11 +410,132 @@ public final class ResourceFlow {
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             firstErr.compareAndSet(null, new java.io.IOException("已取消"));
+        } finally {
+            hb.stop();
+            pool.shutdown();
+            try { pool.awaitTermination(5, TimeUnit.SECONDS); } catch (InterruptedException ignore) {}
         }
-        pool.shutdown();
-        try { pool.awaitTermination(5, TimeUnit.SECONDS); } catch (InterruptedException ignore) {}
 
         if (firstErr.get() != null) throw firstErr.get();
+    }
+
+    // ── 心跳系统内部类 ────────────────────────────────────────────────────
+
+    /** 单个文件的实时下载状态，由 download worker 写入，HeartbeatSender 读取。 */
+    private static final class DownloadState {
+        enum Status { PENDING, DOWNLOADING, DONE, FAILED }
+
+        final String fileName;
+        volatile Status  status        = Status.PENDING;
+        volatile long    soFar         = 0L;
+        volatile long    total         = -1L;
+        volatile long    bps           = 0L;
+        /** 心跳收到换线指令后更新为新镜像 URL，再设置 switchPending = true。 */
+        volatile String  currentMirror;
+        /** download worker 在 ProgressSink.isCancelled() 中检测此标志触发重试。 */
+        volatile boolean switchPending = false;
+
+        DownloadState(String fileName, String initialMirror) {
+            this.fileName      = fileName;
+            this.currentMirror = initialMirror;
+        }
+    }
+
+    /**
+     * 每 5 秒向 /client/heartbeat 上报所有文件的下载状态。
+     *
+     * <p>服务端响应 {@code action=switch_mirrors} 时：更新受影响文件的
+     * {@link DownloadState#currentMirror} 并置 {@link DownloadState#switchPending}，
+     * 触发 download worker 的协作式取消 + 重试。
+     *
+     * <p>服务端响应 {@code action=ban} 时：持久化封禁信息，阻塞显示致命弹窗。
+     */
+    private final class HeartbeatSender implements Runnable {
+        private final ConcurrentHashMap<String, DownloadState> states;
+        private final String deviceId;
+        private volatile boolean stopped = false;
+
+        HeartbeatSender(ConcurrentHashMap<String, DownloadState> states, String deviceId) {
+            this.states   = states;
+            this.deviceId = deviceId;
+        }
+
+        void stop() { stopped = true; }
+
+        @Override public void run() {
+            while (!stopped) {
+                try { Thread.sleep(5_000); } catch (InterruptedException ie) { break; }
+                if (stopped) break;
+                try {
+                    sendHeartbeat();
+                } catch (Throwable t) {
+                    reporter.log("WARN", "心跳发送失败: " + t.getMessage());
+                }
+            }
+        }
+
+        private void sendHeartbeat() throws Exception {
+            JSONObject body = new JSONObject();
+            body.put("device_id", deviceId);
+            JSONArray files = new JSONArray();
+            for (DownloadState s : states.values()) {
+                JSONObject f = new JSONObject();
+                f.put("name",      s.fileName);
+                f.put("status",    s.status.name().toLowerCase(Locale.US));
+                f.put("percent",   s.total > 0 ? (s.soFar * 100.0 / s.total) : 0.0);
+                f.put("speed_bps", s.bps);
+                files.put(f);
+            }
+            body.put("files", files);
+
+            String raw = Net.postJson(
+                    CloudEndpoint.CLIENT_HEARTBEAT, body.toString(), 10_000);
+            if (raw == null || raw.isEmpty()) return;
+
+            JSONObject resp = new JSONObject(raw);
+            String action = resp.optString("action", "ok");
+
+            if ("switch_mirrors".equals(action)) {
+                JSONArray assignments = resp.optJSONArray("assignments");
+                if (assignments == null) return;
+                for (int i = 0; i < assignments.length(); i++) {
+                    JSONObject a    = assignments.getJSONObject(i);
+                    String mirror   = a.optString("mirror", "");
+                    JSONArray fList = a.optJSONArray("files");
+                    if (mirror.isEmpty() || fList == null) continue;
+                    for (int j = 0; j < fList.length(); j++) {
+                        String fname = fList.getString(j);
+                        DownloadState st = states.get(fname);
+                        if (st != null && st.status == DownloadState.Status.DOWNLOADING) {
+                            // volatile write order matters: mirror before pending flag
+                            st.currentMirror = mirror;
+                            st.switchPending = true;
+                        }
+                    }
+                }
+                reporter.log("INFO", "服务端触发换线，已更新受影响文件的镜像分配");
+
+            } else if ("ban".equals(action)) {
+                stopped = true;
+                String reason     = resp.optString("reason", "（服务端未提供原因）");
+                long   expireTime = resp.optLong("expire_time", 0L);
+                BanInfo.save(ctx, reason, expireTime);
+
+                String msg = "原因：" + reason;
+                if (expireTime > 0L) {
+                    try {
+                        String ts = new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
+                                .format(new Date(expireTime * 1000L));
+                        msg += "\n解封时间：" + ts;
+                    } catch (Throwable ignore) {
+                        msg += "\n解封时间戳：" + expireTime;
+                    }
+                } else {
+                    msg += "\n封禁类型：永久";
+                }
+                reporter.showFatalAndExit("账号已被封禁", msg);
+            }
+        }
     }
 
     // ── 离线流程 ──────────────────────────────────────────────────────────
