@@ -23,9 +23,7 @@ import java.util.concurrent.atomic.AtomicReference;
  *   <li>{@link #getString(String, int)} —— 同步 GET 拿 UTF-8 文本，
  *       用于小配置/JSON/XML。</li>
  *   <li>{@link #downloadResume(String, File, long, int, ProgressSink)}
- *       —— 单线程 HTTP Range 断点续传下载。带速率监控，瞬时
- *       速率低于 100KB/s 持续超过 30 秒会抛 {@link IOException}
- *       触发上层换镜像 / 换线路。</li>
+ *       —— 单线程 HTTP Range 断点续传下载。</li>
  *   <li>{@link #downloadChunked(String, File, long, int, int, ProgressSink)}
  *       —— 多线程分片并行下载。先 HEAD 探测服务端是否支持
  *       Range 请求；不支持 / 不能确定总大小时自动回落到
@@ -134,9 +132,7 @@ public final class Net {
      * 不再发起请求。当 expectedTotal 未知（{@code -1}）时，永远不
      * 把"文件已存在但不知道是否完整"当成完成状态。
      *
-     * <p>瞬时速率持续低于 100KB/s 超过 30 秒会抛 {@link IOException}，
-     * 触发上层换镜像 / 换线路。
-     */
+         */
     public static void downloadResume(String url, File target, long expectedTotal,
                                       int connectTimeoutMs, ProgressSink sink) throws IOException {
         File parent = target.getParentFile();
@@ -193,7 +189,6 @@ public final class Net {
             long soFar = existing;
             long windowStart = System.nanoTime();
             long windowBytes = 0;
-            long slowStart = -1;
             int n;
             while ((n = is.read(buf)) > 0) {
                 if (sink != null && sink.isCancelled()) {
@@ -207,14 +202,6 @@ public final class Net {
                 if (elapsedMs >= 500) {
                     long bps = elapsedMs > 0 ? (windowBytes * 1000L / elapsedMs) : 0L;
                     if (sink != null) sink.onProgress(soFar, total, bps);
-                    if (bps < 100L * 1024L) {
-                        if (slowStart < 0) slowStart = System.currentTimeMillis();
-                        else if (System.currentTimeMillis() - slowStart > 30_000L) {
-                            throw new IOException("速率低于 100KB/s 超过 30 秒");
-                        }
-                    } else {
-                        slowStart = -1;
-                    }
                     windowStart = now;
                     windowBytes = 0;
                 }
@@ -309,7 +296,6 @@ public final class Net {
         final long initialDone = totalDone.get();
 
         final AtomicReference<IOException> firstErr = new AtomicReference<>(null);
-        final AtomicLong slowSince = new AtomicLong(-1L);
         final AtomicLong windowStart = new AtomicLong(System.nanoTime());
         final AtomicLong windowBytes = new AtomicLong(0L);
 
@@ -326,7 +312,7 @@ public final class Net {
                     downloadOneChunk(url, target, starts[idx], ends[idx], done, idx,
                             connectTimeoutMs, meta, expectedTotal,
                             totalDone, windowStart, windowBytes,
-                            slowSince, sink);
+                            sink);
                 } catch (Throwable t) {
                     firstErr.compareAndSet(null,
                             t instanceof IOException ? (IOException) t :
@@ -365,7 +351,6 @@ public final class Net {
                                          AtomicLong totalDone,
                                          AtomicLong windowStart,
                                          AtomicLong windowBytes,
-                                         AtomicLong slowSince,
                                          ProgressSink sink) throws IOException {
         long chunkLen = chunkEnd - chunkStart + 1;
         if (done[idx] >= chunkLen) return; // 已经下完了
@@ -401,15 +386,6 @@ public final class Net {
                     long bps = elapsedMs > 0 ? (wb * 1000L / elapsedMs) : 0L;
                     windowBytes.set(0);
                     if (sink != null) sink.onProgress(sumSoFar, expectedTotal, bps);
-                    if (bps < 100L * 1024L) {
-                        long s = slowSince.get();
-                        if (s < 0) slowSince.compareAndSet(-1, System.currentTimeMillis());
-                        else if (System.currentTimeMillis() - s > 30_000L) {
-                            throw new IOException("速率低于 100KB/s 超过 30 秒");
-                        }
-                    } else {
-                        slowSince.set(-1);
-                    }
                 }
                 if (System.currentTimeMillis() - lastSave > 2000L) {
                     saveProgressMeta(metaFile, expectedTotal, done);

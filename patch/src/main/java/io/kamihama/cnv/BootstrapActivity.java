@@ -1516,37 +1516,6 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     }
 
     @Override
-    public boolean requestAutoSwitch() {
-        final boolean[] result   = { false };
-        final boolean[] answered = { false };
-        final Object lock = new Object();
-        ui.post(() -> {
-            AlertDialog.Builder b = new AlertDialog.Builder(BootstrapActivity.this);
-            b.setTitle("自动换线");
-            b.setMessage("当一个文件长时间无法下载（数次失败或速度持续低于 100KB/s 超过 30 秒）时，"
-                    + "是否要自动切换到清单中的下一条线路重试？\n\n"
-                    + "开启：网络抖动时更稳定。\n关闭：始终使用你选择的线路。");
-            b.setCancelable(false);
-            b.setPositiveButton("开启", (d, w) -> {
-                synchronized (lock) { result[0] = true; answered[0] = true; lock.notifyAll(); }
-            });
-            b.setNegativeButton("关闭", (d, w) -> {
-                synchronized (lock) { result[0] = false; answered[0] = true; lock.notifyAll(); }
-            });
-            b.show();
-        });
-        synchronized (lock) {
-            while (!answered[0]) {
-                try { lock.wait(500); } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    return true;
-                }
-            }
-            return result[0];
-        }
-    }
-
-    @Override
     public Uri requestFilePick() {
         pickedUri.set(null);
         pickFinished = false;

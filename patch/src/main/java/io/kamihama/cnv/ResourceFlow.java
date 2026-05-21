@@ -73,9 +73,6 @@ public final class ResourceFlow {
          */
         String requestLineChoice(LinkedHashMap<String, List<String>> lines);
 
-        /** 询问是否开启自动换线；返回 true = 开启。 */
-        boolean requestAutoSwitch();
-
         /** 弹系统文件选择器，阻塞到用户选完；取消时返回 null。 */
         Uri requestFilePick();
 
@@ -188,8 +185,6 @@ public final class ResourceFlow {
             throw new FatalConfigException("empty mirrors for line: " + selectedLine);
         }
 
-        boolean autoSwitch = reporter.requestAutoSwitch();
-
         // 3. 获取文件清单（从第一个可用镜像）
         reporter.setPhase("download");
         reporter.setStatus("正在获取资源清单…");
@@ -208,7 +203,7 @@ public final class ResourceFlow {
         reporter.initSlots(concurrency);
 
         // 5. 下载所有文件
-        downloadAll(entries, mirrors, init.downloadAccessToken, concurrency, autoSwitch);
+        downloadAll(entries, mirrors, init.downloadAccessToken, concurrency);
 
         // 6. 完成
         reporter.setPhase("done");
@@ -270,15 +265,11 @@ public final class ResourceFlow {
         }
     }
 
-    /**
-     * 多线程并发下载所有条目。
-     * autoSwitch = true 时，某个镜像连续失败超过阈值后自动切换到下一个。
-     */
+    /** 多线程并发下载所有条目。 */
     private void downloadAll(List<S3List.Entry> entries,
                              List<String> mirrors,
                              String token,
-                             int concurrency,
-                             boolean autoSwitch) throws Exception {
+                             int concurrency) throws Exception {
         File destDir = ctx.getFilesDir();
         long totalBytes = 0L;
         for (S3List.Entry e : entries) totalBytes += Math.max(0, e.size);
@@ -289,7 +280,6 @@ public final class ResourceFlow {
         AtomicLong    bytesFinished = new AtomicLong(0L);
         AtomicLong    instantBpsAll = new AtomicLong(0L);
         AtomicInteger mirrorIdx     = new AtomicInteger(0);
-        ConcurrentHashMap<Integer, Integer> mirrorFails = new ConcurrentHashMap<>();
         AtomicReference<Exception> firstErr = new AtomicReference<>(null);
 
         // 共享槽位 — 用 AtomicInteger 在 workers 间轮转
@@ -352,19 +342,9 @@ public final class ResourceFlow {
                     reporter.setAggregate(done, total, 0);
                     reporter.setOverallProgress(bytesFinished.get(), totalBytesF);
                     reporter.log("INFO", "下载完成: " + entry.key);
-                    if (autoSwitch) mirrorFails.put(mi, 0);
                 } catch (Exception e) {
                     if (!reporter.isCancelled()) {
                         reporter.log("WARN", "下载失败(" + entry.key + "): " + e.getMessage());
-                        if (autoSwitch) {
-                            int mi = mirrorIdx.get() % mirrors.size();
-                            int fails = mirrorFails.merge(mi, 1, Integer::sum);
-                            if (fails >= 3 && mirrors.size() > 1) {
-                                int next = (mi + 1) % mirrors.size();
-                                mirrorIdx.compareAndSet(mi, next);
-                                reporter.log("INFO", "自动切换镜像 → " + mirrors.get(next));
-                            }
-                        }
                     }
                     firstErr.compareAndSet(null,
                             reporter.isCancelled()
