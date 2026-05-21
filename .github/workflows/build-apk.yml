@@ -62,7 +62,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PYTHONUNBUFFERED: "1"
-      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
       KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
       KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
       KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
@@ -129,21 +129,33 @@ jobs:
               with open(os.environ["GITHUB_OUTPUT"], "a") as f:
                   f.write(f"{key}={value}\n")
 
-          def gh_var_get(name, default=""):
-              r = subprocess.run(
-                  ["gh", "variable", "get", name, "--repo", os.environ["REPO"]],
-                  capture_output=True, text=True
-              )
-              return r.stdout.strip() if r.returncode == 0 else default
+          def get_variable(repo, name, token, default=""):
+              """直接调用 GitHub REST API 读取仓库变量，不依赖 gh CLI 的权限配置。"""
+              import json, urllib.request, urllib.error
+              headers = {
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              }
+              url = f"https://api.github.com/repos/{repo}/actions/variables/{name}"
+              try:
+                  with urllib.request.urlopen(
+                      urllib.request.Request(url, headers=headers)
+                  ) as resp:
+                      return json.loads(resp.read()).get("value", default)
+              except Exception:
+                  return default
 
           header("计算新版本号")
 
           event_name = os.environ.get("GITHUB_EVENT_NAME", "push")
           bump_major = os.environ.get("INPUT_BUMP_MAJOR", "false").lower() == "true"
+          repo       = os.environ["REPO"]
+          token      = os.environ.get("GH_TOKEN", "")
 
-          section("读取当前版本（GitHub Variables）")
-          cur_version = gh_var_get("APK_VERSION", "4.0.0")
-          cur_code    = int(gh_var_get("APK_VERSION_CODE", "1"))
+          section("读取当前版本（GitHub Variables REST API）")
+          cur_version = get_variable(repo, "APK_VERSION",      token, "4.0.0")
+          cur_code    = int(get_variable(repo, "APK_VERSION_CODE", token, "1") or "1")
           info(f"当前版本:  {c(C.BRIGHT_CYAN, cur_version)}")
           info(f"当前 VersionCode: {c(C.BRIGHT_CYAN, str(cur_code))}")
 
@@ -816,7 +828,7 @@ jobs:
         if: steps.sign.outputs.signed_apk != ''
         run: |
           python3 <<'SCRIPT_END'
-          import subprocess, os, sys
+          import json, urllib.request, urllib.error, os, sys
 
           sys.stdout.reconfigure(line_buffering=True)
 
@@ -825,6 +837,7 @@ jobs:
               BOLD          = "\033[1m"
               RED           = "\033[31m"
               BRIGHT_GREEN  = "\033[92m"
+              BRIGHT_YELLOW = "\033[93m"
               BRIGHT_BLUE   = "\033[94m"
               BRIGHT_WHITE  = "\033[97m"
               CYAN          = "\033[36m"
@@ -835,28 +848,148 @@ jobs:
               print(f"\n{c(C.BOLD + C.BRIGHT_BLUE, bar)}")
               print(c(C.BOLD + C.BRIGHT_WHITE, f"  {text}"))
               print(f"{c(C.BOLD + C.BRIGHT_BLUE, bar)}\n", flush=True)
-          def ok(t):  print(f"  {c(C.BRIGHT_GREEN, '✔')} {t}", flush=True)
-          def err(t): print(f"  {c(C.RED,          '✘')} {t}", flush=True)
+          def ok(t):   print(f"  {c(C.BRIGHT_GREEN,  '✔')} {t}", flush=True)
+          def warn(t): print(f"  {c(C.BRIGHT_YELLOW, '⚠')} {t}", flush=True)
+          def err(t):  print(f"  {c(C.RED,           '✘')} {t}", flush=True)
 
-          def run(cmd, **kw):
-              r = subprocess.run(cmd, shell=True, capture_output=True, text=True, **kw)
-              if r.returncode != 0:
-                  err(f"命令失败: {cmd}\n{r.stderr.strip()}")
-                  sys.exit(1)
-              return r.stdout.strip()
+          def set_variable(repo, name, value, token):
+              """PATCH（更新）失败时自动 POST（创建），直接调用 REST API。"""
+              headers = {
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "Content-Type": "application/json",
+              }
+              body = json.dumps({"name": name, "value": value}).encode()
+
+              # 优先尝试更新
+              url_var = f"https://api.github.com/repos/{repo}/actions/variables/{name}"
+              req = urllib.request.Request(url_var, data=body, headers=headers, method="PATCH")
+              try:
+                  urllib.request.urlopen(req)
+                  return "updated"
+              except urllib.error.HTTPError as e:
+                  if e.code != 404:
+                      raise RuntimeError(f"PATCH {name} 失败 HTTP {e.code}: {e.read().decode()}")
+
+              # 变量不存在，改为创建
+              url_all = f"https://api.github.com/repos/{repo}/actions/variables"
+              req = urllib.request.Request(url_all, data=body, headers=headers, method="POST")
+              try:
+                  urllib.request.urlopen(req)
+                  return "created"
+              except urllib.error.HTTPError as e:
+                  raise RuntimeError(f"POST {name} 失败 HTTP {e.code}: {e.read().decode()}")
 
           header("保存版本号到 GitHub Variables")
 
           repo        = os.environ["REPO"]
           new_version = os.environ["NEW_VERSION"]
           new_code    = os.environ["NEW_CODE"]
+          token       = os.environ.get("GH_TOKEN", "")
 
-          run(f'gh variable set APK_VERSION      --body "{new_version}" --repo "{repo}"')
-          run(f'gh variable set APK_VERSION_CODE --body "{new_code}"    --repo "{repo}"')
+          if not token:
+              err("GH_TOKEN 未配置，无法写入 Variables")
+              err("请在仓库 Settings → Secrets 中配置 GH_TOKEN（需具备 repo 或 actions:write 权限）")
+              sys.exit(1)
 
-          ok(f"APK_VERSION      → {new_version}")
-          ok(f"APK_VERSION_CODE → {new_code}")
+          failed = False
+          for var_name, var_value in [
+              ("APK_VERSION",      new_version),
+              ("APK_VERSION_CODE", new_code),
+          ]:
+              try:
+                  action = set_variable(repo, var_name, var_value, token)
+                  ok(f"{var_name} → {var_value}（{action}）")
+              except RuntimeError as e:
+                  err(str(e))
+                  failed = True
+
+          if failed:
+              warn("版本号未能持久化，下次构建可能从默认值重新计数")
+              warn("请确认 GH_TOKEN 具备 repo 或 actions:write 权限")
+              sys.exit(1)
           SCRIPT_END
         env:
           NEW_VERSION: ${{ steps.version.outputs.new_version }}
           NEW_CODE:    ${{ steps.version.outputs.new_code }}
+
+      - name: 📊 生成构建报告（Job Summary）
+        if: always()
+        run: |
+          python3 <<'SCRIPT_END'
+          import os
+
+          summary_f   = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null")
+          new_version = os.environ.get("NEW_VERSION",  "")
+          new_code    = os.environ.get("NEW_CODE",     "")
+          tag_name    = os.environ.get("TAG_NAME",     "")
+          apk_name    = os.environ.get("APK_NAME",     "")
+          signed_apk  = os.environ.get("SIGNED_APK",  "")
+          event_name  = os.environ.get("GITHUB_EVENT_NAME", "push")
+          bump_major  = os.environ.get("INPUT_BUMP_MAJOR", "false").lower() == "true"
+          commit_sha  = os.environ.get("GITHUB_SHA",  "unknown")[:7]
+          repo        = os.environ.get("REPO",         "")
+
+          if event_name == "push":
+              trigger = "自动构建（push 触发）"
+          elif bump_major:
+              trigger = "手动大版本升级"
+          else:
+              trigger = "手动构建"
+
+          if signed_apk and os.path.exists(signed_apk):
+              apk_size = f"{os.path.getsize(signed_apk) / 1024 / 1024:.1f} MB"
+              status_line = f"✅ 构建成功"
+          elif not new_version:
+              status_line = "❌ 构建失败（版本计算阶段中止）"
+              apk_size = "—"
+          else:
+              status_line = "⚠️ APK 未签名（KEYSTORE_BASE64 未配置）"
+              apk_size = "—"
+
+          lines = [
+              f"## {status_line}",
+              "",
+              "| 字段 | 值 |",
+              "|------|-----|",
+              f"| 版本号 | `{new_version}` |" if new_version else "| 版本号 | — |",
+              f"| VersionCode | `{new_code}` |" if new_code else "| VersionCode | — |",
+              f"| Release 标签 | `{tag_name}` |" if tag_name else "| Release 标签 | — |",
+              f"| APK 文件 | `{apk_name}` |" if apk_name else "| APK 文件 | — |",
+              f"| APK 大小 | {apk_size} |",
+              f"| 构建方式 | {trigger} |",
+              f"| 源码提交 | `{commit_sha}` |",
+              "",
+          ]
+
+          if signed_apk and tag_name:
+              lines += [
+                  f"### 下载",
+                  f"前往 [Release {tag_name}](https://github.com/{repo}/releases/tag/{tag_name}) 下载签名 APK。",
+                  "",
+              ]
+
+          if not os.environ.get("KEYSTORE_BASE64", "").strip():
+              lines += [
+                  "### ⚠️ 签名密钥未配置",
+                  "APK 未签名，无法安装到 Android 设备。",
+                  "请先运行 `gen-signing-key.yml` 生成签名密钥并配置以下 Secrets：",
+                  "- `KEYSTORE_BASE64`",
+                  "- `KEY_STORE_PASSWORD`",
+                  "- `KEY_ALIAS`",
+                  "- `KEY_PASSWORD`",
+                  "",
+              ]
+
+          with open(summary_f, "w", encoding="utf-8") as f:
+              f.write("\n".join(lines))
+          SCRIPT_END
+        env:
+          NEW_VERSION:      ${{ steps.version.outputs.new_version }}
+          NEW_CODE:         ${{ steps.version.outputs.new_code }}
+          TAG_NAME:         ${{ steps.version.outputs.tag_name }}
+          APK_NAME:         ${{ steps.version.outputs.apk_name }}
+          SIGNED_APK:       ${{ steps.sign.outputs.signed_apk }}
+          INPUT_BUMP_MAJOR: ${{ inputs.bump_major }}
+          KEYSTORE_BASE64:  ${{ secrets.KEYSTORE_BASE64 }}
