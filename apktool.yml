@@ -1,0 +1,48 @@
+version: 2.9.3
+apkFileName: totentanz.apk
+isFrameworkApk: false
+usesFramework:
+  ids:
+  - 1
+  tag: null
+sdkInfo:
+  minSdkVersion: 21
+  targetSdkVersion: 33
+packageInfo:
+  forcedPackageId: 127
+  renameManifestPackage: null
+versionInfo:
+  versionCode: 1713000515
+  versionName: 3.1.9
+resourcesAreCompressed: false
+sharedLibrary: false
+sparseResources: false
+unknownFiles:
+  DebugProbesKt.bin: 8
+  billing.properties: 8
+  firebase-analytics-impl.properties: 8
+  firebase-analytics.properties: 8
+  firebase-common.properties: 8
+  firebase-core.properties: 8
+  firebase-iid-interop.properties: 8
+  firebase-iid.properties: 8
+  firebase-measurement-connector-impl.properties: 8
+  firebase-measurement-connector.properties: 8
+  firebase-messaging.properties: 8
+  google-services.json: 8
+  play-services-ads-identifier.properties: 8
+  play-services-analytics-impl.properties: 8
+  play-services-analytics.properties: 8
+  play-services-base.properties: 8
+  play-services-basement.properties: 8
+  play-services-measurement-base.properties: 8
+  play-services-stats.properties: 8
+  play-services-tagmanager-v4-impl.properties: 8
+  play-services-tasks.properties: 8
+  com/android/vending/billing/IInAppBillingService.aidl: 8
+doNotCompress:
+- resources.arsc
+- png
+- jpg
+- assets/dexopt/baseline.prof
+- assets/dexopt/baseline.profm
