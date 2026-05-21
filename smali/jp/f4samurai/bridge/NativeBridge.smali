@@ -265,6 +265,13 @@
 .method public static getAppVersion()Ljava/lang/String;
     .locals 3
 
+    # CNV: 优先返回服务端下发的伪造版本号；null 时退化为原 PackageManager 路径
+    invoke-static {}, Lio/kamihama/cnv/Spoof;->getFakeVersion()Ljava/lang/String;
+    move-result-object v0
+    if-eqz v0, :spoof_skip
+    return-object v0
+    :spoof_skip
+
     .line 72
     :try_start_0
     sget-object v0, Ljp/f4samurai/bridge/NativeBridge;->sAppActivity:Ljp/f4samurai/AppActivity;

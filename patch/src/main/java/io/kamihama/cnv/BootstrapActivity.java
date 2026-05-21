@@ -1299,6 +1299,10 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                   + "后续 ResourceFlow 接入云端 mirrors 时可能需要在此提前拦截");
         }
 
+        // 版本伪造：将服务端下发的 fake_version / fake_name 写入 Spoof 静态缓存，
+        // NativeBridge.getAppVersion() 会优先返回该值（null = 自动退化为真实版本）
+        Spoof.set(init.fakeName, init.fakeVersion);
+
         return true;
     }
 
