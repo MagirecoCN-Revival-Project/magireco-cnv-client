@@ -157,30 +157,38 @@ public final class ResourceFlow {
     // ── 在线流程 ──────────────────────────────────────────────────────────
 
     private void runOnline() throws Exception {
-        // 1. 取镜像列表
         reporter.setPhase("init");
         reporter.setStatus("正在连接服务器…");
 
-        ClientInit.Response init;
+        // 1. 上报用户选择的下载方式（忽略失败，服务端容错）
         try {
-            init = ClientInit.fetch(ctx, BUILD_VERSION);
+            ClientInit.postMethodSelect(ctx, MODE_ONLINE);
+        } catch (Throwable t) {
+            reporter.log("WARN", "method-select 上报失败（忽略）: " + t.getMessage());
+        }
+
+        // 2. 获取镜像列表和访问令牌
+        reporter.setStatus("正在获取镜像列表…");
+        ClientInit.OnlineDownloadInfo dlInfo;
+        try {
+            dlInfo = ClientInit.fetchOnlineDownload(ctx);
         } catch (Exception e) {
             reporter.showFatalAndExit("无法取得资源清单",
                     "连接资源服务器失败：" + e.getMessage()
                             + "\n\n请检查网络后重试。");
-            throw new FatalConfigException("ClientInit failed");
+            throw new FatalConfigException("fetchOnlineDownload failed");
         }
 
-        if (init.downloadMirrors == null || init.downloadMirrors.isEmpty()
-                || init.downloadAccessToken == null || init.downloadAccessToken.isEmpty()) {
+        if (dlInfo.mirrors == null || dlInfo.mirrors.isEmpty()
+                || dlInfo.accessToken == null || dlInfo.accessToken.isEmpty()) {
             reporter.showFatalAndExit("资源配置缺失",
                     "服务端未返回资源下载地址或令牌，无法在线下载。\n\n请联系管理员。");
             throw new FatalConfigException("no mirrors");
         }
 
-        // 2. 构建线路表（当前只有一条"默认线路"）
+        // 3. 构建线路表（当前只有一条"默认线路"）
         LinkedHashMap<String, List<String>> lines = new LinkedHashMap<>();
-        lines.put("默认线路", new ArrayList<>(init.downloadMirrors));
+        lines.put("默认线路", new ArrayList<>(dlInfo.mirrors));
 
         String selectedLine = lines.size() > 1
                 ? reporter.requestLineChoice(lines)
@@ -191,12 +199,12 @@ public final class ResourceFlow {
             throw new FatalConfigException("empty mirrors for line: " + selectedLine);
         }
 
-        // 3. 获取文件清单（从第一个可用镜像）
+        // 4. 获取文件清单（从第一个可用镜像）
         reporter.setPhase("download");
         reporter.setStatus("正在获取资源清单…");
         reporter.log("INFO", "使用线路：" + selectedLine + "，镜像数=" + mirrors.size());
 
-        List<S3List.Entry> entries = fetchManifest(mirrors, init.downloadAccessToken);
+        List<S3List.Entry> entries = fetchManifest(mirrors, dlInfo.accessToken);
         if (entries.isEmpty()) {
             reporter.showFatalAndExit("资源清单为空",
                     "从服务端拿到的资源清单是空的，无法继续下载。\n\n请联系管理员。");
@@ -204,14 +212,14 @@ public final class ResourceFlow {
         }
         reporter.log("INFO", "清单条目数=" + entries.size());
 
-        // 4. 并发数
+        // 5. 并发数
         int concurrency = reporter.requestConcurrency(Math.min(4, mirrors.size()));
         reporter.initSlots(concurrency);
 
-        // 5. 下载所有文件
-        downloadAll(entries, mirrors, init.downloadAccessToken, concurrency);
+        // 6. 下载所有文件
+        downloadAll(entries, mirrors, dlInfo.accessToken, concurrency);
 
-        // 6. 完成
+        // 7. 完成
         reporter.setPhase("done");
         reporter.setStatus("下载完成");
         reporter.log("INFO", "所有资源下载完成");
@@ -541,6 +549,16 @@ public final class ResourceFlow {
     // ── 离线流程 ──────────────────────────────────────────────────────────
 
     private void runOffline() throws Exception {
+        reporter.setPhase("init");
+        reporter.setStatus("正在上报下载方式…");
+
+        // 上报用户选择的下载方式（忽略失败）
+        try {
+            ClientInit.postMethodSelect(ctx, MODE_OFFLINE);
+        } catch (Throwable t) {
+            reporter.log("WARN", "method-select 上报失败（忽略）: " + t.getMessage());
+        }
+
         reporter.setPhase("offline-pick");
         reporter.setStatus("请选择离线资源 zip 文件…");
 

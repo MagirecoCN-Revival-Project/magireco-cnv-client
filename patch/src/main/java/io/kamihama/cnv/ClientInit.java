@@ -16,6 +16,7 @@ import java.util.List;
  */
 public final class ClientInit {
 
+    /** /client/init 握手响应：封禁 / 维护 / 版本闸门 / 伪造版本。 */
     public static final class Response {
         public boolean      bannedFlag;
         public String       bannedReason;
@@ -28,14 +29,25 @@ public final class ClientInit {
         public List<String> allowedVersions       = new ArrayList<>();
         public String       updateUrlNormal;
         public String       updateUrlInternalTest;
-        /** 资源下载镜像 URL 列表（按优先级排列）。 */
-        public List<String> downloadMirrors       = new ArrayList<>();
-        public String       downloadAccessToken;
-        public String       reportApi;
         /** 向游戏 native 层伪造的版本号；null 表示服务端未配置，退化为真实版本。 */
         public String       fakeVersion;
         /** 向游戏 native 层伪造的应用名；null 表示服务端未配置。 */
         public String       fakeName;
+    }
+
+    /** /client/online-download 响应：镜像列表 + 访问令牌 + 进度上报接口。 */
+    public static final class OnlineDownloadInfo {
+        /** 资源下载镜像 URL 列表（按优先级排列）。 */
+        public List<String> mirrors       = new ArrayList<>();
+        public String       accessToken;
+        public String       reportApi;
+    }
+
+    /** /client/offline-package 响应：离线包下载 URL + 版本 + MD5。 */
+    public static final class OfflinePackageInfo {
+        public String downloadUrl;
+        public String packageVersion;
+        public String md5;
     }
 
     /**
@@ -79,14 +91,6 @@ public final class ClientInit {
             r.updateUrlInternalTest = client.optString("update_url_internal_test", null);
         }
 
-        JSONObject dl = obj.optJSONObject("download");
-        if (dl != null) {
-            JSONArray mirrors = dl.optJSONArray("mirrors");
-            if (mirrors != null) for (int i = 0; i < mirrors.length(); i++) r.downloadMirrors.add(mirrors.getString(i));
-            r.downloadAccessToken = dl.optString("access_token", null);
-            r.reportApi           = dl.optString("report_api",   null);
-        }
-
         JSONObject spoof = obj.optJSONObject("spoof");
         if (spoof != null) {
             r.fakeVersion = spoof.optString("fake_version", null);
@@ -94,6 +98,58 @@ public final class ClientInit {
         }
 
         return r;
+    }
+
+    /**
+     * 上报用户选择的下载方式；忽略响应体（服务端只需知晓）。
+     *
+     * @param ctx    Context
+     * @param method {@link io.kamihama.cnv.ResourceFlow#MODE_ONLINE} 或 {@link io.kamihama.cnv.ResourceFlow#MODE_OFFLINE}
+     */
+    public static void postMethodSelect(Context ctx, String method) throws Exception {
+        JSONObject body = new JSONObject();
+        body.put("device_id", DeviceId.get(ctx));
+        body.put("method",    method);
+        Net.postJson(CloudEndpoint.CLIENT_METHOD_SELECT, body.toString(), 10_000);
+    }
+
+    /**
+     * 获取在线下载所需的镜像列表和访问令牌。
+     *
+     * @throws Exception 网络错误 / HTTP &ge; 400
+     */
+    public static OnlineDownloadInfo fetchOnlineDownload(Context ctx) throws Exception {
+        JSONObject body = new JSONObject();
+        body.put("device_id", DeviceId.get(ctx));
+        String raw = Net.postJson(CloudEndpoint.CLIENT_ONLINE_DOWNLOAD, body.toString(), 15_000);
+        OnlineDownloadInfo info = new OnlineDownloadInfo();
+        if (raw == null || raw.isEmpty()) return info;
+        JSONObject obj = new JSONObject(raw);
+        JSONArray mirrors = obj.optJSONArray("mirrors");
+        if (mirrors != null) {
+            for (int i = 0; i < mirrors.length(); i++) info.mirrors.add(mirrors.getString(i));
+        }
+        info.accessToken = obj.optString("access_token", null);
+        info.reportApi   = obj.optString("report_api",   null);
+        return info;
+    }
+
+    /**
+     * 获取离线包下载 URL、版本号和 MD5。
+     *
+     * @throws Exception 网络错误 / HTTP &ge; 400
+     */
+    public static OfflinePackageInfo fetchOfflinePackage(Context ctx) throws Exception {
+        JSONObject body = new JSONObject();
+        body.put("device_id", DeviceId.get(ctx));
+        String raw = Net.postJson(CloudEndpoint.CLIENT_OFFLINE_PACKAGE, body.toString(), 15_000);
+        OfflinePackageInfo info = new OfflinePackageInfo();
+        if (raw == null || raw.isEmpty()) return info;
+        JSONObject obj = new JSONObject(raw);
+        info.downloadUrl     = obj.optString("download_url",     null);
+        info.packageVersion  = obj.optString("package_version",  null);
+        info.md5             = obj.optString("md5",              null);
+        return info;
     }
 
     private ClientInit() {}

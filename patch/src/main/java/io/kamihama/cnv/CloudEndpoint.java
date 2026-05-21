@@ -25,6 +25,38 @@ public final class CloudEndpoint {
     public static final String CLIENT_INIT = "https://api.magi-reco.top/client/init";
 
     /**
+     * 用户确认下载方式后上报服务端。
+     *
+     * <p>请求：POST，{@code application/json}。Body：
+     * <pre>{ "device_id": "...", "method": "online" | "offline" }</pre>
+     *
+     * <p>响应：200 OK（无关键字段，忽略即可）。
+     */
+    public static final String CLIENT_METHOD_SELECT   = "https://api.magi-reco.top/client/method-select";
+
+    /**
+     * 在线下载模式：获取镜像列表和访问令牌。
+     *
+     * <p>请求：POST，{@code application/json}。Body：
+     * <pre>{ "device_id": "..." }</pre>
+     *
+     * <p>响应：{@code application/json}，schema 见
+     * {@link ClientInit#fetchOnlineDownload(android.content.Context)}。
+     */
+    public static final String CLIENT_ONLINE_DOWNLOAD = "https://api.magi-reco.top/client/online-download";
+
+    /**
+     * 离线包模式：获取离线包下载 URL、版本号和 MD5。
+     *
+     * <p>请求：POST，{@code application/json}。Body：
+     * <pre>{ "device_id": "..." }</pre>
+     *
+     * <p>响应：{@code application/json}，schema 见
+     * {@link ClientInit#fetchOfflinePackage(android.content.Context)}。
+     */
+    public static final String CLIENT_OFFLINE_PACKAGE = "https://api.magi-reco.top/client/offline-package";
+
+    /**
      * 下载过程心跳接口。
      *
      * <p>请求：POST，{@code application/json}。Body：

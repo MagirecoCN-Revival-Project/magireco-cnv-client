@@ -1,11 +1,9 @@
 package io.kamihama.cnv;
 
 import android.app.Activity;
-import android.app.AlertDialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
-import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.res.AssetFileDescriptor;
 import android.graphics.Bitmap;
@@ -97,10 +95,10 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private static final String BG_ASSET          = "cnv/background_light.png";
     /** 资源目录内的游戏 Logo 路径（assets/cnv/logo.png）。 */
     private static final String LOGO_ASSET        = "cnv/logo.png";
-    /** CI 将 HCA 转换成 OGG 后落在 assets 内的循环 BGM 路径。 */
-    private static final String BGM_ASSET         = "resource/sound_native/bgm/bgm00_system01_hca.ogg";
-    /** 自检完毕后播放一次的标题音效（"Magia Record！" 片段）。 */
-    private static final String TITLE_SFX_ASSET   = "resource/sound_native/bgm/bgm00_system02_hca.ogg";
+    /** CI 将 HCA 转换成 OGG 后落在 assets 内的循环 BGM 路径（system02 = 系统菜单循环曲）。 */
+    private static final String BGM_ASSET         = "resource/sound_native/bgm/bgm00_system02_hca.ogg";
+    /** 自检完毕后播放一次的标题音效（system01 = "Magia Record！" 片段）。 */
+    private static final String TITLE_SFX_ASSET   = "resource/sound_native/bgm/bgm00_system01_hca.ogg";
 
     // ---- 配色 ----
     private int COLOR_CARD;          // 卡片/面板背景
@@ -537,6 +535,8 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         LinearLayout panel = new LinearLayout(this);
         panel.setOrientation(LinearLayout.VERTICAL);
         panel.setClickable(true);
+        // 拦截触摸事件，防止点击面板内部区域穿透到遮罩层关闭面板
+        panel.setOnTouchListener((v, e) -> true);
         panel.setPadding(dp(16), dp(16), dp(16), dp(16));
         GradientDrawable panelBg = new GradientDrawable();
         panelBg.setColor(COLOR_LOG_PANEL_BG);
@@ -601,14 +601,16 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         vLogScroll = new ScrollView(this);
         vLogScroll.setFillViewport(true);
         GradientDrawable logScrollBg = new GradientDrawable();
-        logScrollBg.setColor(COLOR_BAR_BG);
+        // 使用与面板背景有明显对比的半透明深色背景，确保空日志时滚动区域可见
+        logScrollBg.setColor(darkMode ? 0x44FFFFFF : 0x14000000);
         logScrollBg.setCornerRadius(dp(8));
+        logScrollBg.setStroke(1, darkMode ? 0x33FFFFFF : 0x22000000);
         vLogScroll.setBackground(logScrollBg);
         vLogScroll.setPadding(dp(8), dp(6), dp(8), dp(6));
         panel.addView(vLogScroll, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
         vLogFull = new TextView(this);
-        vLogFull.setText("");
+        vLogFull.setText("（暂无日志）");
         vLogFull.setTextColor(COLOR_LOG_PANEL_TEXT);
         vLogFull.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f);
         vLogFull.setTypeface(Typeface.MONOSPACE);
@@ -1027,7 +1029,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         synchronized (logBuffer) {
             for (String s : logBuffer) sb.append(s).append('\n');
         }
-        vLogFull.setText(sb.toString());
+        vLogFull.setText(sb.length() == 0 ? "（暂无日志）" : sb.toString());
     }
 
     // ======================================================================
@@ -1180,6 +1182,14 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     // ======================================================================
 
     private void runWork() {
+        // 调试模式：display_ui_only.flag 存在且内容为 "true" 时，仅展示 UI，跳过所有其他逻辑
+        if (isDebugUiOnly()) {
+            ui.post(this::playTitleSequence);
+            setPhase("init");
+            setStatus("调试模式：仅展示 UI");
+            return;
+        }
+
         // 第 0a 步：检查本机资源是否已准备就绪
         boolean alreadyReady = isResourcesAlreadyReady();
 
@@ -1228,6 +1238,23 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         ui.post(this::launchGame);
     }
 
+    /** 检测 &lt;filesDir&gt;/debug/display_ui_only.flag 是否存在且内容为 "true"。 */
+    private boolean isDebugUiOnly() {
+        try {
+            java.io.File f = new java.io.File(new java.io.File(getFilesDir(), "debug"),
+                    "display_ui_only.flag");
+            if (!f.exists()) return false;
+            java.io.FileInputStream fis = new java.io.FileInputStream(f);
+            byte[] buf = new byte[(int) Math.min(f.length(), 16)];
+            int len = fis.read(buf);
+            fis.close();
+            String content = len > 0 ? new String(buf, 0, len, "UTF-8").trim() : "";
+            return "true".equals(content);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     /**
      * 检查资源就绪 flag 文件是否存在。
      * 同时兼容旧版 flag 路径（迁移期）。
@@ -1252,16 +1279,47 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         final boolean[] done  = new boolean[] { false };
         final String[]  result= new String[] { null };
         ui.post(() -> {
+            View[] frame = inflateDialogFrame();
+            FrameLayout overlay = (FrameLayout) frame[0];
+            LinearLayout card   = (LinearLayout) frame[1];
+            addDialogTitle(card, "选择资源准备方式");
+
             final int[] which = new int[] { 0 };
-            AlertDialog.Builder b = new AlertDialog.Builder(BootstrapActivity.this);
-            b.setTitle("选择资源准备方式");
-            b.setSingleChoiceItems(
-                    new String[] {
-                            "在线下载（推荐，自动多镜像并发）",
-                            "离线包注入（已有官方离线 zip 时用）"
-                    }, 0, (d, w) -> which[0] = w);
-            b.setCancelable(true);
-            b.setPositiveButton("确定", (d, w) -> {
+            String[] options = {
+                "在线下载（推荐，自动多镜像并发）",
+                "离线包注入（已有官方离线 zip 时用）"
+            };
+            android.widget.RadioGroup rg = new android.widget.RadioGroup(this);
+            rg.setOrientation(android.widget.RadioGroup.VERTICAL);
+            for (int i = 0; i < options.length; i++) {
+                android.widget.RadioButton rb = new android.widget.RadioButton(this);
+                rb.setText(options[i]);
+                rb.setTextColor(COLOR_LOG_PANEL_TEXT);
+                rb.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
+                rb.setId(i);
+                if (i == 0) rb.setChecked(true);
+                rg.addView(rb, new android.widget.RadioGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT));
+            }
+            rg.setOnCheckedChangeListener((g, id) -> which[0] = id);
+            LinearLayout.LayoutParams rgLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT);
+            rgLp.bottomMargin = dp(16);
+            card.addView(rg, rgLp);
+
+            LinearLayout row = addDialogButtonRow(card);
+            Button cancelBtn = addDialogButton(row, "取消", false);
+            Button okBtn     = addDialogButton(row, "确定", true);
+            cancelBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { done[0] = true; lock.notifyAll(); }
+            });
+            okBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
                 synchronized (lock) {
                     result[0] = which[0] == 0
                             ? ResourceFlow.MODE_ONLINE : ResourceFlow.MODE_OFFLINE;
@@ -1269,10 +1327,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                     lock.notifyAll();
                 }
             });
-            b.setOnCancelListener(d -> {
-                synchronized (lock) { done[0] = true; lock.notifyAll(); }
-            });
-            b.show();
+            overlay.setVisibility(View.VISIBLE);
         });
         synchronized (lock) {
             while (!done[0]) {
@@ -1350,15 +1405,6 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             return false;
         }
 
-        // 下载镜像 / token 缺失时打日志（不阻断，ResourceFlow 内部会处理）
-        if (init.downloadMirrors.isEmpty()
-                || init.downloadAccessToken == null
-                || init.downloadAccessToken.isEmpty()) {
-            android.util.Log.w("cnv-init",
-                    "服务端 init 响应里 download.mirrors / access-token 为空——"
-                  + "后续 ResourceFlow 接入云端 mirrors 时可能需要在此提前拦截");
-        }
-
         // 版本伪造：将服务端下发的 fake_version / fake_name 写入 Spoof 静态缓存，
         // NativeBridge.getAppVersion() 会优先返回该值（null = 自动退化为真实版本）
         Spoof.set(init.fakeName, init.fakeVersion);
@@ -1396,15 +1442,124 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         }
     }
 
+    // ======================================================================
+    // 自定义样式对话框
+    // ======================================================================
+
+    /**
+     * 构建一个与应用色调匹配的自定义对话框根视图，插入到 vRoot（全屏遮罩）。
+     * 返回值[0] = 遮罩 FrameLayout（添加到 vRoot 后需自行 VISIBLE/GONE）。
+     * 返回值[1] = 内容 LinearLayout（向其中添加标题 / 正文 / 按钮）。
+     */
+    private View[] inflateDialogFrame() {
+        FrameLayout overlay = new FrameLayout(this);
+        overlay.setBackgroundColor(COLOR_DIM);
+        overlay.setVisibility(View.GONE);
+
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(20), dp(20), dp(20), dp(16));
+        GradientDrawable cardBg = new GradientDrawable();
+        cardBg.setColor(COLOR_LOG_PANEL_BG);
+        cardBg.setCornerRadius(dp(18));
+        cardBg.setStroke(dp(1), COLOR_CARD_STK);
+        card.setBackground(cardBg);
+
+        FrameLayout.LayoutParams cardLp = new FrameLayout.LayoutParams(
+                (int) (getResources().getDisplayMetrics().widthPixels * 0.85f),
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        cardLp.gravity = Gravity.CENTER;
+        overlay.addView(card, cardLp);
+
+        vRoot.addView(overlay, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT));
+        return new View[] { overlay, card };
+    }
+
+    /** 添加对话框标题行。 */
+    private TextView addDialogTitle(LinearLayout card, String title) {
+        TextView tv = new TextView(this);
+        tv.setText(title);
+        tv.setTextColor(COLOR_ACCENT);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f);
+        tv.setTypeface(null, android.graphics.Typeface.BOLD);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.bottomMargin = dp(10);
+        card.addView(tv, lp);
+        return tv;
+    }
+
+    /** 添加对话框正文区（支持多行）。 */
+    private TextView addDialogMessage(LinearLayout card, String message) {
+        TextView tv = new TextView(this);
+        tv.setText(message);
+        tv.setTextColor(COLOR_LOG_PANEL_TEXT);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.bottomMargin = dp(16);
+        card.addView(tv, lp);
+        return tv;
+    }
+
+    /** 添加对话框底部按钮行容器。 */
+    private LinearLayout addDialogButtonRow(LinearLayout card) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.END);
+        card.addView(row, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+        return row;
+    }
+
+    /**
+     * 在按钮行中添加一个按钮。
+     * @param primary true = 强调色填充；false = 半透明灰色
+     */
+    private Button addDialogButton(LinearLayout row, String label, boolean primary) {
+        Button btn = new Button(this);
+        btn.setText(label);
+        btn.setAllCaps(false);
+        btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f);
+        GradientDrawable bg = new GradientDrawable();
+        if (primary) {
+            bg.setColor(COLOR_ACCENT);
+            btn.setTextColor(0xFFFFFFFF);
+        } else {
+            bg.setColor(darkMode ? 0x33FFFFFF : 0x22000000);
+            btn.setTextColor(COLOR_TEXT);
+        }
+        bg.setCornerRadius(dp(10));
+        btn.setBackground(bg);
+        btn.setPadding(dp(16), dp(8), dp(16), dp(8));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.leftMargin = dp(8);
+        row.addView(btn, lp);
+        return btn;
+    }
+
     private void showFatal(Throwable t) {
-        AlertDialog.Builder b = new AlertDialog.Builder(this);
-        b.setTitle("资源准备失败");
-        b.setMessage("无法继续启动游戏: " + t.getMessage()
-                + "\n\n请检查网络后重试，或尝试切换为离线包注入方式。");
-        b.setCancelable(false);
-        b.setPositiveButton("重试",      (d, w) -> recreate());
-        b.setNegativeButton("查看日志",  (d, w) -> openLogModal());
-        b.show();
+        if (!isFinishing()) {
+            View[] frame = inflateDialogFrame();
+            FrameLayout overlay = (FrameLayout) frame[0];
+            LinearLayout card   = (LinearLayout) frame[1];
+            addDialogTitle(card, "资源准备失败");
+            addDialogMessage(card, "无法继续启动游戏: " + t.getMessage()
+                    + "\n\n请检查网络后重试，或尝试切换为离线包注入方式。");
+            LinearLayout row = addDialogButtonRow(card);
+            Button logBtn = addDialogButton(row, "查看日志", false);
+            Button retryBtn = addDialogButton(row, "重试", true);
+            logBtn.setOnClickListener(v -> { overlay.setVisibility(View.GONE); openLogModal(); });
+            retryBtn.setOnClickListener(v -> { overlay.setVisibility(View.GONE); recreate(); });
+            overlay.setVisibility(View.VISIBLE);
+        }
     }
 
     @Override
@@ -1423,18 +1578,39 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     public String requestModeChoice(boolean onlineEnabled, boolean offlineEnabled) {
         modeChoice.set(null);
         ui.post(() -> {
-            final CharSequence[] items = { "在线下载", "离线包注入" };
-            AlertDialog.Builder b = new AlertDialog.Builder(BootstrapActivity.this);
-            b.setTitle("请选择资源下载方式");
-            b.setCancelable(false);
-            b.setItems(items, (dialog, which) -> {
-                synchronized (modeLock) {
-                    modeChoice.set(which == 0
-                            ? ResourceFlow.MODE_ONLINE : ResourceFlow.MODE_OFFLINE);
-                    modeLock.notifyAll();
-                }
-            });
-            b.show();
+            View[] frame = inflateDialogFrame();
+            FrameLayout overlay = (FrameLayout) frame[0];
+            LinearLayout card   = (LinearLayout) frame[1];
+            addDialogTitle(card, "请选择资源下载方式");
+
+            String[] opts = { "在线下载", "离线包注入" };
+            for (int i = 0; i < opts.length; i++) {
+                final String mode = i == 0 ? ResourceFlow.MODE_ONLINE : ResourceFlow.MODE_OFFLINE;
+                Button btn = new Button(this);
+                btn.setText(opts[i]);
+                btn.setAllCaps(false);
+                btn.setTextColor(0xFFFFFFFF);
+                btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f);
+                GradientDrawable bg = new GradientDrawable();
+                bg.setColor(COLOR_ACCENT);
+                bg.setCornerRadius(dp(10));
+                btn.setBackground(bg);
+                btn.setPadding(dp(16), dp(10), dp(16), dp(10));
+                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT);
+                lp.bottomMargin = dp(8);
+                card.addView(btn, lp);
+                btn.setOnClickListener(v -> {
+                    overlay.setVisibility(View.GONE);
+                    vRoot.removeView(overlay);
+                    synchronized (modeLock) {
+                        modeChoice.set(mode);
+                        modeLock.notifyAll();
+                    }
+                });
+            }
+            overlay.setVisibility(View.VISIBLE);
         });
         synchronized (modeLock) {
             while (modeChoice.get() == null) {
@@ -1461,21 +1637,43 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         final int[] result   = { -1 };
         final Object lock = new Object();
         ui.post(() -> {
-            CharSequence[] items = new CharSequence[options.length];
-            for (int i = 0; i < options.length; i++)
-                items[i] = options[i] + " 个" + (options[i] == recommended ? "   (推荐)" : "");
-            AlertDialog.Builder b = new AlertDialog.Builder(BootstrapActivity.this);
-            b.setTitle("同时下载文件数")
-             .setCancelable(false)
-             .setSingleChoiceItems(items, finalDefaultIdx, (d, w) -> selected[0] = w)
-             .setPositiveButton("开始下载", (d, w) -> {
-                 synchronized (lock) {
-                     int idx = Math.max(0, Math.min(selected[0], options.length - 1));
-                     result[0] = options[idx];
-                     lock.notifyAll();
-                 }
-             });
-            b.show();
+            View[] frame = inflateDialogFrame();
+            FrameLayout overlay = (FrameLayout) frame[0];
+            LinearLayout card   = (LinearLayout) frame[1];
+            addDialogTitle(card, "同时下载文件数");
+
+            android.widget.RadioGroup rg = new android.widget.RadioGroup(this);
+            rg.setOrientation(android.widget.RadioGroup.VERTICAL);
+            for (int i = 0; i < options.length; i++) {
+                android.widget.RadioButton rb = new android.widget.RadioButton(this);
+                rb.setText(options[i] + " 个" + (options[i] == recommended ? "  （推荐）" : ""));
+                rb.setTextColor(COLOR_LOG_PANEL_TEXT);
+                rb.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
+                rb.setId(i);
+                if (i == finalDefaultIdx) rb.setChecked(true);
+                rg.addView(rb, new android.widget.RadioGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT));
+            }
+            rg.setOnCheckedChangeListener((g, id) -> selected[0] = id);
+            LinearLayout.LayoutParams rgLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT);
+            rgLp.bottomMargin = dp(16);
+            card.addView(rg, rgLp);
+
+            LinearLayout row = addDialogButtonRow(card);
+            Button okBtn = addDialogButton(row, "开始下载", true);
+            okBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) {
+                    int idx = Math.max(0, Math.min(selected[0], options.length - 1));
+                    result[0] = options[idx];
+                    lock.notifyAll();
+                }
+            });
+            overlay.setVisibility(View.VISIBLE);
         });
         synchronized (lock) {
             while (result[0] < 0) {
@@ -1496,20 +1694,42 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         final String[] result   = { null };
         final Object lock = new Object();
         ui.post(() -> {
-            CharSequence[] items = new CharSequence[keys.length];
+            View[] frame = inflateDialogFrame();
+            FrameLayout overlay = (FrameLayout) frame[0];
+            LinearLayout card   = (LinearLayout) frame[1];
+            addDialogTitle(card, "请选择下载线路");
+
+            android.widget.RadioGroup rg = new android.widget.RadioGroup(this);
+            rg.setOrientation(android.widget.RadioGroup.VERTICAL);
             for (int i = 0; i < keys.length; i++) {
+                android.widget.RadioButton rb = new android.widget.RadioButton(this);
                 java.util.List<String> templates = lines.get(keys[i]);
                 int n = templates != null ? templates.size() : 0;
-                items[i] = keys[i] + (n > 0 ? "  (" + n + " 个镜像)" : "");
+                rb.setText(keys[i] + (n > 0 ? "  (" + n + " 个镜像)" : ""));
+                rb.setTextColor(COLOR_LOG_PANEL_TEXT);
+                rb.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
+                rb.setId(i);
+                if (i == 0) rb.setChecked(true);
+                final int idx = i;
+                rg.addView(rb, new android.widget.RadioGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT));
             }
-            AlertDialog.Builder b = new AlertDialog.Builder(BootstrapActivity.this);
-            b.setTitle("请选择下载线路")
-             .setCancelable(false)
-             .setSingleChoiceItems(items, 0, (d, w) -> selected[0] = keys[w])
-             .setPositiveButton("使用此线路", (d, w) -> {
-                 synchronized (lock) { result[0] = selected[0]; lock.notifyAll(); }
-             });
-            b.show();
+            rg.setOnCheckedChangeListener((g, id) -> selected[0] = keys[id]);
+            LinearLayout.LayoutParams rgLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT);
+            rgLp.bottomMargin = dp(16);
+            card.addView(rg, rgLp);
+
+            LinearLayout row = addDialogButtonRow(card);
+            Button okBtn = addDialogButton(row, "使用此线路", true);
+            okBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { result[0] = selected[0]; lock.notifyAll(); }
+            });
+            overlay.setVisibility(View.VISIBLE);
         });
         synchronized (lock) {
             while (result[0] == null) {
@@ -1699,12 +1919,19 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         final Object   lock = new Object();
         final boolean[] done = { false };
         ui.post(() -> {
-            AlertDialog.Builder b = new AlertDialog.Builder(BootstrapActivity.this);
-            b.setTitle(title).setMessage(message).setCancelable(false)
-             .setPositiveButton("确定", (d, w) -> {
-                 synchronized (lock) { done[0] = true; lock.notifyAll(); }
-             });
-            b.show();
+            View[] frame = inflateDialogFrame();
+            FrameLayout overlay = (FrameLayout) frame[0];
+            LinearLayout card   = (LinearLayout) frame[1];
+            addDialogTitle(card, title);
+            addDialogMessage(card, message);
+            LinearLayout row = addDialogButtonRow(card);
+            Button okBtn = addDialogButton(row, "确定", true);
+            okBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { done[0] = true; lock.notifyAll(); }
+            });
+            overlay.setVisibility(View.VISIBLE);
         });
         synchronized (lock) {
             while (!done[0]) {
@@ -1720,27 +1947,31 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                                        final String jumpLabel, final String jumpUrl) {
         final Object   lock = new Object();
         final boolean[] done = { false };
-        final Runnable[] showRef = new Runnable[1];
-        showRef[0] = () -> {
-            AlertDialog.Builder b = new AlertDialog.Builder(BootstrapActivity.this);
-            b.setTitle(title).setMessage(message).setCancelable(false)
-             .setPositiveButton("确定", (d, w) -> {
-                 synchronized (lock) { done[0] = true; lock.notifyAll(); }
-             })
-             .setNeutralButton(jumpLabel, (d, w) -> {
-                 try {
-                     startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(jumpUrl))
-                             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
-                 } catch (Throwable t) {
-                     Toast.makeText(BootstrapActivity.this,
-                             "无法打开浏览器：" + t.getMessage(), Toast.LENGTH_LONG).show();
-                 }
-                 // 玩家从浏览器返回后让对话框重新出现
-                 ui.postDelayed(showRef[0], 300L);
-             });
-            b.show();
-        };
-        ui.post(showRef[0]);
+        ui.post(() -> {
+            View[] frame = inflateDialogFrame();
+            FrameLayout overlay = (FrameLayout) frame[0];
+            LinearLayout card   = (LinearLayout) frame[1];
+            addDialogTitle(card, title);
+            addDialogMessage(card, message);
+            LinearLayout row = addDialogButtonRow(card);
+            Button jumpBtn = addDialogButton(row, jumpLabel, false);
+            Button okBtn   = addDialogButton(row, "确定", true);
+            jumpBtn.setOnClickListener(v -> {
+                try {
+                    startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(jumpUrl))
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                } catch (Throwable t) {
+                    Toast.makeText(BootstrapActivity.this,
+                            "无法打开浏览器：" + t.getMessage(), Toast.LENGTH_LONG).show();
+                }
+            });
+            okBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { done[0] = true; lock.notifyAll(); }
+            });
+            overlay.setVisibility(View.VISIBLE);
+        });
         synchronized (lock) {
             while (!done[0]) {
                 try { lock.wait(500); } catch (InterruptedException ie) {
@@ -1756,17 +1987,26 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         final boolean[] done = { false };
         final Runnable[] showRef = new Runnable[1];
         showRef[0] = () -> {
-            AlertDialog.Builder b = new AlertDialog.Builder(BootstrapActivity.this);
-            b.setTitle(title).setMessage(message).setCancelable(false)
-             .setPositiveButton("退出", (d, w) -> {
-                 synchronized (lock) { done[0] = true; lock.notifyAll(); }
-             })
-             .setNeutralButton("查看日志", (d, w) -> {
-                 // 记录"重弹 FATAL"的 Runnable，关掉日志面板时会重新弹出
-                 fatalRetrigger = showRef[0];
-                 openLogModal();
-             });
-            b.show();
+            View[] frame = inflateDialogFrame();
+            FrameLayout overlay = (FrameLayout) frame[0];
+            LinearLayout card   = (LinearLayout) frame[1];
+            addDialogTitle(card, title);
+            addDialogMessage(card, message);
+            LinearLayout row = addDialogButtonRow(card);
+            Button logBtn  = addDialogButton(row, "查看日志", false);
+            Button exitBtn = addDialogButton(row, "退出", true);
+            logBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                // 关闭日志面板后重新展示此对话框
+                fatalRetrigger = showRef[0];
+                openLogModal();
+            });
+            exitBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { done[0] = true; lock.notifyAll(); }
+            });
+            overlay.setVisibility(View.VISIBLE);
         };
         ui.post(showRef[0]);
         synchronized (lock) {
@@ -1787,26 +2027,31 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                                           final String jumpLabel, final String jumpUrl) {
         final Object   lock = new Object();
         final boolean[] done = { false };
-        final Runnable[] showRef = new Runnable[1];
-        showRef[0] = () -> {
-            AlertDialog.Builder b = new AlertDialog.Builder(BootstrapActivity.this);
-            b.setTitle(title).setMessage(message).setCancelable(false)
-             .setPositiveButton("退出", (d, w) -> {
-                 synchronized (lock) { done[0] = true; lock.notifyAll(); }
-             })
-             .setNeutralButton(jumpLabel, (d, w) -> {
-                 try {
-                     startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(jumpUrl))
-                             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
-                 } catch (Throwable t) {
-                     Toast.makeText(BootstrapActivity.this,
-                             "无法打开浏览器：" + t.getMessage(), Toast.LENGTH_LONG).show();
-                 }
-                 ui.postDelayed(showRef[0], 300L);
-             });
-            b.show();
-        };
-        ui.post(showRef[0]);
+        ui.post(() -> {
+            View[] frame = inflateDialogFrame();
+            FrameLayout overlay = (FrameLayout) frame[0];
+            LinearLayout card   = (LinearLayout) frame[1];
+            addDialogTitle(card, title);
+            addDialogMessage(card, message);
+            LinearLayout row = addDialogButtonRow(card);
+            Button jumpBtn = addDialogButton(row, jumpLabel, false);
+            Button exitBtn = addDialogButton(row, "退出", true);
+            jumpBtn.setOnClickListener(v -> {
+                try {
+                    startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(jumpUrl))
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                } catch (Throwable t) {
+                    Toast.makeText(BootstrapActivity.this,
+                            "无法打开浏览器：" + t.getMessage(), Toast.LENGTH_LONG).show();
+                }
+            });
+            exitBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { done[0] = true; lock.notifyAll(); }
+            });
+            overlay.setVisibility(View.VISIBLE);
+        });
         synchronized (lock) {
             while (!done[0]) {
                 try { lock.wait(500); } catch (InterruptedException ie) {
