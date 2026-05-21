@@ -36,7 +36,7 @@
         <meta-data android:name="com.google.firebase.messaging.default_notification_icon" android:resource="@mipmap/ic_stat_notify"/>
         <meta-data android:name="com.google.firebase.messaging.default_notification_color" android:resource="@color/fcm_color"/>
         <meta-data android:name="com.google.firebase.messaging.default_notification_channel_id" android:value="@string/fcm_channel_id"/>
-        <activity android:configChanges="keyboard|keyboardHidden|orientation|screenSize" android:exported="true" android:immersive="true" android:launchMode="singleTask" android:name="jp.f4samurai.AppActivity" android:screenOrientation="userLandscape" android:theme="@android:style/Theme.NoTitleBar.Fullscreen" android:windowSoftInputMode="adjustPan|stateVisible">
+        <activity android:configChanges="keyboard|keyboardHidden|orientation|screenSize" android:exported="true" android:immersive="true" android:launchMode="singleTask" android:name="io.kamihama.cnv.BootstrapActivity" android:screenOrientation="userLandscape" android:theme="@android:style/Theme.NoTitleBar.Fullscreen" android:windowSoftInputMode="adjustPan|stateHidden">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
@@ -54,6 +54,8 @@
                 <data android:scheme="magireco.reward"/>
             </intent-filter>
         </activity>
+        <activity android:configChanges="keyboard|keyboardHidden|orientation|screenSize" android:exported="false" android:immersive="true" android:launchMode="singleTask" android:name="jp.f4samurai.AppActivity" android:screenOrientation="userLandscape" android:theme="@android:style/Theme.NoTitleBar.Fullscreen" android:windowSoftInputMode="adjustPan|stateVisible"/>
+        <provider android:authorities="io.kamihama.totentanz.cnvupdate" android:exported="false" android:grantUriPermissions="true" android:name="io.kamihama.cnv.UpdateProvider"/>
         <service android:exported="true" android:name="jp.f4samurai.pnote.util.MyFcmListenerService">
             <intent-filter>
                 <action android:name="com.google.firebase.MESSAGING_EVENT"/>
