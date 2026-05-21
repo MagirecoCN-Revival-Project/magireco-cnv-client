@@ -846,6 +846,25 @@
     invoke-virtual {v0}, Ljava/lang/Exception;->printStackTrace()V
 
     :goto_0
+    # CNV: 链式加载 libMagiaClient.so —— native runtime hook 伙伴库。
+    # 必须紧跟 madomagi_native 之后，因为它的 JNI_OnLoad 要 hook
+    # madomagi_native 内部 C++ 符号。失败不影响游戏运行（仅汉化
+    # native hook 不生效，引擎本体已正常工作）。
+    :try_start_1
+    const-string v0, "MagiaClient"
+
+    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V
+    :try_end_1
+    .catch Ljava/lang/Exception; {:try_start_1 .. :try_end_1} :catch_1
+
+    goto :goto_1
+
+    :catch_1
+    move-exception v0
+
+    invoke-virtual {v0}, Ljava/lang/Exception;->printStackTrace()V
+
+    :goto_1
     return-void
 .end method
 
