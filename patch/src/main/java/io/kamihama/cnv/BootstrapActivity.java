@@ -301,16 +301,16 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
 
-        // ── 第 1 层：毛玻璃底板（覆盖中间内容区，四角按钮区在外） ──
+        // ── 第 1 层：毛玻璃底板（居中覆盖，浮动按钮叠在上方） ──
         // 使用异步 Stack Blur 处理背景图，初次显示前先用纯色半透明占位
         GlassPanelView glassPanel = new GlassPanelView(this, COLOR_GLASS, COLOR_GLASS_STK, dp(20));
         FrameLayout.LayoutParams glassLp = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT);
-        glassLp.leftMargin  = dp(56);   // 左上角 LOG 按钮宽度
-        glassLp.rightMargin = dp(10);
-        glassLp.topMargin   = dp(52);   // 顶部按钮高度
-        glassLp.bottomMargin= dp(28);   // 底部版本文字高度
+        glassLp.leftMargin   = dp(16);
+        glassLp.rightMargin  = dp(16);
+        glassLp.topMargin    = dp(16);
+        glassLp.bottomMargin = dp(16);
         root.addView(glassPanel, glassLp);
 
         // ── 第 2 层：主内容区（横向两列） ──
