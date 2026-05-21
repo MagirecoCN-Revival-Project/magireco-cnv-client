@@ -1,0 +1,1605 @@
+package io.kamihama.cnv;
+
+import android.app.Activity;
+import android.app.AlertDialog;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
+import android.content.DialogInterface;
+import android.content.Intent;
+import android.content.res.AssetFileDescriptor;
+import android.graphics.drawable.GradientDrawable;
+import android.media.AudioManager;
+import android.media.MediaPlayer;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.util.TypedValue;
+import android.view.Gravity;
+import android.view.View;
+import android.view.ViewGroup;
+import android.view.WindowManager;
+import android.widget.Button;
+import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.ProgressBar;
+import android.widget.ScrollView;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.Locale;
+import java.util.concurrent.atomic.AtomicReference;
+
+/**
+ * 启动前的引导 Activity（LAUNCHER）。
+ *
+ * <p>它的职责是：在 Cocos2dx 引擎接管之前完成所有资源准备
+ * 工作（在线下载或离线包注入、客户端版本核查、剧本热更新等），
+ * 然后通过 Intent 显式启动 {@link jp.f4samurai.AppActivity}
+ * （后者在 AndroidManifest 中已被改为 {@code exported="false"}）。
+ *
+ * <p>这种"先 Java 准备好再交给 native"的设计，确保了原版的
+ * 资源下载 / 完整性校验代码在 native 侧根本没有机会跑起来。
+ *
+ * <p>本类同时也是 {@link ResourceFlow.Reporter} 的 UI 实现：
+ * 渲染极光背景、进度卡片、浮动日志和顶部胶囊按钮，并把所有
+ * 业务层的 dialog 请求、文件选择请求、进度更新转译成对应的
+ * Android UI 事件。
+ */
+public class BootstrapActivity extends Activity implements ResourceFlow.Reporter {
+
+    public static final String TAG = "CNVBoot";
+    public static final String GAME_ACTIVITY = "jp.f4samurai.AppActivity";
+
+    /**
+     * Native 兜底入口：被 {@code libMagiaClient.so} 在「flag 缺失 +
+     * 引擎尝试触发原版下载」时反向调用。这意味着用户绕过了引导
+     * （或被外部清过 data 但 APK 没动），唯一安全的做法是杀掉当前
+     * 引擎进程、把玩家踢回 BootstrapActivity 重新走资源准备流程。
+     *
+     * <p>用 {@code ActivityThread.currentApplication()} 反射拿
+     * Application context，避免在静态成员里维护一份脆弱的 context 引用。
+     * 该 API 是 hidden 但在 Android Q+ 仍位于 unhidden allowlist 上，
+     * 跨版本稳定。
+     */
+    public static void startCNDownload() {
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            Object app = at.getMethod("currentApplication").invoke(null);
+            if (app == null) {
+                android.util.Log.e(TAG, "startCNDownload: 无法取到 Application");
+                return;
+            }
+            Context ctx = (Context) app;
+            Intent it = new Intent(ctx, BootstrapActivity.class);
+            it.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+            ctx.startActivity(it);
+            android.util.Log.i(TAG, "startCNDownload: 已拉起 BootstrapActivity，杀掉引擎进程");
+            // 杀掉自己（引擎进程），让 Android 接到 startActivity 之后
+            // 干净地启一个新 task。否则两个 Activity 会在同一进程里挤
+            // 着，Cocos2dx 已经初始化过的 native 状态没法重置。
+            android.os.Process.killProcess(android.os.Process.myPid());
+        } catch (Throwable t) {
+            android.util.Log.e(TAG, "startCNDownload fallback 失败: " + t.getMessage(), t);
+        }
+    }
+
+    private static final int REQ_FILE_PICK = 0x4D47;
+    private static final String PREFS_NAME = "cnv_bootstrap_ui";
+    private static final String PREF_DARK_MODE = "dark_mode";
+
+    // ---- 配色：浅色调（Madoka 粉色） + 深色调，运行时可切换 ----
+    private int COLOR_CARD;
+    private int COLOR_CARD_STK;
+    private int COLOR_ACCENT;
+    private int COLOR_ACCENT2;
+    private int COLOR_TEXT;
+    private int COLOR_SUB;
+    private int COLOR_LOG;
+    private int COLOR_BAR_BG;
+    private int COLOR_LOG_PILL;
+    private int COLOR_DIM;
+    /** 日志面板自身的背景色——深色模式下不再用纯白底，否则
+     *  浅色的 COLOR_TEXT 在白底上几乎不可读。 */
+    private int COLOR_LOG_PANEL_BG;
+    /** 日志面板正文里的文字颜色——单独于 COLOR_TEXT，给日志面板
+     *  用更高对比度的颜色保证可读性。 */
+    private int COLOR_LOG_PANEL_TEXT;
+    /** 当前是否处于深色模式。 */
+    private boolean darkMode = false;
+
+    private void loadPalette(boolean dark) {
+        if (dark) {
+            COLOR_CARD     = 0xF21F1730;
+            COLOR_CARD_STK = 0x55FF80C0;
+            COLOR_ACCENT   = 0xFFFF7AC2;
+            COLOR_ACCENT2  = 0xFFB87FE0;
+            COLOR_TEXT     = 0xFFEFE4F8;
+            COLOR_SUB      = 0xFFB9A6C8;
+            COLOR_LOG      = 0xCCB9A6C8;
+            COLOR_BAR_BG   = 0x44FFFFFF;
+            COLOR_LOG_PILL = 0xE6FF6FB5;
+            COLOR_DIM      = 0xAA000000;
+            // 深色模式：日志面板用接近卡片的深紫底 + 纯白字
+            COLOR_LOG_PANEL_BG   = 0xFF1B1029;
+            COLOR_LOG_PANEL_TEXT = 0xFFF5ECFB;
+        } else {
+            COLOR_CARD     = 0xF2FFFFFF;
+            COLOR_CARD_STK = 0x33B53C8C;
+            COLOR_ACCENT   = 0xFFD63384;
+            COLOR_ACCENT2  = 0xFF9C5BC2;
+            COLOR_TEXT     = 0xFF2A1A3B;
+            COLOR_SUB      = 0xFF6E5276;
+            COLOR_LOG      = 0x99452A52;
+            COLOR_BAR_BG   = 0x22000000;
+            COLOR_LOG_PILL = 0xE6D63384;
+            COLOR_DIM      = 0x88000000;
+            // 浅色模式：保持原来的纯白底 + 深紫字
+            COLOR_LOG_PANEL_BG   = 0xFFFFFFFF;
+            COLOR_LOG_PANEL_TEXT = 0xFF2A1A3B;
+        }
+    }
+
+    // ---- 卡片内 widget（构建一次） ----
+    private TextView vTitle;
+    private TextView vSubtitle;
+    private TextView vPhase;
+    private TextView vStatus;
+    private TextView vAggregate;
+    private TextView vOverallText;
+    private TextView vCredits;
+    private ProgressBar pbOverall;
+    private LinearLayout slotContainer;
+    private LinearLayout card;
+    private GradientDrawable cardBgDrawable;
+    private AuroraView aurora;
+    private TextView vThemeChip;
+    private TextView vHomeChip;
+    private TextView vGitHubChip;
+    private GradientDrawable themeChipBg;
+    private GradientDrawable homeChipBg;
+    private GradientDrawable githubChipBg;
+
+    // ---- 槽位 widget（每次 initSlots(n) 重新构建一组） ----
+    private TextView[] slotNameViews;
+    private ProgressBar[] slotBars;
+    private TextView[] slotMetaViews;
+
+    // ---- 浮动日志面板 ----
+    private TextView vLogPill;
+    private FrameLayout logModal;
+    private TextView vLogFull;
+    /** 当 FATAL 对话框被"查看日志"按钮临时关掉、日志面板正在显示时，
+     *  这里记着重新展示 FATAL 对话框的 Runnable。日志面板关闭时
+     *  {@link #closeLogModal} 会把它 post 回 UI 线程重新弹窗，让用户
+     *  最终能点到"退出"按钮——这是阻止进程在用户看完日志前被杀掉的
+     *  关键，否则点"查看日志"就会闪退。 */
+    private Runnable fatalRetrigger;
+
+    // ---- 下载界面 BGM（沿用原版的 bgm00_system01）-------------------
+    /** 原版游戏下载页 BGM 的资源路径。原文件是 CRI HCA 格式
+     *  ({@code .hca})，Android MediaPlayer 不能直接放；构建 CI 用
+     *  vgmstream-cli + ffmpeg 把它转码成 OGG 后塞到 APK assets/ 里和
+     *  原 HCA 文件并列存在。<br>
+     *  apktool.yml 的 {@code doNotCompress} 已经加了 {@code ogg}，所以
+     *  {@link android.content.res.AssetManager#openFd} 能直接拿到 fd 给
+     *  {@link MediaPlayer#setDataSource(java.io.FileDescriptor, long, long)}
+     *  用，避免还要解压到磁盘。 */
+    private static final String BGM_ASSET =
+            "resource/sound_native/bgm/bgm00_system01_hca.ogg";
+    private MediaPlayer bgmPlayer;
+    /** 调用 {@link #pauseBgm()} 时记录"暂停前是否在放"，这样
+     *  {@link #resumeBgm()} 只会在玩家把 APP 从后台切回来时恢复，
+     *  不会无中生有地开始播。 */
+    private boolean bgmWasPlayingWhenPaused = false;
+    /** 永久跳过 BGM——一旦 startBgm 在某次启动里失败（比如 OGG 资源
+     *  缺失），就置 true，本会话内不再尝试播，避免 onResume 反复重试。 */
+    private boolean bgmDisabled = false;
+    private ScrollView vLogScroll;
+    private final Deque<String> logBuffer = new ArrayDeque<>();
+    private static final int LOG_BUFFER_MAX = 500;
+
+    private final Handler ui = new Handler(Looper.getMainLooper());
+    private volatile boolean cancelled = false;
+    private volatile boolean launched = false;
+
+    private final AtomicReference<String> modeChoice = new AtomicReference<>(null);
+    private final Object modeLock = new Object();
+
+    private final AtomicReference<Uri> pickedUri = new AtomicReference<>(null);
+    private final Object pickLock = new Object();
+    private volatile boolean pickFinished = false;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        applyFullscreen();
+        // 读取上次保存的主题偏好，初始化配色
+        darkMode = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getBoolean(PREF_DARK_MODE, false);
+        loadPalette(darkMode);
+        // 启动时把上次的 lastest.log 打开（截断），开始记录本次会话
+        openLogFile();
+        setContentView(buildLayout());
+        // 先渲染一个槽位，避免在线程启动前 UI 是空白
+        initSlots(1);
+        // 启动原版下载页 BGM（异步 prepare，不阻塞 UI）
+        startBgm();
+        Thread t = new Thread(this::runWork, "cnv-bootstrap");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // 玩家从后台 / 浏览器返回时把 BGM 接着放（如果之前在放过）
+        resumeBgm();
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        pauseBgm();
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        stopBgm();
+        closeLogFile();
+    }
+
+    private void applyFullscreen() {
+        getWindow().setFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN,
+                WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        getWindow().setFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
+                WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        if (Build.VERSION.SDK_INT >= 19) {
+            getWindow().getDecorView().setSystemUiVisibility(
+                    View.SYSTEM_UI_FLAG_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                            | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                            | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+        }
+    }
+
+    private View buildLayout() {
+        FrameLayout root = new FrameLayout(this);
+
+        // ---- 背景：极光动效 ----
+        aurora = new AuroraView(this);
+        aurora.setDarkMode(darkMode);
+        root.addView(aurora, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT));
+
+        // ---- ScrollView 包住整列，防止屏幕较矮时下方状态行被裁掉 ----
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        root.addView(scroll, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT));
+
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setGravity(Gravity.CENTER_HORIZONTAL | Gravity.CENTER_VERTICAL);
+        // 给顶部留出空间避免被胶囊按钮压住
+        col.setPadding(dp(24), dp(48), dp(24), dp(16));
+        scroll.addView(col, new ScrollView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        vTitle = new TextView(this);
+        vTitle.setText("✨  Magia Record  ✨");
+        vTitle.setTextColor(COLOR_ACCENT);
+        vTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f);
+        vTitle.setGravity(Gravity.CENTER);
+        col.addView(vTitle, lpRow(0, dp(2)));
+
+        vSubtitle = new TextView(this);
+        vSubtitle.setText("私服资源准备中 / Preparing assets");
+        vSubtitle.setTextColor(COLOR_SUB);
+        vSubtitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
+        vSubtitle.setGravity(Gravity.CENTER);
+        col.addView(vSubtitle, lpRow(0, dp(10)));
+
+        // ---- 卡片 ----
+        card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(18), dp(14), dp(18), dp(14));
+        cardBgDrawable = new GradientDrawable();
+        cardBgDrawable.setColor(COLOR_CARD);
+        cardBgDrawable.setCornerRadius(dp(16));
+        cardBgDrawable.setStroke(dp(1), COLOR_CARD_STK);
+        card.setBackground(cardBgDrawable);
+        col.addView(card, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        // 阶段名 + 汇总信息 行
+        LinearLayout headRow = new LinearLayout(this);
+        headRow.setOrientation(LinearLayout.HORIZONTAL);
+        card.addView(headRow, lpRow(0, dp(6)));
+        vPhase = new TextView(this);
+        vPhase.setText("初始化");
+        vPhase.setTextColor(COLOR_ACCENT);
+        vPhase.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
+        headRow.addView(vPhase, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        vAggregate = new TextView(this);
+        vAggregate.setText("");
+        vAggregate.setTextColor(COLOR_SUB);
+        vAggregate.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f);
+        vAggregate.setGravity(Gravity.END);
+        headRow.addView(vAggregate, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        // 槽位容器（initSlots(n) 会重建里面的所有 row）
+        slotContainer = new LinearLayout(this);
+        slotContainer.setOrientation(LinearLayout.VERTICAL);
+        card.addView(slotContainer, lpRow(0, dp(6)));
+
+        vOverallText = new TextView(this);
+        vOverallText.setText("整体进度");
+        vOverallText.setTextColor(COLOR_TEXT);
+        vOverallText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
+        card.addView(vOverallText, lpRow(0, dp(2)));
+
+        pbOverall = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        pbOverall.setMax(1000);
+        pbOverall.setProgress(0);
+        tintBar(pbOverall, true);
+        LinearLayout.LayoutParams pbAllLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(10));
+        pbAllLp.bottomMargin = dp(4);
+        card.addView(pbOverall, pbAllLp);
+
+        // 署名：Made by CyberNova（蓝） & Data from MadeInMagius（浅军绿）, segfault（粉）, 水银h2oag（天蓝）
+        vCredits = new TextView(this);
+        vCredits.setText(buildCreditsSpan());
+        vCredits.setTextColor(COLOR_SUB);
+        vCredits.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f);
+        vCredits.setGravity(Gravity.END);
+        card.addView(vCredits, lpRow(0, dp(8)));
+
+        vStatus = new TextView(this);
+        vStatus.setText("正在加载...");
+        vStatus.setTextColor(COLOR_TEXT);
+        vStatus.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
+        vStatus.setGravity(Gravity.CENTER);
+        vStatus.setSingleLine(true);
+        vStatus.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
+        card.addView(vStatus, lpRow(0, 0));
+
+        // ---- 浮动日志胶囊（左上角） ----
+        vLogPill = new TextView(this);
+        vLogPill.setText("LOG");
+        vLogPill.setTextColor(0xFFFFFFFF);
+        vLogPill.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f);
+        vLogPill.setTypeface(vLogPill.getTypeface(), android.graphics.Typeface.BOLD);
+        vLogPill.setGravity(Gravity.CENTER);
+        vLogPill.setPadding(dp(12), dp(6), dp(12), dp(6));
+        GradientDrawable pillBg = new GradientDrawable();
+        pillBg.setColor(COLOR_LOG_PILL);
+        pillBg.setCornerRadius(dp(20));
+        vLogPill.setBackground(pillBg);
+        FrameLayout.LayoutParams pillLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        pillLp.gravity = Gravity.TOP | Gravity.START;
+        pillLp.topMargin = dp(10);
+        pillLp.leftMargin = dp(10);
+        vLogPill.setOnClickListener(v -> openLogModal());
+        root.addView(vLogPill, pillLp);
+
+        // ---- 右上角胶囊按钮：[主题切换] [主页] [GitHub] ----
+        LinearLayout headRight = new LinearLayout(this);
+        headRight.setOrientation(LinearLayout.HORIZONTAL);
+        FrameLayout.LayoutParams headLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        headLp.gravity = Gravity.TOP | Gravity.END;
+        headLp.topMargin = dp(10);
+        headLp.rightMargin = dp(10);
+
+        // 主题切换：当前为浅色 → 显示 "☾"（按下切到深色）；反之亦然
+        vThemeChip = new TextView(this);
+        vThemeChip.setTextColor(0xFFFFFFFF);
+        vThemeChip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f);
+        vThemeChip.setTypeface(vThemeChip.getTypeface(), android.graphics.Typeface.BOLD);
+        vThemeChip.setGravity(Gravity.CENTER);
+        vThemeChip.setPadding(dp(12), dp(6), dp(12), dp(6));
+        themeChipBg = new GradientDrawable();
+        themeChipBg.setCornerRadius(dp(20));
+        vThemeChip.setBackground(themeChipBg);
+        vThemeChip.setOnClickListener(v -> toggleTheme());
+        headRight.addView(vThemeChip, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        homeChipBg = new GradientDrawable();
+        homeChipBg.setCornerRadius(dp(20));
+        vHomeChip = makeChip("⌂  主页", "https://www.magireco.top", homeChipBg);
+        LinearLayout.LayoutParams homeLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        homeLp.leftMargin = dp(8);
+        headRight.addView(vHomeChip, homeLp);
+
+        githubChipBg = new GradientDrawable();
+        githubChipBg.setCornerRadius(dp(20));
+        vGitHubChip = makeChip("</>  GitHub",
+                "https://github.com/MagirecoCN-Revival-Project",
+                githubChipBg);
+        LinearLayout.LayoutParams ghLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        ghLp.leftMargin = dp(8);
+        headRight.addView(vGitHubChip, ghLp);
+        root.addView(headRight, headLp);
+
+        applyThemeChipColors();
+
+        // ---- 日志模态面板（默认隐藏） ----
+        logModal = new FrameLayout(this);
+        logModal.setBackgroundColor(COLOR_DIM);
+        logModal.setVisibility(View.GONE);
+        logModal.setClickable(true);
+        // 点击半透明遮罩区域会关闭面板；点击面板自身会被它的
+        // clickable=true 吞掉，不冒泡。
+        logModal.setOnClickListener(v -> closeLogModal());
+        FrameLayout.LayoutParams modalLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT);
+        root.addView(logModal, modalLp);
+
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setClickable(true);
+        panel.setPadding(dp(16), dp(16), dp(16), dp(16));
+        GradientDrawable panelBg = new GradientDrawable();
+        panelBg.setColor(COLOR_LOG_PANEL_BG);
+        panelBg.setCornerRadius(dp(16));
+        panelBg.setStroke(dp(1), COLOR_CARD_STK);
+        panel.setBackground(panelBg);
+        FrameLayout.LayoutParams panelLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT);
+        panelLp.leftMargin = dp(20);
+        panelLp.rightMargin = dp(20);
+        panelLp.topMargin = dp(20);
+        panelLp.bottomMargin = dp(20);
+        logModal.addView(panel, panelLp);
+
+        // 头部一行：标题 + 复制按钮 + 关闭按钮
+        LinearLayout logHead = new LinearLayout(this);
+        logHead.setOrientation(LinearLayout.HORIZONTAL);
+        logHead.setGravity(Gravity.CENTER_VERTICAL);
+        panel.addView(logHead, lpRow(0, dp(8)));
+        TextView logTitle = new TextView(this);
+        logTitle.setText("调试日志");
+        logTitle.setTextColor(COLOR_ACCENT);
+        logTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f);
+        LinearLayout.LayoutParams ltLp = new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        logHead.addView(logTitle, ltLp);
+        Button copyBtn = new Button(this);
+        copyBtn.setText("复制全部");
+        copyBtn.setAllCaps(false);
+        copyBtn.setTextColor(0xFFFFFFFF);
+        GradientDrawable copyBg = new GradientDrawable();
+        copyBg.setColor(COLOR_ACCENT);
+        copyBg.setCornerRadius(dp(8));
+        copyBtn.setBackground(copyBg);
+        copyBtn.setMinHeight(dp(36));
+        copyBtn.setMinimumHeight(dp(36));
+        copyBtn.setPadding(dp(14), dp(4), dp(14), dp(4));
+        copyBtn.setOnClickListener(v -> copyLogToClipboard());
+        logHead.addView(copyBtn, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+        Button closeBtn = new Button(this);
+        closeBtn.setText("关闭");
+        closeBtn.setAllCaps(false);
+        closeBtn.setTextColor(COLOR_TEXT);
+        GradientDrawable closeBg = new GradientDrawable();
+        closeBg.setColor(0x22000000);
+        closeBg.setCornerRadius(dp(8));
+        closeBtn.setBackground(closeBg);
+        closeBtn.setPadding(dp(14), dp(4), dp(14), dp(4));
+        LinearLayout.LayoutParams closeLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        closeLp.leftMargin = dp(8);
+        closeBtn.setOnClickListener(v -> closeLogModal());
+        logHead.addView(closeBtn, closeLp);
+
+        // 可滚动的日志正文（等宽字体 + 可全文选择）
+        vLogScroll = new ScrollView(this);
+        LinearLayout.LayoutParams scrollLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                0, 1f);
+        panel.addView(vLogScroll, scrollLp);
+        vLogFull = new TextView(this);
+        vLogFull.setText("");
+        vLogFull.setTextColor(COLOR_LOG_PANEL_TEXT);
+        vLogFull.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f);
+        vLogFull.setTypeface(android.graphics.Typeface.MONOSPACE);
+        vLogFull.setTextIsSelectable(true);
+        vLogScroll.addView(vLogFull, new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        return root;
+    }
+
+    private LinearLayout.LayoutParams lpRow(int marginTop, int marginBottom) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = marginTop;
+        lp.bottomMargin = marginBottom;
+        return lp;
+    }
+
+    private void tintBar(ProgressBar pb, boolean accent) {
+        if (Build.VERSION.SDK_INT >= 21) {
+            int c = accent ? COLOR_ACCENT : COLOR_ACCENT2;
+            pb.setProgressTintList(android.content.res.ColorStateList.valueOf(c));
+            pb.setProgressBackgroundTintList(android.content.res.ColorStateList.valueOf(COLOR_BAR_BG));
+        }
+    }
+
+    private int dp(int v) {
+        return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
+    }
+
+    /**
+     * 右上角胶囊形按钮（主页 / GitHub）的工厂方法。
+     * 调用方负责传入一个 {@link GradientDrawable} 作为背景，方便切换
+     * 主题时统一更新这些胶囊的颜色。
+     */
+    private TextView makeChip(String label, final String openUrl, GradientDrawable bg) {
+        TextView t = new TextView(this);
+        t.setText(label);
+        t.setTextColor(0xFFFFFFFF);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f);
+        t.setTypeface(t.getTypeface(), android.graphics.Typeface.BOLD);
+        t.setGravity(Gravity.CENTER);
+        t.setPadding(dp(12), dp(6), dp(12), dp(6));
+        t.setBackground(bg);
+        t.setOnClickListener(v -> {
+            try {
+                Intent it = new Intent(Intent.ACTION_VIEW, Uri.parse(openUrl));
+                it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                startActivity(it);
+            } catch (Throwable ex) {
+                Toast.makeText(BootstrapActivity.this,
+                        "无法打开链接: " + openUrl, Toast.LENGTH_SHORT).show();
+            }
+        });
+        return t;
+    }
+
+    /** 应用当前调色板到右上角胶囊按钮和日志胶囊。 */
+    private void applyThemeChipColors() {
+        if (themeChipBg != null) themeChipBg.setColor(darkMode ? 0xCCFFE4A0 : COLOR_ACCENT2);
+        if (vThemeChip != null) vThemeChip.setText(darkMode ? "☀  亮色" : "☾  夜间");
+        if (homeChipBg != null) homeChipBg.setColor(COLOR_LOG_PILL);
+        if (githubChipBg != null) githubChipBg.setColor(COLOR_ACCENT2);
+    }
+
+    /** 切换深色 / 浅色模式：保存偏好后重建 UI。 */
+    private void toggleTheme() {
+        darkMode = !darkMode;
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(PREF_DARK_MODE, darkMode).apply();
+        loadPalette(darkMode);
+        // 重建整个 UI 树。Reporter 的 ui.post 通过 Handler 走主线程，
+        // 重建后 ui.post 仍能正常工作（Handler 不绑定具体 View）；
+        // 字段引用会被新的 buildLayout() 重新赋值。
+        setContentView(buildLayout());
+        // 重建一组占位槽位（实际 slot 数量后续会被 ResourceFlow 重置）
+        if (slotNameViews != null) initSlots(slotNameViews.length);
+        else initSlots(1);
+        // 用 INFO 日志记一笔，便于排错
+        log("INFO", "[UI] 切换主题：" + (darkMode ? "夜间" : "亮色"));
+    }
+
+    /** 用 SpannableString 构造带不同颜色的署名行。
+     *
+     *  Made by CyberNova feat. MadeInMagius & Data from segfault and 水银h2oag
+     *          ↑蓝         ↑浅军绿              ↑粉           ↑天蓝
+     */
+    private CharSequence buildCreditsSpan() {
+        String prefix = "Made by ";
+        String n1     = "CyberNova";       // → 蓝
+        String mid1   = " feat. ";
+        String n2     = "MadeInMagius";    // → 浅军绿
+        String mid2   = " & Data from ";
+        String n3     = "segfault";        // → 粉
+        String and3   = " and ";
+        String n4     = "水银h2oag";        // → 天蓝
+        String full   = prefix + n1 + mid1 + n2 + mid2 + n3 + and3 + n4;
+        android.text.SpannableString ss = new android.text.SpannableString(full);
+        int i = prefix.length();
+        ss.setSpan(new android.text.style.ForegroundColorSpan(0xFF3D7BFF),
+                i, i + n1.length(), 0);
+        i += n1.length() + mid1.length();
+        ss.setSpan(new android.text.style.ForegroundColorSpan(0xFF8BB87A),
+                i, i + n2.length(), 0);
+        i += n2.length() + mid2.length();
+        ss.setSpan(new android.text.style.ForegroundColorSpan(0xFFE667A0),
+                i, i + n3.length(), 0);
+        i += n3.length() + and3.length();
+        ss.setSpan(new android.text.style.ForegroundColorSpan(0xFF4FB7E6),
+                i, i + n4.length(), 0);
+        return ss;
+    }
+
+    // -- 浮动日志面板 ---------------------------------------------------
+
+    private void openLogModal() {
+        renderLogModal();
+        logModal.setVisibility(View.VISIBLE);
+        vLogScroll.post(() -> vLogScroll.fullScroll(View.FOCUS_DOWN));
+    }
+
+    private void closeLogModal() {
+        logModal.setVisibility(View.GONE);
+        // 如果 FATAL 流程被"查看日志"打断了，关掉日志面板后要把
+        // FATAL 对话框重新弹回来，否则工作线程会永远停在 wait() 上、
+        // 用户也没有"退出"按钮可点，APP 看上去就死了。
+        if (fatalRetrigger != null) {
+            Runnable r = fatalRetrigger;
+            fatalRetrigger = null;
+            ui.post(r);
+        }
+    }
+
+    private void renderLogModal() {
+        StringBuilder sb = new StringBuilder();
+        synchronized (logBuffer) {
+            for (String s : logBuffer) {
+                sb.append(s).append('\n');
+            }
+        }
+        vLogFull.setText(sb.toString());
+    }
+
+    // -- BGM 控制 -------------------------------------------------------
+
+    /** 异步启动下载页 BGM（原版游戏同款）。已经在放则忽略；OGG 资源
+     *  缺失或任何解码错误都静默跳过，不影响下载主流程。 */
+    private void startBgm() {
+        if (bgmDisabled || bgmPlayer != null) return;
+        try {
+            AssetFileDescriptor afd = getAssets().openFd(BGM_ASSET);
+            MediaPlayer mp = new MediaPlayer();
+            mp.setAudioStreamType(AudioManager.STREAM_MUSIC);
+            mp.setDataSource(afd.getFileDescriptor(),
+                    afd.getStartOffset(), afd.getLength());
+            try { afd.close(); } catch (Throwable ignore) {}
+            mp.setLooping(true);
+            mp.setOnPreparedListener(p -> {
+                try { p.start(); } catch (Throwable ignore) {}
+            });
+            mp.setOnErrorListener((p, what, extra) -> {
+                // 解码失败：释放 + 本会话内不再尝试
+                try { p.release(); } catch (Throwable ignore) {}
+                bgmPlayer = null;
+                bgmDisabled = true;
+                return true;
+            });
+            bgmPlayer = mp;
+            mp.prepareAsync();
+        } catch (Throwable t) {
+            // 资源缺失（CI 没跑解码 / apktool.yml 没把 ogg 加到
+            // doNotCompress）— 本会话内不再尝试。
+            bgmPlayer = null;
+            bgmDisabled = true;
+        }
+    }
+
+    private void pauseBgm() {
+        if (bgmPlayer == null) return;
+        try {
+            if (bgmPlayer.isPlaying()) {
+                bgmPlayer.pause();
+                bgmWasPlayingWhenPaused = true;
+            }
+        } catch (Throwable ignore) {}
+    }
+
+    private void resumeBgm() {
+        if (bgmPlayer == null || !bgmWasPlayingWhenPaused) return;
+        try {
+            bgmPlayer.start();
+            bgmWasPlayingWhenPaused = false;
+        } catch (Throwable ignore) {}
+    }
+
+    private void stopBgm() {
+        MediaPlayer mp = bgmPlayer;
+        bgmPlayer = null;
+        if (mp == null) return;
+        try {
+            if (mp.isPlaying()) mp.stop();
+        } catch (Throwable ignore) {}
+        try { mp.release(); } catch (Throwable ignore) {}
+    }
+
+    private void copyLogToClipboard() {
+        StringBuilder sb = new StringBuilder();
+        synchronized (logBuffer) {
+            for (String s : logBuffer) sb.append(s).append('\n');
+        }
+        try {
+            ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm != null) {
+                cm.setPrimaryClip(ClipData.newPlainText("magireco-cnv-log", sb.toString()));
+                Toast.makeText(this, "日志已复制到剪贴板", Toast.LENGTH_SHORT).show();
+            }
+        } catch (Throwable t) {
+            Toast.makeText(this, "复制失败: " + t.getMessage(), Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    // -- 后台线程驱动 ---------------------------------------------------
+
+    private void runWork() {
+        // 第 0a 步：早期检测——本机资源是否已经齐了？
+        // （cnv_inject/cn_resources_ready.flag 由 ResourceFlow 写出）
+        // 后续模式选择对话框只在「资源未齐」时弹，避免回头玩家每次启动
+        // 都被一个无意义的对话框拦一次。init 仍然要发——里面有 banned /
+        // 维护 / 版本闸门，跟资源是否齐无关。
+        boolean alreadyReady = isResourcesAlreadyReady();
+
+        // 第 0b 步：选下载模式（在线 / 离线）。init 请求要带 download.method，
+        // 所以模式必须在 init 之前定下来。资源已齐时跳过对话框、用占位值
+        // 发 init（服务端在 ready 路径上不会驱动下载相关字段）。
+        String userMethod;
+        if (alreadyReady) {
+            userMethod = ClientInit.METHOD_ONLINE;   // 占位；不会触发下载
+        } else {
+            userMethod = askDownloadMethod();
+            if (userMethod == null) {
+                // 用户取消模式选择 → 当作 fatal 退出
+                showFatalAndExit("已取消", "下载模式选择被取消，APP 即将退出。");
+                return;
+            }
+        }
+
+        // 第 0c 步：和云端 /client/init 握手。封禁 / 维护 / 版本闸门
+        // 都在这里处理；任何一项命中后会通过本地弹框 + killProcess
+        // 直接结束进程，下面的 ResourceFlow 不会再启动。
+        if (!handleCloudInit(userMethod)) return;
+
+        // 第 0d 步：资源已齐则直接 launch，不再跑 ResourceFlow。
+        if (alreadyReady) {
+            ui.post(this::launchGame);
+            return;
+        }
+
+        try {
+            new ResourceFlow(this, this, userMethod).run();
+        } catch (ResourceFlow.FatalConfigException fce) {
+            // showFatalAndExit 已经把对话框弹给用户、并已经
+            // schedule 了 killProcess。这里静默返回，避免在原弹框
+            // 之上叠加另一个错误对话框。
+            return;
+        } catch (final Throwable t) {
+            ui.post(() -> showFatal(t));
+            return;
+        }
+        ui.post(this::launchGame);
+    }
+
+    /**
+     * 看 {@code <filesDir>/cnv_inject/cn_resources_ready.flag} 是否存在。
+     * 这个文件由 ResourceFlow 在主资源 + 热更新都装完后写出，做完整性
+     * 标记 + libMagiaClient.so 的 hook 兜底用。
+     *
+     * <p>顺便也兼容老版本写到 {@code <filesDir>/madomagi/magica/cn_base_done.flag}
+     * 的情况（迁移期友好）。
+     */
+    private boolean isResourcesAlreadyReady() {
+        java.io.File primary = new java.io.File(
+                new java.io.File(getFilesDir(), "cnv_inject"),
+                "cn_resources_ready.flag");
+        if (primary.exists()) return true;
+        java.io.File legacy = new java.io.File(
+                new java.io.File(new java.io.File(getFilesDir(), "madomagi"), "magica"),
+                "cn_base_done.flag");
+        return legacy.exists();
+    }
+
+    /**
+     * 阻塞型对话框：让用户在「在线下载」和「离线包」之间二选一。
+     *
+     * <p>返回 {@link ClientInit#METHOD_ONLINE} / {@link ClientInit#METHOD_OFFLINE}；
+     * 用户按返回键取消时返回 null（调用方应当 fatal 退出）。
+     *
+     * <p>实现：post 到 UI 线程弹 AlertDialog + setSingleChoiceItems，
+     * 用 Object lock 阻塞 worker 等用户选完。与 showFatalAndExit
+     * 同一种 wait/notify 模板。
+     */
+    private String askDownloadMethod() {
+        final Object lock = new Object();
+        final boolean[] done = new boolean[] { false };
+        final String[] result = new String[] { null };
+        ui.post(() -> {
+            final int[] which = new int[] { 0 };   // 默认选在线下载
+            AlertDialog.Builder b = new AlertDialog.Builder(BootstrapActivity.this);
+            b.setTitle("选择资源准备方式");
+            b.setSingleChoiceItems(
+                    new String[] {
+                            "在线下载（推荐，自动多镜像并发）",
+                            "离线包注入（已有官方离线 zip 时用）"
+                    },
+                    0,
+                    (d, w) -> which[0] = w);
+            b.setCancelable(false);
+            b.setPositiveButton("继续", (d, w) -> {
+                result[0] = which[0] == 0 ? ClientInit.METHOD_ONLINE : ClientInit.METHOD_OFFLINE;
+                synchronized (lock) { done[0] = true; lock.notifyAll(); }
+            });
+            b.setNegativeButton("退出", (d, w) -> {
+                result[0] = null;
+                synchronized (lock) { done[0] = true; lock.notifyAll(); }
+            });
+            b.show();
+        });
+        synchronized (lock) {
+            while (!done[0]) {
+                try { lock.wait(500); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return null;
+                }
+            }
+        }
+        return result[0];
+    }
+
+    /**
+     * 调 {@link ClientInit#fetch} 拿云端配置并按状态字段分流：
+     * <ul>
+     *   <li>{@code banned.flag=true} → 弹"被拒绝"致命框 → kill</li>
+     *   <li>{@code server.status=maintenance/error} → 弹相应致命框 → kill</li>
+     *   <li>当前 BUILD_VERSION 不在 {@code client.allowed-versions} 内
+     *       → 弹"需要更新"致命框（按 {@link BuildChannel} 选用正常版
+     *       / 内测版 URL）→ kill</li>
+     *   <li>通信失败 / 响应解析失败 → 弹"无法联系服务器"致命框 → kill</li>
+     * </ul>
+     * 全部检查通过返回 {@code true}；否则返回 {@code false}，调用方应
+     * 立刻 {@code return}（致命框 + killProcess 已经在 dispatch 中）。
+     */
+    private boolean handleCloudInit() {
+        ClientInit.Response init;
+        try {
+            init = ClientInit.fetch(this, ResourceFlow.BUILD_VERSION);
+        } catch (Throwable t) {
+            showFatalAndExit("无法联系服务器",
+                    "客户端启动需要先和云端 init 接口握手，但本次请求失败了。\n\n"
+                  + "API：" + CloudEndpoint.CLIENT_INIT + "\n"
+                  + "错误：" + t.getClass().getSimpleName()
+                  + (t.getMessage() != null ? (": " + t.getMessage()) : "")
+                  + "\n\n请检查网络后重试。如果持续无法连接，可能是服务端临时维护，"
+                  + "稍后再试。");
+            return false;
+        }
+
+        // ── 封禁 ──
+        if (init.bannedFlag) {
+            String reason = (init.bannedReason != null && !init.bannedReason.isEmpty())
+                    ? init.bannedReason
+                    : "（服务端未提供原因）";
+            showFatalAndExit("访问被服务端拒绝", "原因：" + reason);
+            return false;
+        }
+
+        // ── 服务器状态 ──
+        // 缺省 / "normal" / 任何未识别值都按"放行"处理，避免协议未来扩展
+        // 引入新状态时旧客户端误把玩家挡在外面。只在显式 maintenance / error
+        // 时才阻断。
+        if ("maintenance".equals(init.serverStatus)) {
+            String msg = (init.maintenanceMessage != null && !init.maintenanceMessage.isEmpty())
+                    ? init.maintenanceMessage
+                    : "服务器正在维护，请稍后再试。";
+            if (init.maintenanceEndTime > 0L) {
+                msg += "\n\n预计完成时间：" + formatUnixSeconds(init.maintenanceEndTime);
+            }
+            showFatalAndExit("服务器维护中", msg);
+            return false;
+        }
+        if ("error".equals(init.serverStatus)) {
+            String msg = (init.maintenanceMessage != null && !init.maintenanceMessage.isEmpty())
+                    ? init.maintenanceMessage
+                    : "服务端报告错误状态，请稍后再试。";
+            showFatalAndExit("服务端错误", msg);
+            return false;
+        }
+
+        // ── 客户端版本闸门 ──
+        // 只有当服务端**显式**下发了 allowed-versions 且不为空、且本地
+        // 版本不在内时才阻断；缺失或空列表视为"不限制"。
+        if (init.allowedVersions != null
+                && !init.allowedVersions.isEmpty()
+                && !init.allowedVersions.contains(ResourceFlow.BUILD_VERSION)) {
+            boolean internalTest = BuildChannel.isInternalTest(this);
+            String  channelName  = internalTest ? "内测版" : "正常版";
+            String  url          = internalTest ? init.updateUrlInternalTest
+                                                : init.updateUrlNormal;
+            String  msg;
+            if (url != null && !url.isEmpty()) {
+                msg = "当前客户端版本 " + ResourceFlow.BUILD_VERSION
+                    + " 已不在服务端允许的版本列表内。\n\n"
+                    + "请下载最新" + channelName + " APK 后再启动。\n\n"
+                    + "下载地址：\n" + url;
+                showFatalAndExitWithJump("客户端需要更新", msg, "去下载", url);
+            } else {
+                msg = "当前客户端版本 " + ResourceFlow.BUILD_VERSION
+                    + " 已不在服务端允许的版本列表内，但服务端未下发"
+                    + channelName + " APK 的下载地址。\n\n请联系管理员。";
+                showFatalAndExit("客户端需要更新", msg);
+            }
+            return false;
+        }
+
+        // ── download.* 校验 ──
+        // 当前阶段：不在这里强校验 mirrors / access-token / report-api 是否齐全。
+        // ResourceFlow 还没有接到云端 mirrors 上来；等下一轮迭代把它们
+        // 串起来时再决定"缺哪个才算致命"。这里只在它们完全缺失时打条
+        // 日志方便排查。
+        if (init.downloadMirrors.isEmpty()
+                || init.downloadAccessToken == null
+                || init.downloadAccessToken.isEmpty()) {
+            android.util.Log.w("cnv-init",
+                    "服务端 init 响应里 download.mirrors / access-token 为空——"
+                  + "后续 ResourceFlow 接入云端 mirrors 时可能需要在此提前拦截");
+        }
+
+        return true;
+    }
+
+    /** Unix 秒 → "yyyy-MM-dd HH:mm" 本地时区显示。 */
+    private static String formatUnixSeconds(long sec) {
+        try {
+            java.text.SimpleDateFormat fmt = new java.text.SimpleDateFormat(
+                    "yyyy-MM-dd HH:mm", java.util.Locale.US);
+            return fmt.format(new java.util.Date(sec * 1000L));
+        } catch (Throwable t) {
+            return String.valueOf(sec);
+        }
+    }
+
+    /**
+     * 致命对话框 + 跳转按钮。语义上 = showFatalAndExit + showInfoDialogWithJump 的合体：
+     * 用户点 "去下载" 后浏览器打开 jumpUrl，对话框会在玩家返回 APP 时
+     * 重新弹出；只有点 "退出" 才真的释放等待 + kill 进程。
+     */
+    private void showFatalAndExitWithJump(final String title, final String message,
+                                          final String jumpLabel, final String jumpUrl) {
+        final Object lock = new Object();
+        final boolean[] done = new boolean[] { false };
+        final Runnable[] showRef = new Runnable[1];
+        showRef[0] = () -> {
+            AlertDialog.Builder b = new AlertDialog.Builder(BootstrapActivity.this);
+            b.setTitle(title);
+            b.setMessage(message);
+            b.setCancelable(false);
+            b.setPositiveButton("退出", (d, w) -> {
+                synchronized (lock) { done[0] = true; lock.notifyAll(); }
+            });
+            b.setNeutralButton(jumpLabel, (d, w) -> {
+                try {
+                    android.content.Intent it = new android.content.Intent(
+                            android.content.Intent.ACTION_VIEW,
+                            android.net.Uri.parse(jumpUrl));
+                    it.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+                    startActivity(it);
+                } catch (Throwable t) {
+                    Toast.makeText(BootstrapActivity.this,
+                            "无法打开浏览器：" + t.getMessage(),
+                            Toast.LENGTH_LONG).show();
+                }
+                ui.postDelayed(showRef[0], 300L);
+            });
+            b.show();
+        };
+        ui.post(showRef[0]);
+        synchronized (lock) {
+            while (!done[0]) {
+                try { lock.wait(500); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt(); return;
+                }
+            }
+        }
+        ui.post(() -> {
+            try { finishAndRemoveTask(); } catch (Throwable ignore) {}
+            android.os.Process.killProcess(android.os.Process.myPid());
+        });
+    }
+
+    private void launchGame() {
+        if (launched) return;
+        launched = true;
+        // 把 BGM 收掉，让原版游戏自己的音频栈接管。这步必须放在
+        // startActivity 之前，否则两个 AudioStream 会重叠几秒钟。
+        stopBgm();
+        try {
+            Intent it = new Intent();
+            it.setClassName(getPackageName(), GAME_ACTIVITY);
+            it.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            Intent orig = getIntent();
+            if (orig != null && orig.getData() != null) it.setData(orig.getData());
+            startActivity(it);
+            finish();
+            overridePendingTransition(0, 0);
+        } catch (Throwable t) {
+            showFatal(t);
+        }
+    }
+
+    private void showFatal(Throwable t) {
+        AlertDialog.Builder b = new AlertDialog.Builder(this);
+        b.setTitle("资源准备失败");
+        b.setMessage("无法继续启动游戏: " + t.getMessage()
+                + "\n\n请检查网络后重试，或尝试切换为离线包注入方式。");
+        b.setCancelable(false);
+        b.setPositiveButton("重试", (d, w) -> recreate());
+        b.setNegativeButton("查看日志", (d, w) -> openLogModal());
+        b.show();
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (logModal.getVisibility() == View.VISIBLE) {
+            closeLogModal();
+            return;
+        }
+        // 否则吞掉 back 键，避免用户在下载中途误触退出导致前功尽弃
+    }
+
+    // -- Reporter 接口实现 -----------------------------------------------
+
+    @Override
+    public String requestModeChoice(boolean onlineEnabled, boolean offlineEnabled) {
+        modeChoice.set(null);
+        ui.post(() -> {
+            final CharSequence[] items = new CharSequence[] { "在线下载", "离线包注入" };
+            AlertDialog.Builder b = new AlertDialog.Builder(BootstrapActivity.this);
+            b.setTitle("请选择资源下载方式");
+            b.setCancelable(false);
+            b.setItems(items, new DialogInterface.OnClickListener() {
+                @Override public void onClick(DialogInterface dialog, int which) {
+                    synchronized (modeLock) {
+                        modeChoice.set(which == 0 ? ResourceFlow.MODE_ONLINE : ResourceFlow.MODE_OFFLINE);
+                        modeLock.notifyAll();
+                    }
+                }
+            });
+            b.show();
+        });
+        synchronized (modeLock) {
+            while (modeChoice.get() == null) {
+                try { modeLock.wait(500); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return ResourceFlow.MODE_ONLINE;
+                }
+            }
+            return modeChoice.get();
+        }
+    }
+
+    @Override
+    public int requestConcurrency(final int recommended) {
+        final int[] options = { 1, 2, 3, 4, 6, 8 };
+        int defaultIdx = 0;
+        for (int i = 0; i < options.length; i++) {
+            if (options[i] == recommended) { defaultIdx = i; break; }
+            if (options[i] > recommended) { defaultIdx = Math.max(0, i - 1); break; }
+            defaultIdx = i;
+        }
+        final int finalDefaultIdx = defaultIdx;
+        final int[] selected = new int[] { defaultIdx };
+        final int[] result = new int[] { -1 };
+        final Object lock = new Object();
+        ui.post(() -> {
+            CharSequence[] items = new CharSequence[options.length];
+            for (int i = 0; i < options.length; i++) {
+                items[i] = options[i] + " 个"
+                        + (options[i] == recommended ? "   (推荐)" : "");
+            }
+            AlertDialog.Builder b = new AlertDialog.Builder(BootstrapActivity.this);
+            b.setTitle("同时下载文件数")
+                    .setCancelable(false)
+                    .setSingleChoiceItems(items, finalDefaultIdx, new DialogInterface.OnClickListener() {
+                        @Override public void onClick(DialogInterface dialog, int which) {
+                            selected[0] = which;
+                        }
+                    })
+                    .setPositiveButton("开始下载", new DialogInterface.OnClickListener() {
+                        @Override public void onClick(DialogInterface dialog, int which) {
+                            synchronized (lock) {
+                                int idx = Math.max(0, Math.min(selected[0], options.length - 1));
+                                result[0] = options[idx];
+                                lock.notifyAll();
+                            }
+                        }
+                    });
+            b.show();
+        });
+        synchronized (lock) {
+            while (result[0] < 0) {
+                try { lock.wait(500); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return recommended;
+                }
+            }
+            return result[0];
+        }
+    }
+
+    @Override
+    public String requestLineChoice(
+            final java.util.LinkedHashMap<String, java.util.List<String>> lines) {
+        final String[] keys = lines.keySet().toArray(new String[0]);
+        final String[] selected = new String[] { keys.length > 0 ? keys[0] : null };
+        final String[] result = new String[] { null };
+        final Object lock = new Object();
+        ui.post(() -> {
+            CharSequence[] items = new CharSequence[keys.length];
+            for (int i = 0; i < keys.length; i++) {
+                java.util.List<String> templates = lines.get(keys[i]);
+                int n = templates != null ? templates.size() : 0;
+                items[i] = keys[i] + (n > 0 ? "  (" + n + " 个镜像)" : "");
+            }
+            AlertDialog.Builder b = new AlertDialog.Builder(BootstrapActivity.this);
+            b.setTitle("请选择下载线路")
+                    .setCancelable(false)
+                    .setSingleChoiceItems(items, 0, new DialogInterface.OnClickListener() {
+                        @Override public void onClick(DialogInterface dialog, int which) {
+                            selected[0] = keys[which];
+                        }
+                    })
+                    .setPositiveButton("使用此线路", new DialogInterface.OnClickListener() {
+                        @Override public void onClick(DialogInterface dialog, int which) {
+                            synchronized (lock) {
+                                result[0] = selected[0];
+                                lock.notifyAll();
+                            }
+                        }
+                    });
+            b.show();
+        });
+        synchronized (lock) {
+            while (result[0] == null) {
+                try { lock.wait(500); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return keys.length > 0 ? keys[0] : null;
+                }
+            }
+            return result[0];
+        }
+    }
+
+    @Override
+    public boolean requestAutoSwitch() {
+        final boolean[] result = new boolean[] { false };
+        final boolean[] answered = new boolean[] { false };
+        final Object lock = new Object();
+        ui.post(() -> {
+            AlertDialog.Builder b = new AlertDialog.Builder(BootstrapActivity.this);
+            b.setTitle("自动换线");
+            b.setMessage("当一个文件长时间无法下载（数次失败或速度持续低于 100KB/s 超过 30 秒）时，是否要自动切换到清单中的下一条线路重试？\n\n开启：网络抖动时更稳定。\n关闭：始终使用你选择的线路。");
+            b.setCancelable(false);
+            b.setPositiveButton("开启", (d, w) -> {
+                synchronized (lock) { result[0] = true; answered[0] = true; lock.notifyAll(); }
+            });
+            b.setNegativeButton("关闭", (d, w) -> {
+                synchronized (lock) { result[0] = false; answered[0] = true; lock.notifyAll(); }
+            });
+            b.show();
+        });
+        synchronized (lock) {
+            while (!answered[0]) {
+                try { lock.wait(500); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return true;
+                }
+            }
+            return result[0];
+        }
+    }
+
+    @Override
+    public Uri requestFilePick() {
+        pickedUri.set(null);
+        pickFinished = false;
+        ui.post(() -> {
+            Intent it = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            it.addCategory(Intent.CATEGORY_OPENABLE);
+            it.setType("application/zip");
+            it.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{
+                    "application/zip", "application/octet-stream", "application/x-zip-compressed", "*/*"
+            });
+            try {
+                startActivityForResult(it, REQ_FILE_PICK);
+            } catch (Throwable t) {
+                Intent fallback = new Intent(Intent.ACTION_GET_CONTENT);
+                fallback.addCategory(Intent.CATEGORY_OPENABLE);
+                fallback.setType("*/*");
+                startActivityForResult(fallback, REQ_FILE_PICK);
+            }
+        });
+        synchronized (pickLock) {
+            while (!pickFinished) {
+                try { pickLock.wait(500); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return null;
+                }
+            }
+        }
+        return pickedUri.get();
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_FILE_PICK) {
+            synchronized (pickLock) {
+                pickedUri.set(resultCode == Activity.RESULT_OK && data != null ? data.getData() : null);
+                pickFinished = true;
+                pickLock.notifyAll();
+            }
+        }
+    }
+
+    @Override
+    public void setPhase(final String phase) {
+        ui.post(() -> {
+            String show = phase;
+            switch (phase) {
+                case "init": show = "初始化"; break;
+                case "client-check": show = "校验客户端版本"; break;
+                case "client-update": show = "下载新版客户端"; break;
+                case "mode-choice": show = "选择资源方式"; break;
+                case "download": show = "在线下载"; break;
+                case "extract": show = "解压资源"; break;
+                case "offline-pick": show = "选择离线包"; break;
+                case "offline-verify": show = "校验离线包"; break;
+                case "offline-extract": show = "解压离线包"; break;
+                case "scenario-check": show = "校验剧本版本"; break;
+                case "scenario-download": show = "下载剧本更新"; break;
+                case "scenario-extract": show = "解压剧本更新"; break;
+                case "done": show = "完成"; break;
+            }
+            vPhase.setText(show);
+        });
+    }
+
+    @Override
+    public void setStatus(final String status) {
+        ui.post(() -> vStatus.setText(status == null ? "" : status));
+    }
+
+    @Override
+    public void initSlots(final int count) {
+        final int n = Math.max(1, count);
+        ui.post(() -> rebuildSlots(n));
+    }
+
+    private void rebuildSlots(int n) {
+        slotContainer.removeAllViews();
+        slotNameViews = new TextView[n];
+        slotBars = new ProgressBar[n];
+        slotMetaViews = new TextView[n];
+        for (int i = 0; i < n; i++) {
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.VERTICAL);
+            LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT);
+            rowLp.bottomMargin = dp(6);
+            slotContainer.addView(row, rowLp);
+
+            LinearLayout headRow = new LinearLayout(this);
+            headRow.setOrientation(LinearLayout.HORIZONTAL);
+            row.addView(headRow, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT));
+
+            TextView name = new TextView(this);
+            name.setText(n > 1 ? ("#" + (i + 1) + "  待命") : "--");
+            name.setTextColor(COLOR_TEXT);
+            name.setTextSize(TypedValue.COMPLEX_UNIT_SP, n > 4 ? 11f : 13f);
+            name.setSingleLine(true);
+            name.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
+            headRow.addView(name, new LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+            TextView meta = new TextView(this);
+            meta.setText("");
+            meta.setTextColor(COLOR_SUB);
+            meta.setTextSize(TypedValue.COMPLEX_UNIT_SP, n > 4 ? 10f : 11f);
+            meta.setGravity(Gravity.END);
+            headRow.addView(meta, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT));
+
+            ProgressBar bar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+            bar.setMax(1000);
+            bar.setProgress(0);
+            tintBar(bar, false);
+            LinearLayout.LayoutParams barLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, dp(n > 4 ? 6 : 8));
+            barLp.topMargin = dp(2);
+            row.addView(bar, barLp);
+
+            slotNameViews[i] = name;
+            slotBars[i] = bar;
+            slotMetaViews[i] = meta;
+        }
+    }
+
+    @Override
+    public void setSlot(final int slot, final String fileName,
+                        final long soFar, final long total, final long instantBps) {
+        ui.post(() -> {
+            if (slotNameViews == null || slot < 0 || slot >= slotNameViews.length) return;
+            int prefixN = slotNameViews.length;
+            String prefix = prefixN > 1 ? ("#" + (slot + 1) + "  ") : "";
+            slotNameViews[slot].setText(prefix + (fileName == null ? "--" : fileName));
+            int pct = total > 0 ? (int) Math.min(1000L, soFar * 1000L / total) : 0;
+            slotBars[slot].setProgress(pct);
+            StringBuilder meta = new StringBuilder();
+            meta.append(formatBytes(soFar));
+            if (total > 0) meta.append(" / ").append(formatBytes(total));
+            if (instantBps > 0) meta.append("  ").append(formatSpeed(instantBps));
+            slotMetaViews[slot].setText(meta.toString());
+        });
+    }
+
+    @Override
+    public void clearSlot(final int slot) {
+        ui.post(() -> {
+            if (slotNameViews == null || slot < 0 || slot >= slotNameViews.length) return;
+            int prefixN = slotNameViews.length;
+            slotNameViews[slot].setText(prefixN > 1 ? ("#" + (slot + 1) + "  待命") : "--");
+            slotBars[slot].setProgress(0);
+            slotMetaViews[slot].setText("");
+        });
+    }
+
+    @Override
+    public void setAggregate(final int completed, final int total, final long instantBpsTotal) {
+        ui.post(() -> {
+            StringBuilder sb = new StringBuilder();
+            if (total > 0) sb.append(completed).append(" / ").append(total).append(" 文件");
+            if (instantBpsTotal > 0) {
+                if (sb.length() > 0) sb.append("  ");
+                sb.append("合计 ").append(formatSpeed(instantBpsTotal));
+            }
+            vAggregate.setText(sb.toString());
+        });
+    }
+
+    @Override
+    public void setOverallProgress(final long soFar, final long total) {
+        ui.post(() -> {
+            int pct = total > 0 ? (int) Math.min(1000L, soFar * 1000L / total) : 0;
+            pbOverall.setProgress(pct);
+            vOverallText.setText("整体进度  " + formatBytes(soFar) + " / " + formatBytes(total));
+        });
+    }
+
+    @Override
+    public boolean isCancelled() { return cancelled; }
+
+    private static final java.text.SimpleDateFormat LOG_TS =
+            new java.text.SimpleDateFormat("yyyy/MM/dd HH:mm:ss", Locale.US);
+
+    /** 与浮动调试窗输出同步写入 {@code <filesDir>/lastest.log} 的文件。 */
+    private java.io.BufferedWriter logFileWriter;
+    private final Object logFileLock = new Object();
+
+    /**
+     * 启动时打开（截断）lastest.log，开始记录本次会话。
+     * 截断让"最新一次"的日志总是从空开始；上一次的内容如需保留
+     * 可在外部备份。
+     */
+    private void openLogFile() {
+        synchronized (logFileLock) {
+            try {
+                java.io.File logFile = new java.io.File(getFilesDir(), "lastest.log");
+                logFileWriter = new java.io.BufferedWriter(new java.io.OutputStreamWriter(
+                        new java.io.FileOutputStream(logFile, false), "UTF-8"));
+                String head = "==== Magireco CNV Bootstrap 日志 (开始于 "
+                        + new java.text.SimpleDateFormat(
+                                "yyyy/MM/dd HH:mm:ss", Locale.US).format(new java.util.Date())
+                        + ") ====\n";
+                logFileWriter.write(head);
+                logFileWriter.flush();
+            } catch (Throwable t) {
+                android.util.Log.w(TAG, "无法打开 lastest.log: " + t);
+                logFileWriter = null;
+            }
+        }
+    }
+
+    private void closeLogFile() {
+        synchronized (logFileLock) {
+            if (logFileWriter != null) {
+                try { logFileWriter.flush(); } catch (Throwable ignore) {}
+                try { logFileWriter.close(); } catch (Throwable ignore) {}
+                logFileWriter = null;
+            }
+        }
+    }
+
+    @Override
+    public void log(final String type, final String msg) {
+        String tag = type == null ? "INFO" : type;
+        switch (tag) {
+            case "WARN":  android.util.Log.w(TAG, msg); break;
+            case "ERROR":
+            case "FATAL": android.util.Log.e(TAG, msg); break;
+            default:      android.util.Log.i(TAG, msg);
+        }
+        final String ts;
+        synchronized (LOG_TS) {
+            ts = "[" + LOG_TS.format(new java.util.Date()) + "] [" + tag + "] " + msg;
+        }
+        synchronized (logBuffer) {
+            logBuffer.addLast(ts);
+            while (logBuffer.size() > LOG_BUFFER_MAX) logBuffer.removeFirst();
+        }
+        // 同步落盘：与浮动调试窗同份内容写到 lastest.log
+        synchronized (logFileLock) {
+            if (logFileWriter != null) {
+                try {
+                    logFileWriter.write(ts);
+                    logFileWriter.write('\n');
+                    logFileWriter.flush();
+                } catch (Throwable t) {
+                    android.util.Log.w(TAG, "lastest.log 写入失败: " + t);
+                }
+            }
+        }
+        ui.post(() -> {
+            if (logModal != null && logModal.getVisibility() == View.VISIBLE) {
+                renderLogModal();
+                vLogScroll.post(() -> vLogScroll.fullScroll(View.FOCUS_DOWN));
+            }
+        });
+    }
+
+    @Override
+    public void showInfoDialog(final String title, final String message) {
+        final Object lock = new Object();
+        final boolean[] done = new boolean[] { false };
+        ui.post(() -> {
+            AlertDialog.Builder b = new AlertDialog.Builder(BootstrapActivity.this);
+            b.setTitle(title);
+            b.setMessage(message);
+            b.setCancelable(false);
+            b.setPositiveButton("确定", (d, w) -> {
+                synchronized (lock) { done[0] = true; lock.notifyAll(); }
+            });
+            b.show();
+        });
+        synchronized (lock) {
+            while (!done[0]) {
+                try { lock.wait(500); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt(); return;
+                }
+            }
+        }
+    }
+
+    @Override
+    public void showInfoDialogWithJump(final String title, final String message,
+                                       final String jumpLabel, final String jumpUrl) {
+        final Object lock = new Object();
+        final boolean[] done = new boolean[] { false };
+        // 同 showFatalAndExit 的可重入对话框思路：跳转按钮不释放 wait，
+        // 而是把当前对话框 Runnable 再次 post 回 UI 线程，等浏览器回到
+        // 前台后玩家自然会看到对话框再弹出来，点确定才继续后续流程。
+        final Runnable[] showRef = new Runnable[1];
+        showRef[0] = () -> {
+            AlertDialog.Builder b = new AlertDialog.Builder(BootstrapActivity.this);
+            b.setTitle(title);
+            b.setMessage(message);
+            b.setCancelable(false);
+            b.setPositiveButton("确定", (d, w) -> {
+                synchronized (lock) { done[0] = true; lock.notifyAll(); }
+            });
+            b.setNeutralButton(jumpLabel, (d, w) -> {
+                try {
+                    android.content.Intent it = new android.content.Intent(
+                            android.content.Intent.ACTION_VIEW,
+                            android.net.Uri.parse(jumpUrl));
+                    it.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+                    startActivity(it);
+                } catch (Throwable t) {
+                    Toast.makeText(BootstrapActivity.this,
+                            "无法打开浏览器：" + t.getMessage(),
+                            Toast.LENGTH_LONG).show();
+                }
+                // 玩家从浏览器返回 APP 后能看到对话框再次出现。延迟一点
+                // 让 Activity 切到后台再后切回前台的过程稳一些。
+                ui.postDelayed(showRef[0], 300L);
+            });
+            b.show();
+        };
+        ui.post(showRef[0]);
+        synchronized (lock) {
+            while (!done[0]) {
+                try { lock.wait(500); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt(); return;
+                }
+            }
+        }
+    }
+
+    @Override
+    public void showFatalAndExit(final String title, final String message) {
+        final Object lock = new Object();
+        final boolean[] done = new boolean[] { false };
+        // 把"弹出 FATAL 对话框"封装成可重入的 Runnable：用户点"查看日志"
+        // 后会关掉对话框去看日志，关掉日志面板时 closeLogModal 会再次
+        // 调度本 Runnable，把 FATAL 对话框重新弹给用户——只有当用户点击
+        // "退出"才真正释放 wait()。这样阻止了"点查看日志就闪退"的 bug。
+        final Runnable[] showRef = new Runnable[1];
+        showRef[0] = () -> {
+            AlertDialog.Builder b = new AlertDialog.Builder(BootstrapActivity.this);
+            b.setTitle(title);
+            b.setMessage(message);
+            b.setCancelable(false);
+            b.setPositiveButton("退出", (d, w) -> {
+                synchronized (lock) { done[0] = true; lock.notifyAll(); }
+            });
+            b.setNeutralButton("查看日志", (d, w) -> {
+                fatalRetrigger = showRef[0];
+                openLogModal();
+                // 注意：这里不 notify lock —— worker 仍然 park 在 wait()
+            });
+            b.show();
+        };
+        ui.post(showRef[0]);
+        synchronized (lock) {
+            while (!done[0]) {
+                try { lock.wait(500); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt(); return;
+                }
+            }
+        }
+        // 硬退出：确保原版游戏 native 侧不会在用户点完
+        // FATAL 对话框后还有机会被启动。
+        ui.post(() -> {
+            try { finishAndRemoveTask(); } catch (Throwable ignore) {}
+            android.os.Process.killProcess(android.os.Process.myPid());
+        });
+    }
+
+    private static String formatBytes(long b) {
+        if (b < 1024L) return b + " B";
+        if (b < 1024L * 1024L) return String.format(Locale.US, "%.1f KB", b / 1024.0);
+        if (b < 1024L * 1024L * 1024L) return String.format(Locale.US, "%.1f MB", b / (1024.0 * 1024.0));
+        return String.format(Locale.US, "%.2f GB", b / (1024.0 * 1024.0 * 1024.0));
+    }
+
+    private static String formatSpeed(long bps) {
+        if (bps <= 0) return "";
+        return formatBytes(bps) + "/s";
+    }
+}
