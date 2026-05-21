@@ -1,0 +1,372 @@
+name: 🔑 生成 APK 签名密钥
+
+# ╔════════════════════════════════════════════════════════════════════╗
+# ║   生成并输出用于 APK 签名的 JKS Keystore                            ║
+# ╠════════════════════════════════════════════════════════════════════╣
+# ║                                                                    ║
+# ║ 用法                                                               ║
+# ║ ────                                                               ║
+# ║   1. 在此仓库的 Actions 页面手动触发本 workflow                      ║
+# ║   2. 填写以下输入参数（或接受默认值）                                 ║
+# ║   3. 运行完成后，在 Job Summary 中查看生成的 Base64 keystore 及说明   ║
+# ║   4. 按说明将各项值分别存入仓库 Secrets                              ║
+# ║                                                                    ║
+# ║ 生成后需要配置的 Secrets                                            ║
+# ║ ──────────────────────                                             ║
+# ║   KEYSTORE_BASE64    — 本 workflow 输出的 Base64 编码 keystore      ║
+# ║   KEY_STORE_PASSWORD — 你在下方填写的 keystore 密码                 ║
+# ║   KEY_ALIAS          — 你在下方填写的 key 别名                      ║
+# ║   KEY_PASSWORD       — 你在下方填写的 key 密码                      ║
+# ║                                                                    ║
+# ║ 安全说明                                                            ║
+# ║ ──────                                                             ║
+# ║   ▸ 密码输入参数在 GitHub Actions 日志中可见，请确保仓库访问权限管理  ║
+# ║     得当（建议设为 Private 或只允许可信成员访问）                     ║
+# ║   ▸ keystore 文件本身不会提交到仓库，仅通过 Job Summary 传递         ║
+# ║   ▸ 密钥一旦丢失无法恢复，请务必妥善保存 Base64 内容                 ║
+# ║   ▸ 同一应用的所有版本必须用同一个 key 签名，密钥请勿随意更换         ║
+# ║                                                                    ║
+# ╚════════════════════════════════════════════════════════════════════╝
+
+on:
+  workflow_dispatch:
+    inputs:
+      key_alias:
+        description: 'Key 别名（KEY_ALIAS）'
+        required: true
+        default: 'android'
+        type: string
+      store_password:
+        description: 'Keystore 密码（KEY_STORE_PASSWORD）— 至少 6 位'
+        required: true
+        default: ''
+        type: string
+      key_password:
+        description: 'Key 密码（KEY_PASSWORD）— 至少 6 位，可与 Keystore 密码相同'
+        required: true
+        default: ''
+        type: string
+      validity_years:
+        description: '证书有效期（年）'
+        required: false
+        default: '27'
+        type: string
+      distinguished_name:
+        description: '证书 Distinguished Name（DN）'
+        required: false
+        default: 'CN=MagirecoCN, OU=MagirecoCN-Revival-Project, O=MagirecoCN, L=CN, ST=CN, C=CN'
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  gen-key:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: 🛡️ 校验输入参数
+        run: |
+          python3 <<'SCRIPT_END'
+          import os, sys
+
+          sys.stdout.reconfigure(line_buffering=True)
+
+          class C:
+              RESET         = "\033[0m"
+              BOLD          = "\033[1m"
+              RED           = "\033[31m"
+              BRIGHT_GREEN  = "\033[92m"
+              BRIGHT_YELLOW = "\033[93m"
+              BRIGHT_BLUE   = "\033[94m"
+              BRIGHT_WHITE  = "\033[97m"
+              CYAN          = "\033[36m"
+
+          def c(color, text): return f"{color}{text}{C.RESET}"
+          def header(text):
+              bar = "═" * 60
+              print(f"\n{c(C.BOLD + C.BRIGHT_BLUE, bar)}")
+              print(c(C.BOLD + C.BRIGHT_WHITE, f"  {text}"))
+              print(f"{c(C.BOLD + C.BRIGHT_BLUE, bar)}\n", flush=True)
+          def ok(t):   print(f"  {c(C.BRIGHT_GREEN,  '✔')} {t}", flush=True)
+          def warn(t): print(f"  {c(C.BRIGHT_YELLOW, '⚠')} {t}", flush=True)
+          def err(t):  print(f"  {c(C.RED,           '✘')} {t}", flush=True)
+
+          header("校验输入参数")
+
+          alias      = os.environ.get("INPUT_KEY_ALIAS", "").strip()
+          ks_pass    = os.environ.get("INPUT_STORE_PASSWORD", "").strip()
+          key_pass   = os.environ.get("INPUT_KEY_PASSWORD", "").strip()
+          validity   = os.environ.get("INPUT_VALIDITY_YEARS", "27").strip()
+          dn         = os.environ.get("INPUT_DISTINGUISHED_NAME", "").strip()
+
+          failed = False
+
+          if not alias:
+              err("KEY_ALIAS 不能为空")
+              failed = True
+          else:
+              ok(f"key_alias: {alias}")
+
+          if len(ks_pass) < 6:
+              err(f"store_password 长度不足 6 位（当前 {len(ks_pass)} 位）")
+              failed = True
+          else:
+              ok(f"store_password: {'*' * len(ks_pass)}")
+
+          if len(key_pass) < 6:
+              err(f"key_password 长度不足 6 位（当前 {len(key_pass)} 位）")
+              failed = True
+          else:
+              ok(f"key_password:   {'*' * len(key_pass)}")
+
+          if not validity.isdigit() or int(validity) < 1:
+              err(f"validity_years 必须为正整数（当前: {validity!r}）")
+              failed = True
+          else:
+              ok(f"validity: {validity} 年")
+
+          if not dn:
+              err("distinguished_name 不能为空")
+              failed = True
+          else:
+              ok(f"DN: {dn}")
+
+          if failed:
+              sys.exit(1)
+
+          warn("⚠  密码已在本步骤以明文呈现——请确保只有可信成员能访问本仓库的 Actions 日志")
+          SCRIPT_END
+        env:
+          INPUT_KEY_ALIAS:           ${{ inputs.key_alias }}
+          INPUT_STORE_PASSWORD:      ${{ inputs.store_password }}
+          INPUT_KEY_PASSWORD:        ${{ inputs.key_password }}
+          INPUT_VALIDITY_YEARS:      ${{ inputs.validity_years }}
+          INPUT_DISTINGUISHED_NAME:  ${{ inputs.distinguished_name }}
+
+      - name: ☕ 设置 JDK 17（提供 keytool）
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: 🔑 生成 Keystore
+        id: keygen
+        run: |
+          python3 <<'SCRIPT_END'
+          import subprocess, os, sys, base64
+
+          sys.stdout.reconfigure(line_buffering=True)
+
+          class C:
+              RESET         = "\033[0m"
+              BOLD          = "\033[1m"
+              DIM           = "\033[2m"
+              RED           = "\033[31m"
+              BRIGHT_GREEN  = "\033[92m"
+              BRIGHT_YELLOW = "\033[93m"
+              BRIGHT_BLUE   = "\033[94m"
+              BRIGHT_CYAN   = "\033[96m"
+              BRIGHT_WHITE  = "\033[97m"
+              CYAN          = "\033[36m"
+
+          def c(color, text): return f"{color}{text}{C.RESET}"
+          def header(text):
+              bar = "═" * 60
+              print(f"\n{c(C.BOLD + C.BRIGHT_BLUE, bar)}")
+              print(c(C.BOLD + C.BRIGHT_WHITE, f"  {text}"))
+              print(f"{c(C.BOLD + C.BRIGHT_BLUE, bar)}\n", flush=True)
+          def section(text): print(f"\n{c(C.BOLD + C.CYAN, '┌─ ' + text)}", flush=True)
+          def info(t):  print(f"  {c(C.BRIGHT_BLUE,   'ℹ')} {t}", flush=True)
+          def ok(t):    print(f"  {c(C.BRIGHT_GREEN,  '✔')} {t}", flush=True)
+          def warn(t):  print(f"  {c(C.BRIGHT_YELLOW, '⚠')} {t}", flush=True)
+          def err(t):   print(f"  {c(C.RED,           '✘')} {t}", flush=True)
+
+          def set_output(key, value):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write(f"{key}={value}\n")
+
+          def run(cmd, **kw):
+              r = subprocess.run(cmd, shell=True, capture_output=True, text=True, **kw)
+              if r.returncode != 0:
+                  err(f"命令失败")
+                  print(r.stdout)
+                  print(r.stderr)
+                  sys.exit(1)
+              return r.stdout.strip()
+
+          header("生成 APK 签名 Keystore")
+
+          alias      = os.environ["INPUT_KEY_ALIAS"].strip()
+          ks_pass    = os.environ["INPUT_STORE_PASSWORD"].strip()
+          key_pass   = os.environ["INPUT_KEY_PASSWORD"].strip()
+          validity_y = int(os.environ.get("INPUT_VALIDITY_YEARS", "27").strip())
+          dn         = os.environ["INPUT_DISTINGUISHED_NAME"].strip()
+          ks_path    = "/tmp/release.keystore"
+          validity_d = validity_y * 365
+
+          section("运行 keytool 生成 RSA-2048 密钥对")
+          info(f"别名:     {alias}")
+          info(f"有效期:   {validity_y} 年（{validity_d} 天）")
+          info(f"DN:       {dn}")
+          info(f"算法:     RSA 2048")
+
+          run(
+              f'keytool -genkeypair '
+              f'-v '
+              f'-keystore "{ks_path}" '
+              f'-alias "{alias}" '
+              f'-keyalg RSA '
+              f'-keysize 2048 '
+              f'-validity {validity_d} '
+              f'-storepass "{ks_pass}" '
+              f'-keypass "{key_pass}" '
+              f'-dname "{dn}" '
+              f'-storetype JKS '
+              f'-noprompt'
+          )
+
+          ks_size = os.path.getsize(ks_path)
+          ok(f"Keystore 生成完成: {ks_path}（{ks_size} bytes）")
+
+          section("Base64 编码 Keystore")
+          with open(ks_path, "rb") as f:
+              ks_b64 = base64.b64encode(f.read()).decode("ascii")
+          ok(f"Base64 长度: {len(ks_b64)} 字符")
+
+          set_output("ks_b64",   ks_b64)
+          set_output("ks_alias", alias)
+          set_output("ks_size",  str(ks_size))
+          SCRIPT_END
+        env:
+          INPUT_KEY_ALIAS:          ${{ inputs.key_alias }}
+          INPUT_STORE_PASSWORD:     ${{ inputs.store_password }}
+          INPUT_KEY_PASSWORD:       ${{ inputs.key_password }}
+          INPUT_VALIDITY_YEARS:     ${{ inputs.validity_years }}
+          INPUT_DISTINGUISHED_NAME: ${{ inputs.distinguished_name }}
+
+      - name: 📋 输出 Secrets 配置说明
+        run: |
+          python3 <<'SCRIPT_END'
+          import os, sys
+
+          sys.stdout.reconfigure(line_buffering=True)
+
+          class C:
+              RESET         = "\033[0m"
+              BOLD          = "\033[1m"
+              DIM           = "\033[2m"
+              RED           = "\033[31m"
+              BRIGHT_GREEN  = "\033[92m"
+              BRIGHT_YELLOW = "\033[93m"
+              BRIGHT_BLUE   = "\033[94m"
+              BRIGHT_CYAN   = "\033[96m"
+              BRIGHT_WHITE  = "\033[97m"
+              CYAN          = "\033[36m"
+
+          def c(color, text): return f"{color}{text}{C.RESET}"
+          def header(text):
+              bar = "═" * 60
+              print(f"\n{c(C.BOLD + C.BRIGHT_BLUE, bar)}")
+              print(c(C.BOLD + C.BRIGHT_WHITE, f"  {text}"))
+              print(f"{c(C.BOLD + C.BRIGHT_BLUE, bar)}\n", flush=True)
+          def section(text): print(f"\n{c(C.BOLD + C.CYAN, '┌─ ' + text)}", flush=True)
+          def info(t):  print(f"  {c(C.BRIGHT_BLUE,   'ℹ')} {t}", flush=True)
+          def ok(t):    print(f"  {c(C.BRIGHT_GREEN,  '✔')} {t}", flush=True)
+          def warn(t):  print(f"  {c(C.BRIGHT_YELLOW, '⚠')} {t}", flush=True)
+
+          header("Secrets 配置说明")
+
+          ks_b64    = os.environ["KS_B64"]
+          ks_alias  = os.environ["KS_ALIAS"]
+          ks_size   = os.environ["KS_SIZE"]
+          repo      = os.environ.get("GITHUB_REPOSITORY", "")
+
+          section("生成结果汇总")
+          ok(f"Keystore 大小: {ks_size} bytes")
+          ok(f"Key 别名:      {ks_alias}")
+          ok(f"目标仓库:      {repo}")
+
+          section("需要在仓库 Settings → Secrets and variables → Actions → Secrets 中添加以下 4 个 Secret")
+          print(flush=True)
+
+          secrets = [
+              ("KEYSTORE_BASE64",    "<见下方 Base64 内容>",         "Base64 编码的 Keystore 文件"),
+              ("KEY_STORE_PASSWORD", "<你填写的 store_password>",    "Keystore 密码"),
+              ("KEY_ALIAS",          ks_alias,                       "Key 别名"),
+              ("KEY_PASSWORD",       "<你填写的 key_password>",      "Key 密码"),
+          ]
+          for name, hint, desc in secrets:
+              print(f"  {c(C.BOLD + C.BRIGHT_WHITE, name)}")
+              print(f"    值: {c(C.BRIGHT_CYAN, hint)}")
+              print(f"    说明: {c(C.DIM, desc)}")
+              print(flush=True)
+
+          warn("以下 Base64 内容即为 KEYSTORE_BASE64 的值，请完整复制（不含前后空白）：")
+          print(flush=True)
+          print(ks_b64)
+          print(flush=True)
+
+          warn("密钥是不可逆的签名凭证——一旦丢失将无法为同一应用发布更新，请务必妥善备份！")
+          SCRIPT_END
+        env:
+          KS_B64:   ${{ steps.keygen.outputs.ks_b64 }}
+          KS_ALIAS: ${{ steps.keygen.outputs.ks_alias }}
+          KS_SIZE:  ${{ steps.keygen.outputs.ks_size }}
+
+      - name: 📄 写入 Job Summary
+        run: |
+          python3 <<'SCRIPT_END'
+          import os
+
+          ks_b64    = os.environ["KS_B64"]
+          ks_alias  = os.environ["KS_ALIAS"]
+          ks_size   = os.environ["KS_SIZE"]
+          repo      = os.environ.get("GITHUB_REPOSITORY", "")
+          summary_f = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null")
+
+          lines = [
+              "## 🔑 APK 签名 Keystore 已生成",
+              "",
+              "### 生成信息",
+              f"| 字段 | 值 |",
+              f"|------|-----|",
+              f"| Key 别名 | `{ks_alias}` |",
+              f"| Keystore 大小 | {ks_size} bytes |",
+              f"| 目标仓库 | `{repo}` |",
+              "",
+              "### 配置步骤",
+              "",
+              "前往 **Settings → Secrets and variables → Actions → Secrets**，",
+              "添加以下 4 个 Secret：",
+              "",
+              "| Secret 名称 | 值 |",
+              "|-------------|-----|",
+              "| `KEYSTORE_BASE64` | 下方 Base64 内容（完整复制） |",
+              "| `KEY_STORE_PASSWORD` | 你在 workflow 中填写的 store_password |",
+              f"| `KEY_ALIAS` | `{ks_alias}` |",
+              "| `KEY_PASSWORD` | 你在 workflow 中填写的 key_password |",
+              "",
+              "### KEYSTORE_BASE64 内容",
+              "",
+              "```",
+              ks_b64,
+              "```",
+              "",
+              "> ⚠️ **重要**：请将以上 Base64 内容备份到安全位置。",
+              "> 密钥一旦丢失，将无法为同一 App 发布后续更新。",
+          ]
+
+          with open(summary_f, "w", encoding="utf-8") as f:
+              f.write("\n".join(lines))
+          SCRIPT_END
+        env:
+          KS_B64:   ${{ steps.keygen.outputs.ks_b64 }}
+          KS_ALIAS: ${{ steps.keygen.outputs.ks_alias }}
+          KS_SIZE:  ${{ steps.keygen.outputs.ks_size }}
