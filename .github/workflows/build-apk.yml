@@ -216,6 +216,7 @@ jobs:
 
           event_name = os.environ.get("GITHUB_EVENT_NAME", "push")
           bump_major = os.environ.get("INPUT_BUMP_MAJOR", "false").lower() == "true"
+          is_manual  = (event_name == "workflow_dispatch")
           repo       = os.environ["REPO"]
           token      = os.environ.get("GH_TOKEN", "")
 
@@ -255,6 +256,16 @@ jobs:
           ok(f"新 VersionCode: {c(C.BRIGHT_GREEN, str(new_code))}")
           ok(f"Release 标签:   {c(C.BRIGHT_GREEN, tag_name)}")
           ok(f"APK 文件名:     {c(C.BRIGHT_GREEN, apk_name)}")
+
+          # ── 构建渠道 ────────────────────────────────────────────────────
+          # push / schedule 触发 = internal-test；手动触发 = normal。
+          # BuildChannel.java 运行时读此文件决定从哪条链路拉自更新 APK。
+          section("写入构建渠道")
+          channel_path = "assets/cnv_build_channel.txt"
+          channel = "normal" if is_manual else "internal-test"
+          with open(channel_path, "w", encoding="utf-8") as f:
+              f.write(channel + "\n")
+          ok(f"channel = {c(C.BRIGHT_WHITE, channel)}  (is_manual={is_manual})")
 
           set_output("new_version", new_version)
           set_output("new_code",    str(new_code))
@@ -601,6 +612,61 @@ jobs:
           if len(smali_files) > 5:
               info(f"... 共 {len(smali_files)} 个")
           SCRIPT_END
+
+      - name: 🛠 编译 libMagiaClient.so（cnv-native）
+        run: |
+          set -euo pipefail
+
+          # GitHub ubuntu-latest 预装多版本 NDK 在 /usr/local/lib/android/sdk/ndk/
+          # 选最高已装版本即可；CMake toolchain 跨次版本兼容。
+          NDK_ROOT="${ANDROID_NDK_HOME:-}"
+          if [ -z "$NDK_ROOT" ] || [ ! -d "$NDK_ROOT" ]; then
+              NDK_BASE="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}/ndk"
+              NDK_ROOT="$(ls -1d $NDK_BASE/* 2>/dev/null | sort -V | tail -1)"
+          fi
+          if [ -z "$NDK_ROOT" ] || [ ! -d "$NDK_ROOT" ]; then
+              echo "::error::找不到 Android NDK"
+              exit 1
+          fi
+          echo "[NDK] 使用 $NDK_ROOT"
+
+          # 确保 ninja 在 PATH 里
+          if ! command -v ninja >/dev/null; then
+              sudo apt-get install -y ninja-build
+          fi
+
+          for ABI in arm64-v8a armeabi-v7a; do
+              echo "==== 构建 $ABI ===="
+              BUILD_DIR="cnv-native/build/$ABI"
+              cmake -G Ninja \
+                  -DCMAKE_TOOLCHAIN_FILE="$NDK_ROOT/build/cmake/android.toolchain.cmake" \
+                  -DANDROID_ABI="$ABI" \
+                  -DANDROID_PLATFORM=android-21 \
+                  -DCMAKE_BUILD_TYPE=Release \
+                  -B "$BUILD_DIR" cnv-native
+              cmake --build "$BUILD_DIR" --parallel
+
+              SO="$BUILD_DIR/libMagiaClient.so"
+              if [ ! -f "$SO" ]; then
+                  echo "::error::$SO 未生成"
+                  exit 1
+              fi
+              mkdir -p "lib/$ABI"
+              cp "$SO" "lib/$ABI/libMagiaClient.so"
+
+              # 顺手做一次 strip（NDK 自带 llvm-strip），减小体积
+              STRIP="$(find "$NDK_ROOT/toolchains/llvm/prebuilt" -name llvm-strip 2>/dev/null | head -1)"
+              if [ -n "$STRIP" ]; then
+                  "$STRIP" --strip-unneeded "lib/$ABI/libMagiaClient.so"
+              fi
+
+              echo "[$ABI] $(du -h lib/$ABI/libMagiaClient.so | cut -f1)"
+          done
+
+      - name: 🛡 patch libmadomagi_native.so（杜绝 15GB 重下载）
+        if: ${{ vars.PATCH_ENGINE_DOWNLOAD_CHECK != 'false' }}
+        run: |
+          python3 tools/patch_libmadomagi.py --apk-root .
 
       - name: ✏️ 更新 apktool.yml 版本信息
         run: |
