@@ -125,5 +125,27 @@ public final class CloudEndpoint {
      */
     public static final String CAP_WORKER_URL = "https://captcha.magireco.top";
 
+    // ── 云端存档 ──────────────────────────────────────────────────────────────
+
+    /**
+     * 云端存档上传接口。
+     *
+     * <p>请求：POST，{@code application/json}。Body：
+     * <pre>{ "token": "...", "data": { "/magica/api/...": { "req": "...", "resp": "..." }, ... } }</pre>
+     *
+     * <p>响应：{@code application/json}，{@code { "success": true }}。
+     */
+    public static final String ACCOUNT_SAVE_PUT = "https://api.magi-reco.top/account/save/put";
+
+    /**
+     * 云端存档下载接口。
+     *
+     * <p>请求：POST，{@code application/json}。Body：{@code { "token": "..." }}。
+     *
+     * <p>响应：{@code { "success": true, "data": { ... } }}，data 格式同上传 body 的 data 字段。
+     * 无存档时 data 为 {@code {}}。
+     */
+    public static final String ACCOUNT_SAVE_GET = "https://api.magi-reco.top/account/save/get";
+
     private CloudEndpoint() {}
 }

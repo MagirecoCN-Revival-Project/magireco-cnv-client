@@ -28,6 +28,7 @@ import android.media.AudioManager;
 import android.media.MediaPlayer;
 import android.net.Uri;
 import android.os.Build;
+import android.provider.Settings;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -68,7 +69,8 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     public static final String GAME_ACTIVITY = "jp.f4samurai.AppActivity";
 
     // ---- 常量 ----
-    private static final int    REQ_FILE_PICK     = 0x4D47;
+    private static final int    REQ_FILE_PICK          = 0x4D47;
+    private static final int    REQ_OVERLAY_PERMISSION = 0x4F56;
     private static final String PREFS_NAME        = "cnv_bootstrap_ui";
     private static final String PREF_DARK_MODE    = "dark_mode";
     private static final String PREFS_ACCOUNT     = "cnv_account";
@@ -216,6 +218,9 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private volatile boolean serverOfflineEnabled     = true;
     /** 两个功能均关闭时服务端下发的提示文本；null 时展示默认文案。 */
     private volatile String  serverFeatureDisabledMsg = null;
+
+    /** 覆盖层权限申请完成后待执行的回调（onActivityResult 中触发）。 */
+    private Runnable pendingAfterPermission;
 
     private final AtomicReference<String> modeChoice  = new AtomicReference<>(null);
     private final Object                  modeLock     = new Object();
@@ -1486,7 +1491,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 log("启动", "WARN", "调试：skip_hot_update=true，已跳过热更新检查");
             }
             log("启动", "INFO", "热更新检查完成，显示登录界面");
-            ui.post(() -> showLoginDialog(this::launchGame));
+            ui.post(() -> showLoginDialog(this::checkSavesBeforeLaunch));
             return;
         }
 
@@ -1542,7 +1547,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             log("启动", "WARN", "调试：skip_hot_update=true，已跳过热更新检查");
         }
         log("启动", "INFO", "热更新检查完成，显示登录界面");
-        ui.post(() -> showLoginDialog(this::launchGame));
+        ui.post(() -> showLoginDialog(this::checkSavesBeforeLaunch));
     }
 
     /**
@@ -2106,6 +2111,166 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     }
 
     // ======================================================================
+    // 存档同步（登录后、进游戏前）
+    // ======================================================================
+
+    /**
+     * 登录成功后的入口：先申请悬浮窗权限（若未授权），然后做云端存档对比。
+     * 在主线程调用。
+     */
+    private void checkSavesBeforeLaunch() {
+        if (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(this)) {
+            pendingAfterPermission = this::doSaveCheck;
+            try {
+                Intent it = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:" + getPackageName()));
+                startActivityForResult(it, REQ_OVERLAY_PERMISSION);
+            } catch (Throwable t) {
+                // 如果无法打开权限页，直接继续
+                pendingAfterPermission = null;
+                doSaveCheck();
+            }
+        } else {
+            doSaveCheck();
+        }
+    }
+
+    /**
+     * 在后台线程拉取云端存档，与本地对比，按结果展示对话框或直接启动游戏。
+     * 可在主线程或子线程调用（内部会新开线程处理网络操作）。
+     */
+    private void doSaveCheck() {
+        SharedPreferences prefs = getSharedPreferences(PREFS_ACCOUNT, MODE_PRIVATE);
+        String accountId    = prefs.getString(KEY_ACCOUNT_ID,    null);
+        String accountToken = prefs.getString(KEY_ACCOUNT_TOKEN, null);
+        if (accountId == null || accountToken == null) {
+            ui.post(this::launchWithOverlay);
+            return;
+        }
+        final String fAccountId    = accountId;
+        final String fAccountToken = accountToken;
+        new Thread(() -> {
+            SaveSyncHelper.SaveData local;
+            SaveSyncHelper.SaveData cloud;
+            try {
+                local = SaveSyncHelper.loadLocal(getApplicationContext(), fAccountId);
+                cloud = SaveSyncHelper.fetchCloud(getApplicationContext(), fAccountToken);
+            } catch (Exception e) {
+                android.util.Log.w(TAG, "存档拉取失败，跳过同步：" + e.getMessage());
+                ui.post(this::launchWithOverlay);
+                return;
+            }
+            SaveSyncHelper.SyncState state = SaveSyncHelper.compare(local, cloud);
+            switch (state) {
+                case IN_SYNC:
+                case LOCAL_ONLY:
+                    ui.post(this::launchWithOverlay);
+                    break;
+                case CLOUD_ONLY:
+                    ui.post(() -> showDownloadConfirmDialog(cloud.json, fAccountId));
+                    break;
+                case CONFLICT:
+                    ui.post(() -> showSaveConflictDialog(
+                            local.json, cloud.json, fAccountId, fAccountToken));
+                    break;
+            }
+        }, "cnv-save-check").start();
+    }
+
+    /**
+     * 下载确认框：本地无存档、云端有存档时展示。
+     * 用户选择"下载"时将云端存档写入本地 SQLite，再启动游戏；选"跳过"直接启动。
+     */
+    private void showDownloadConfirmDialog(String cloudJson, String accountId) {
+        View[] frame = inflateDialogFrame();
+        FrameLayout overlay = (FrameLayout) frame[0];
+        LinearLayout card   = (LinearLayout) frame[1];
+        addDialogTitle(card, "下载云端存档");
+        addDialogMessage(card,
+                "检测到云端有存档，而本地尚无存档记录。\n\n是否将云端存档下载到本机？");
+        LinearLayout row = addDialogButtonRow(card);
+        Button skipBtn     = addDialogButton(row, "跳过", false);
+        Button downloadBtn = addDialogButton(row, "下载", true);
+        skipBtn.setOnClickListener(v -> {
+            overlay.setVisibility(View.GONE);
+            vRoot.removeView(overlay);
+            launchWithOverlay();
+        });
+        downloadBtn.setOnClickListener(v -> {
+            overlay.setVisibility(View.GONE);
+            vRoot.removeView(overlay);
+            new Thread(() -> {
+                try {
+                    SaveSyncHelper.applyCloud(getApplicationContext(), accountId, cloudJson);
+                } catch (Exception e) {
+                    android.util.Log.e(TAG, "应用云端存档失败：" + e.getMessage());
+                }
+                ui.post(this::launchWithOverlay);
+            }, "cnv-apply-cloud").start();
+        });
+        overlay.setVisibility(View.VISIBLE);
+    }
+
+    /**
+     * 冲突解决框：本地与云端存档均有内容但不一致时展示。
+     * 用户选择"保留本地"时将本地存档上传覆盖云端；选"使用云端"时将云端存档写入本地。
+     */
+    private void showSaveConflictDialog(String localJson, String cloudJson,
+                                        String accountId, String accountToken) {
+        View[] frame = inflateDialogFrame();
+        FrameLayout overlay = (FrameLayout) frame[0];
+        LinearLayout card   = (LinearLayout) frame[1];
+        addDialogTitle(card, "存档冲突");
+        addDialogMessage(card,
+                "检测到本机存档与云端存档不一致，请选择要保留的版本：\n\n"
+              + "• 保留本地：保留本机存档，并将其上传覆盖云端\n"
+              + "• 使用云端：下载云端存档覆盖本机记录");
+        LinearLayout row  = addDialogButtonRow(card);
+        Button localBtn   = addDialogButton(row, "保留本地", false);
+        Button cloudBtn   = addDialogButton(row, "使用云端", true);
+        localBtn.setOnClickListener(v -> {
+            overlay.setVisibility(View.GONE);
+            vRoot.removeView(overlay);
+            new Thread(() -> {
+                try {
+                    SaveSyncHelper.upload(getApplicationContext(), accountId, accountToken);
+                } catch (Exception e) {
+                    android.util.Log.e(TAG, "上传本地存档失败：" + e.getMessage());
+                }
+                ui.post(this::launchWithOverlay);
+            }, "cnv-upload-local").start();
+        });
+        cloudBtn.setOnClickListener(v -> {
+            overlay.setVisibility(View.GONE);
+            vRoot.removeView(overlay);
+            new Thread(() -> {
+                try {
+                    SaveSyncHelper.applyCloud(getApplicationContext(), accountId, cloudJson);
+                } catch (Exception e) {
+                    android.util.Log.e(TAG, "应用云端存档失败：" + e.getMessage());
+                }
+                ui.post(this::launchWithOverlay);
+            }, "cnv-apply-cloud").start();
+        });
+        overlay.setVisibility(View.VISIBLE);
+    }
+
+    /**
+     * 启动悬浮存档服务（若已获得悬浮窗权限），然后启动游戏。
+     * 在主线程调用。
+     */
+    private void launchWithOverlay() {
+        if (Build.VERSION.SDK_INT < 23 || Settings.canDrawOverlays(this)) {
+            try {
+                startService(new Intent(this, SaveOverlayService.class));
+            } catch (Throwable t) {
+                android.util.Log.w(TAG, "悬浮窗服务启动失败：" + t.getMessage());
+            }
+        }
+        launchGame();
+    }
+
+    // ======================================================================
     // 自定义样式对话框
     // ======================================================================
 
@@ -2517,6 +2682,11 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 pickFinished = true;
                 pickLock.notifyAll();
             }
+        } else if (requestCode == REQ_OVERLAY_PERMISSION) {
+            // 不依赖 resultCode（系统总返回 RESULT_CANCELED），直接检查权限并继续
+            Runnable r = pendingAfterPermission;
+            pendingAfterPermission = null;
+            if (r != null) r.run();
         }
     }
 
