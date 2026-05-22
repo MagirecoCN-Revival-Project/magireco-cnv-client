@@ -72,12 +72,16 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private static final String BG_ASSET          = "cnv/background_light.png";
     /** 资源目录内的游戏 Logo 路径（assets/cnv/logo.png）。 */
     private static final String LOGO_ASSET        = "cnv/logo.png";
-    /** CI 将 HCA 转换成 OGG 后落在 assets 内的循环 BGM 路径（system01 = 系统菜单循环曲）。 */
-    private static final String BGM_ASSET          = "resource/sound_native/bgm/bgm00_system01_hca.ogg";
-    /** 启动音效第一段（startgame01，约 2.0 秒）。 */
-    private static final String TITLE_SFX1_ASSET   = "resource/sound_native/se/startgame01_hca.ogg";
-    /** 启动音效第二段（startgame02，约 2.5 秒），接第一段后播放，完成后启动循环 BGM。 */
-    private static final String TITLE_SFX2_ASSET   = "resource/sound_native/se/startgame02_hca.ogg";
+    /** CI 将 HCA 转换成 OGG 后落在 assets 内的 BGM 路径列表（按顺序循环播放）。 */
+    private static final String[] BGM_ASSETS = {
+        "resource/sound_native/bgm/bgm00_system01_hca.ogg",
+        "resource/sound_native/bgm/bgm00_system02_hca.ogg",
+    };
+    /** 启动音效候选列表（启动时随机取其中一个播放一次，播完后开始循环 BGM）。 */
+    private static final String[] SFX_ASSETS = {
+        "resource/sound_native/se/startgame01_hca.ogg",
+        "resource/sound_native/se/startgame02_hca.ogg",
+    };
 
     // ---- 配色 ----
     private int COLOR_CARD;          // 卡片/面板背景
@@ -178,17 +182,19 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private GradientDrawable homeChipBg;
     private GradientDrawable githubChipBg;
 
-    // ---- BGM / 标题音效 ----
-    /** 循环 BGM 播放器（system01）。 */
+    // ---- BGM / 启动音效 ----
+    /** 当前正在播放的 BGM 播放器。 */
     private MediaPlayer bgmPlayer;
     private boolean bgmWasPlayingWhenPaused = false;
     /** true = 本次会话内不再尝试播 BGM（资源缺失 / 解码失败）。 */
     private boolean bgmDisabled = false;
     /** true = 用户手动关闭 BGM。 */
     private boolean bgmMuted = false;
-    /** 标题音效播放器（一次性）。 */
+    /** 下一首要播的 BGM 在 {@link #BGM_ASSETS} 中的索引（0 = system01）。 */
+    private int bgmIndex = 0;
+    /** 启动音效播放器（一次性）。 */
     private MediaPlayer sfxPlayer;
-    /** true = 本次会话内不再尝试播标题音效。 */
+    /** true = 本次会话内不再尝试播启动音效。 */
     private boolean sfxDisabled = false;
 
     // ---- 线程同步 ----
@@ -1100,19 +1106,20 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     // ======================================================================
 
     /**
-     * 在资源自检完毕后调用：依次播放 startgame01 → startgame02，再启动循环 BGM。
-     * 任一音效资源缺失或播放出错时直接跳到启动 BGM。
+     * 在资源自检完毕后调用：从 {@link #SFX_ASSETS} 中随机选一个启动音效播放一次，
+     * 播完后启动 BGM 循环。资源缺失或播放出错时直接启动 BGM。
      */
     private void playTitleSequence() {
         if (sfxDisabled) {
-            log("音频", "INFO", "标题音效不可用，直接启动 BGM");
+            log("音频", "INFO", "启动音效不可用，直接启动 BGM");
             startBgm();
             return;
         }
         if (sfxPlayer != null) return;
-        log("音频", "INFO", "开始播放标题音效序列");
-        playSfxSegment(TITLE_SFX1_ASSET,
-                () -> playSfxSegment(TITLE_SFX2_ASSET, this::startBgm));
+        int pick = (int)(Math.random() * SFX_ASSETS.length);
+        String sfxAsset = SFX_ASSETS[pick];
+        log("音频", "INFO", "随机播放启动音效 [" + pick + "]");
+        playSfxSegment(sfxAsset, this::startBgm);
     }
 
     /** 播放单段音效资源；完成后在主线程执行 onDone。出错或资源缺失时直接调 startBgm()。 */
@@ -1131,7 +1138,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 onDone.run();
             });
             mp.setOnErrorListener((p, what, extra) -> {
-                log("音频", "WARN", "标题音效播放出错（what=" + what + "，extra=" + extra + "），启动 BGM");
+                log("音频", "WARN", "启动音效播放出错（what=" + what + "，extra=" + extra + "），启动 BGM");
                 try { p.release(); } catch (Throwable ignore) {}
                 sfxPlayer   = null;
                 sfxDisabled = true;
@@ -1142,7 +1149,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             mp.setOnPreparedListener(MediaPlayer::start);
             mp.prepareAsync();
         } catch (Throwable t) {
-            log("音频", "WARN", "标题音效资源缺失，直接启动 BGM：" + t.getMessage());
+            log("音频", "WARN", "启动音效资源缺失，直接启动 BGM：" + t.getMessage());
             sfxPlayer   = null;
             sfxDisabled = true;
             startBgm();
@@ -1154,9 +1161,9 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         bgmMuted = !bgmMuted;
         log("音频", "INFO", "BGM 状态切换：" + (bgmMuted ? "静音" : "恢复播放"));
         if (bgmMuted) {
-            stopBgm();
+            stopBgm();   // 静音时停止并重置曲目索引（stopBgm 内完成）
         } else {
-            startBgm();
+            startBgm();  // 恢复时从 system01 重新开始
         }
         updateBgmPill();
     }
@@ -1174,20 +1181,21 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     }
 
     /**
-     * 异步启动循环 BGM（system01）。
-     * 已经在播、已禁用或用户已静音时直接返回。
+     * 异步启动 BGM；播完当前曲目后自动衔接下一首，形成 system01→system02→… 循环。
+     * 已在播、已禁用或用户已静音时直接返回。
      */
     private void startBgm() {
         if (bgmDisabled || bgmPlayer != null || bgmMuted) return;
-        log("音频", "INFO", "启动 BGM 播放");
+        String asset = BGM_ASSETS[bgmIndex % BGM_ASSETS.length];
+        log("音频", "INFO", "启动 BGM [" + bgmIndex + "] " + asset);
         try {
-            AssetFileDescriptor afd = getAssets().openFd(BGM_ASSET);
+            AssetFileDescriptor afd = getAssets().openFd(asset);
             MediaPlayer mp = new MediaPlayer();
             mp.setAudioStreamType(AudioManager.STREAM_MUSIC);
             mp.setDataSource(afd.getFileDescriptor(),
                     afd.getStartOffset(), afd.getLength());
             try { afd.close(); } catch (Throwable ignore) {}
-            mp.setLooping(true);
+            mp.setLooping(false);
             mp.setOnPreparedListener(p -> {
                 // 准备完成时若已静音（用户在 prepareAsync 期间点了静音），直接丢弃
                 if (bgmMuted || bgmPlayer == null) {
@@ -1195,8 +1203,15 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                     if (bgmPlayer == p) bgmPlayer = null;
                     return;
                 }
-                log("音频", "INFO", "BGM 准备就绪，开始循环播放");
+                log("音频", "INFO", "BGM 准备就绪，开始播放");
                 try { p.start(); } catch (Throwable ignore) {}
+            });
+            mp.setOnCompletionListener(p -> {
+                // 曲目播完：释放旧播放器，推进索引，播下一首
+                try { p.release(); } catch (Throwable ignore) {}
+                if (bgmPlayer == p) bgmPlayer = null;
+                bgmIndex = (bgmIndex + 1) % BGM_ASSETS.length;
+                if (!bgmMuted && !bgmDisabled) startBgm();
             });
             mp.setOnErrorListener((p, what, extra) -> {
                 log("音频", "WARN", "BGM 播放出错（what=" + what + "，extra=" + extra + "），本会话内禁用 BGM");
@@ -1238,6 +1253,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private void stopBgm() {
         MediaPlayer mp = bgmPlayer;
         bgmPlayer = null;
+        bgmIndex  = 0;   // 下次恢复时从 system01 重新开始
         if (mp == null) return;
         // reset() 适用于所有状态（包括 PREPARING），可靠地停止音频输出
         try { mp.reset(); } catch (Throwable ignore) {}
