@@ -123,10 +123,10 @@ public final class ResourceFlow {
         }
 
         /**
-         * MD5 校验不通过时弹确认对话框。
+         * SHA-256 校验不通过时弹确认对话框。
          * @return true = 用户选择强行继续；false = 取消注入
          */
-        boolean confirmMd5Mismatch(String expected, String actual);
+        boolean confirmSha256Mismatch(String expected, String actual);
 
         /** 弹纯信息对话框，阻塞到用户点确定。 */
         void showInfoDialog(String title, String message);
@@ -568,15 +568,15 @@ public final class ResourceFlow {
         }
 
         // 尝试获取云端离线包信息（供用户参考；失败不阻断离线流程）
-        String cloudUrl = null, cloudVersion = null, cloudMd5 = null;
+        String cloudUrl = null, cloudVersion = null, cloudSha256 = null;
         try {
             reporter.setStatus("正在获取云端离线包信息…");
             ClientInit.OfflinePackageInfo pkg = ClientInit.fetchOfflinePackage(ctx, sessionToken);
             cloudUrl     = pkg.downloadUrl;
             cloudVersion = pkg.packageVersion;
-            cloudMd5     = pkg.md5;
+            cloudSha256  = pkg.sha256;
             reporter.log("INFO", "云端离线包版本=" + cloudVersion
-                    + (cloudMd5 != null ? "，MD5 已获取" : "，MD5 未下发"));
+                    + (cloudSha256 != null ? "，SHA-256 已获取" : "，SHA-256 未下发"));
         } catch (Throwable t) {
             reporter.log("WARN", "获取云端离线包信息失败（忽略）: " + t.getMessage());
         }
@@ -601,26 +601,26 @@ public final class ResourceFlow {
         reporter.log("INFO", "离线包 URI: " + zipUri);
         verifyZip(zipUri);
 
-        // MD5 校验：仅在服务端下发了 MD5 时执行
-        if (cloudMd5 != null && !cloudMd5.isEmpty()) {
-            reporter.setStatus("正在计算文件 MD5…");
-            reporter.log("INFO", "开始计算离线包 MD5，期望值=" + cloudMd5);
-            String actualMd5;
+        // SHA-256 校验：仅在服务端下发了哈希值时执行
+        if (cloudSha256 != null && !cloudSha256.isEmpty()) {
+            reporter.setStatus("正在计算文件 SHA-256…");
+            reporter.log("INFO", "开始计算离线包 SHA-256，期望值=" + cloudSha256);
+            String actualSha256;
             try {
-                actualMd5 = md5HexFromUri(zipUri);
+                actualSha256 = sha256HexFromUri(zipUri);
             } catch (Exception e) {
-                reporter.log("WARN", "MD5 计算失败：" + e.getMessage() + "，跳过校验");
-                actualMd5 = null;
+                reporter.log("WARN", "SHA-256 计算失败：" + e.getMessage() + "，跳过校验");
+                actualSha256 = null;
             }
-            if (actualMd5 != null && !cloudMd5.equalsIgnoreCase(actualMd5)) {
-                reporter.log("WARN", "MD5 校验不通过：期望=" + cloudMd5 + "，实际=" + actualMd5);
-                boolean proceed = reporter.confirmMd5Mismatch(cloudMd5, actualMd5);
+            if (actualSha256 != null && !cloudSha256.equalsIgnoreCase(actualSha256)) {
+                reporter.log("WARN", "SHA-256 校验不通过：期望=" + cloudSha256 + "，实际=" + actualSha256);
+                boolean proceed = reporter.confirmSha256Mismatch(cloudSha256, actualSha256);
                 if (!proceed) {
-                    throw new FatalConfigException("MD5 校验不通过，用户取消注入");
+                    throw new FatalConfigException("SHA-256 校验不通过，用户取消注入");
                 }
-                reporter.log("WARN", "用户选择忽略 MD5 校验不通过，继续注入");
-            } else if (actualMd5 != null) {
-                reporter.log("INFO", "MD5 校验通过：" + cloudMd5);
+                reporter.log("WARN", "用户选择忽略 SHA-256 校验不通过，继续注入");
+            } else if (actualSha256 != null) {
+                reporter.log("INFO", "SHA-256 校验通过：" + cloudSha256);
             }
         }
 
@@ -824,7 +824,7 @@ public final class ResourceFlow {
      * 检查并应用 js / scenario 热更新包。每次进游戏前调用，非致命。
      *
      * <p>复用下载槽位 UI（initSlots(2)）和心跳体系（HeartbeatSender），
-     * 行为与在线下载一致：有更新 → 下载 → MD5 校验 → 解压；无更新直接标 done。
+     * 行为与在线下载一致：有更新 → 下载 → SHA-256 校验 → 解压；无更新直接标 done。
      * 心跳向服务端上报热更进度，服务端可响应 switch_mirrors / ban。
      */
     public void runHotUpdate() {
@@ -953,17 +953,17 @@ public final class ResourceFlow {
             }
         }
 
-        if (entry.md5 != null && !entry.md5.isEmpty()) {
-            String actual = md5Hex(zipFile);
-            if (!entry.md5.equalsIgnoreCase(actual)) {
-                reporter.log("热更", "WARN", "[" + fileName + "] MD5 校验失败"
-                        + "（期望=" + entry.md5 + " 实际=" + actual + "），跳过");
+        if (entry.sha256 != null && !entry.sha256.isEmpty()) {
+            String actual = sha256Hex(zipFile);
+            if (!entry.sha256.equalsIgnoreCase(actual)) {
+                reporter.log("热更", "WARN", "[" + fileName + "] SHA-256 校验失败"
+                        + "（期望=" + entry.sha256 + " 实际=" + actual + "），跳过");
                 state.status = DownloadState.Status.FAILED;
                 reporter.setSlotPhase(slot, "failed");
                 zipFile.delete();
                 return;
             }
-            reporter.log("热更", "INFO", "[" + fileName + "] MD5 校验通过");
+            reporter.log("热更", "INFO", "[" + fileName + "] SHA-256 校验通过");
         }
 
         reporter.setSlotPhase(slot, "extracting");
@@ -1008,10 +1008,10 @@ public final class ResourceFlow {
         }
     }
 
-    /** 从 content URI 读取文件字节并计算 MD5，同时通过 reporter 汇报进度。 */
-    private String md5HexFromUri(Uri uri) throws Exception {
+    /** 从 content URI 读取文件字节并计算 SHA-256，同时通过 reporter 汇报进度。 */
+    private String sha256HexFromUri(Uri uri) throws Exception {
         long total = queryStreamLength(uri);
-        java.security.MessageDigest md = java.security.MessageDigest.getInstance("MD5");
+        java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
         try (InputStream is = ctx.getContentResolver().openInputStream(uri)) {
             if (is == null) throw new java.io.IOException("无法打开文件流");
             byte[] buf = new byte[65536];
@@ -1033,9 +1033,9 @@ public final class ResourceFlow {
         return sb.toString();
     }
 
-    private static String md5Hex(File file) {
+    private static String sha256Hex(File file) {
         try {
-            java.security.MessageDigest md = java.security.MessageDigest.getInstance("MD5");
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
             try (java.io.FileInputStream fis = new java.io.FileInputStream(file)) {
                 byte[] buf = new byte[65536];
                 int n;

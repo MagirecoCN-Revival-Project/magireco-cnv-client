@@ -1184,6 +1184,12 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             try { afd.close(); } catch (Throwable ignore) {}
             mp.setLooping(true);
             mp.setOnPreparedListener(p -> {
+                // 准备完成时若已静音（用户在 prepareAsync 期间点了静音），直接丢弃
+                if (bgmMuted || bgmPlayer == null) {
+                    try { p.reset(); p.release(); } catch (Throwable ignore) {}
+                    if (bgmPlayer == p) bgmPlayer = null;
+                    return;
+                }
                 log("音频", "INFO", "BGM 准备就绪，开始循环播放");
                 try { p.start(); } catch (Throwable ignore) {}
             });
@@ -1216,7 +1222,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     }
 
     private void resumeBgm() {
-        if (bgmPlayer == null || !bgmWasPlayingWhenPaused) return;
+        if (bgmPlayer == null || !bgmWasPlayingWhenPaused || bgmMuted) return;
         try {
             bgmPlayer.start();
             bgmWasPlayingWhenPaused = false;
@@ -1228,7 +1234,8 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         MediaPlayer mp = bgmPlayer;
         bgmPlayer = null;
         if (mp == null) return;
-        try { if (mp.isPlaying()) mp.stop(); } catch (Throwable ignore) {}
+        // reset() 适用于所有状态（包括 PREPARING），可靠地停止音频输出
+        try { mp.reset(); } catch (Throwable ignore) {}
         try { mp.release(); } catch (Throwable ignore) {}
     }
 
@@ -2704,7 +2711,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     }
 
     @Override
-    public boolean confirmMd5Mismatch(final String expected, final String actual) {
+    public boolean confirmSha256Mismatch(final String expected, final String actual) {
         final Object   lock   = new Object();
         final boolean[] result = { false };
         final boolean[] done   = { false };
@@ -2712,9 +2719,9 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             View[] frame = inflateDialogFrame();
             FrameLayout overlay = (FrameLayout) frame[0];
             LinearLayout card   = (LinearLayout) frame[1];
-            addDialogTitle(card, "MD5 校验不通过");
+            addDialogTitle(card, "SHA-256 校验不通过");
             addDialogMessage(card,
-                    "所选文件的 MD5 与服务端记录不符，可能文件已损坏或来源有误。\n\n"
+                    "所选文件的 SHA-256 哈希与服务端记录不符，可能文件已损坏或来源有误。\n\n"
                   + "期望：" + (expected != null ? expected : "（未知）") + "\n"
                   + "实际：" + (actual   != null ? actual   : "（计算失败）") + "\n\n"
                   + "强行继续可能导致游戏无法正常运行。");
@@ -2724,13 +2731,13 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             cancelBtn.setOnClickListener(v -> {
                 overlay.setVisibility(View.GONE);
                 vRoot.removeView(overlay);
-                log("离线包", "INFO", "用户取消：MD5 校验不通过");
+                log("离线包", "INFO", "用户取消：SHA-256 校验不通过");
                 synchronized (lock) { result[0] = false; done[0] = true; lock.notifyAll(); }
             });
             forceBtn.setOnClickListener(v -> {
                 overlay.setVisibility(View.GONE);
                 vRoot.removeView(overlay);
-                log("离线包", "WARN", "用户强行继续：忽略 MD5 校验不通过");
+                log("离线包", "WARN", "用户强行继续：忽略 SHA-256 校验不通过");
                 synchronized (lock) { result[0] = true; done[0] = true; lock.notifyAll(); }
             });
             overlay.setVisibility(View.VISIBLE);

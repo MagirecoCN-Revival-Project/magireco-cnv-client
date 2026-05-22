@@ -62,19 +62,19 @@ public final class ClientInit {
         public String       resourceToken;
     }
 
-    /** /client/offline-package 响应：离线包下载 URL + 版本 + MD5。 */
+    /** /client/offline-package 响应：离线包下载 URL + 版本 + SHA-256。 */
     public static final class OfflinePackageInfo {
         public String downloadUrl;
         public String packageVersion;
-        public String md5;
+        public String sha256;
     }
 
-    /** /client/hot-update 响应：js 包和 scenario 包各自的版本 / MD5 / 下载地址。 */
+    /** /client/hot-update 响应：js 包和 scenario 包各自的版本 / SHA-256 / 下载地址。 */
     public static final class HotUpdateInfo {
         public static final class Entry {
             /** 服务端版本号（整数递增）；0 表示服务端未返回。 */
             public int    version;
-            public String md5;
+            public String sha256;
             public String downloadUrl;
             /** 压缩包字节数；-1 表示服务端未返回（退化为单线程 downloadResume）。 */
             public long   fileSize = -1L;
@@ -182,7 +182,7 @@ public final class ClientInit {
     }
 
     /**
-     * 获取云端离线包的下载地址、版本号和 MD5。
+     * 获取云端离线包的下载地址、版本号和 SHA-256。
      *
      * @param sessionToken 握手阶段获取的会话令牌
      * @throws Exception   网络错误 / HTTP &ge; 400
@@ -196,7 +196,7 @@ public final class ClientInit {
         JSONObject obj = new JSONObject(raw);
         info.downloadUrl    = obj.optString("download_url",    null);
         info.packageVersion = obj.optString("package_version", null);
-        info.md5            = obj.optString("md5",             null);
+        info.sha256         = obj.optString("sha256",          null);
         return info;
     }
 
@@ -217,15 +217,15 @@ public final class ClientInit {
 
         JSONObject js = obj.optJSONObject("js");
         if (js != null) {
-            info.js.version     = js.optInt("version",       0);
-            info.js.md5         = js.optString("md5",         null);
+            info.js.version     = js.optInt("version",        0);
+            info.js.sha256      = js.optString("sha256",      null);
             info.js.downloadUrl = js.optString("download_url", null);
             info.js.fileSize    = js.optLong("size",          -1L);
         }
         JSONObject sc = obj.optJSONObject("scenario");
         if (sc != null) {
-            info.scenario.version     = sc.optInt("version",       0);
-            info.scenario.md5         = sc.optString("md5",         null);
+            info.scenario.version     = sc.optInt("version",        0);
+            info.scenario.sha256      = sc.optString("sha256",      null);
             info.scenario.downloadUrl = sc.optString("download_url", null);
             info.scenario.fileSize    = sc.optLong("size",          -1L);
         }
