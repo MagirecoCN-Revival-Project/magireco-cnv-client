@@ -239,15 +239,14 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
 
     // ---- 贡献者数据 ----
     /**
-     * 贡献者条目：圆形头像颜色 + 名字（粗体，保留原始大小写）+ 贡献说明 + 主页 URL。
-     * 头像显示名字首字，颜色与设计文档中署名颜色一致。
+     * 贡献者条目：圆形头像色 + 名字 + 贡献说明 + 主页 URL + 头像图片 URL（null = 显示首字母）。
      */
     private static final Object[][] CONTRIBUTORS = {
-        // { 头像色, 名字, 贡献说明, 主页 URL }
-        { 0xFF3D7BFF, "CyberNova",   "项目负责人 · 私服开发 · UI 设计",  "https://github.com/magirecocn-revival-project" },
-        { 0xFF8BB87A, "MadeInMagius","资源整理 · 汉化数据",              "https://github.com/magirecocn-revival-project" },
-        { 0xFFE667A0, "segfault",    "资源数据 · 技术支持",              "https://github.com/magirecocn-revival-project" },
-        { 0xFF4FB7E6, "水银h2oag",   "资源数据 · 社区维护",              "https://github.com/magirecocn-revival-project" },
+        // { 头像色, 名字, 贡献说明, 主页 URL, 头像图片 URL }
+        { 0xFF3D7BFF, "CyberNova",   "新端APK修改 · 云端提供",     "https://github.com/magirecocn-revival-project", null },
+        { 0xFF8BB87A, "MadeInMagius","旧端APK修改 · 资源打包",     "https://github.com/magirecocn-revival-project", null },
+        { 0xFFE667A0, "水银h2oag",   "日服绝大部分剧情汉化",       "https://github.com/magirecocn-revival-project", null },
+        { 0xFF4FB7E6, "segfault",    "提供国服文件存档",           "https://github.com/magirecocn-revival-project", null },
     };
 
     // ======================================================================
@@ -384,7 +383,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 ViewGroup.LayoutParams.WRAP_CONTENT));
         for (Object[] c : CONTRIBUTORS) {
             contribList.addView(buildContributorRow(
-                    (int) c[0], (String) c[1], (String) c[2], (String) c[3]));
+                    (int) c[0], (String) c[1], (String) c[2], (String) c[3], (String) c[4]));
         }
         leftCol.addView(contribScroll, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
@@ -668,7 +667,8 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
 
         // 日志正文（等宽字体 + 可全选）
         vLogScroll = new ScrollView(this);
-        vLogScroll.setFillViewport(true);
+        // FOCUS_BLOCK_DESCENDANTS 阻止 textIsSelectable 的 TextView 自动把焦点（和滚动位置）吸到顶部
+        vLogScroll.setDescendantFocusability(ViewGroup.FOCUS_BLOCK_DESCENDANTS);
         GradientDrawable logScrollBg = new GradientDrawable();
         // 使用与面板背景有明显对比的半透明深色背景，确保空日志时滚动区域可见
         logScrollBg.setColor(darkMode ? 0x44FFFFFF : 0x14000000);
@@ -809,9 +809,12 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
      *
      * <p>布局：[圆形头像] [大写粗体名字（单击提示 / 双击跳转主页）]
      * <br>         [缩进]  [贡献说明文字]
+     *
+     * @param avatarUrl 头像图片 URL；null 时显示首字母彩色圆
      */
     private View buildContributorRow(final int avatarColor, final String name,
-                                     final String contribution, final String url) {
+                                     final String contribution, final String url,
+                                     final String avatarUrl) {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.VERTICAL);
         LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
@@ -829,12 +832,15 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        // 圆形头像（显示名字首字母，颜色为贡献者专属色）
+        // 圆形头像：有 avatarUrl 时异步加载网络图片，否则显示首字母彩色圆
         AvatarView avatar = new AvatarView(this, avatarColor, name);
         int avatarSize = dp(36);
         LinearLayout.LayoutParams avLp = new LinearLayout.LayoutParams(avatarSize, avatarSize);
         avLp.rightMargin = dp(8);
         nameRow.addView(avatar, avLp);
+        if (avatarUrl != null && !avatarUrl.isEmpty()) {
+            loadAvatarBitmap(avatar, avatarUrl);
+        }
 
         // 名字（粗体，保留原始大小写）
         TextView vName = new TextView(this);
@@ -886,12 +892,40 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     }
 
     /**
-     * 圆形头像 View：在指定颜色的圆形背景上显示名字首字母（大写）。
+     * 后台线程从 URL 下载图片并回调到主线程设置到 AvatarView。
+     * 加载失败时静默忽略，头像保持首字母圆形兜底。
+     */
+    private void loadAvatarBitmap(AvatarView av, String url) {
+        new Thread(() -> {
+            try {
+                java.net.HttpURLConnection conn =
+                        (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+                conn.setConnectTimeout(10_000);
+                conn.setReadTimeout(10_000);
+                conn.setRequestProperty("User-Agent", "MagirecoCNV/1.0");
+                conn.connect();
+                if (conn.getResponseCode() == 200) {
+                    Bitmap bm = BitmapFactory.decodeStream(conn.getInputStream());
+                    if (bm != null) ui.post(() -> av.setBitmap(bm));
+                }
+                conn.disconnect();
+            } catch (Throwable ignore) {}
+        }, "cnv-avatar").start();
+    }
+
+    /**
+     * 圆形头像 View。
+     * 默认在指定颜色的圆形背景上显示名字首字母（大写）；
+     * 调用 {@link #setBitmap(Bitmap)} 后改为显示网络图片（center-crop 裁圆）。
      */
     private static final class AvatarView extends View {
-        private final Paint  circlePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final Paint  textPaint   = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final String initial;
+        private final Paint        circlePaint  = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint        textPaint    = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint        bitmapPaint  = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+        private final String       initial;
+        private       Bitmap       bitmap;
+        private       BitmapShader bitmapShader;
+        private       int          lastSz = -1;
 
         AvatarView(Context ctx, int color, String name) {
             super(ctx);
@@ -899,21 +933,43 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             circlePaint.setStyle(Paint.Style.FILL);
             textPaint.setColor(0xFFFFFFFF);
             textPaint.setTypeface(Typeface.create(Typeface.DEFAULT_BOLD, Typeface.BOLD));
-            // 首字符大写（汉字则直接取第一个字符）
             initial = name.isEmpty() ? "?" :
                     String.valueOf(name.charAt(0)).toUpperCase(Locale.US);
+        }
+
+        void setBitmap(Bitmap bm) {
+            if (bm == null || bm.isRecycled()) return;
+            bitmap       = bm;
+            bitmapShader = new BitmapShader(bm, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP);
+            bitmapPaint.setShader(bitmapShader);
+            lastSz = -1;
+            invalidate();
         }
 
         @Override
         protected void onDraw(Canvas canvas) {
             float cx = getWidth() / 2f, cy = getHeight() / 2f;
             float r  = Math.min(cx, cy) - 2f;
-            canvas.drawCircle(cx, cy, r, circlePaint);
-            textPaint.setTextSize(r * 0.9f);
-            Paint.FontMetrics fm = textPaint.getFontMetrics();
-            float tx = cx - textPaint.measureText(initial) / 2f;
-            float ty = cy - (fm.ascent + fm.descent) / 2f;
-            canvas.drawText(initial, tx, ty, textPaint);
+            if (bitmap != null) {
+                int sz = getWidth();
+                if (sz != lastSz && sz > 0) {
+                    lastSz = sz;
+                    float bw = bitmap.getWidth(), bh = bitmap.getHeight();
+                    float scale = Math.max(sz / bw, sz / bh);
+                    Matrix m = new Matrix();
+                    m.setScale(scale, scale);
+                    m.postTranslate((sz - bw * scale) / 2f, (sz - bh * scale) / 2f);
+                    bitmapShader.setLocalMatrix(m);
+                }
+                canvas.drawCircle(cx, cy, r, bitmapPaint);
+            } else {
+                canvas.drawCircle(cx, cy, r, circlePaint);
+                textPaint.setTextSize(r * 0.9f);
+                Paint.FontMetrics fm = textPaint.getFontMetrics();
+                float tx = cx - textPaint.measureText(initial) / 2f;
+                float ty = cy - (fm.ascent + fm.descent) / 2f;
+                canvas.drawText(initial, tx, ty, textPaint);
+            }
         }
     }
 
