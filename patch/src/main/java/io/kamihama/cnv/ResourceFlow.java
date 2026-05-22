@@ -122,6 +122,12 @@ public final class ResourceFlow {
             log(type, "[" + component + "] " + msg);
         }
 
+        /**
+         * MD5 校验不通过时弹确认对话框。
+         * @return true = 用户选择强行继续；false = 取消注入
+         */
+        boolean confirmMd5Mismatch(String expected, String actual);
+
         /** 弹纯信息对话框，阻塞到用户点确定。 */
         void showInfoDialog(String title, String message);
 
@@ -562,13 +568,15 @@ public final class ResourceFlow {
         }
 
         // 尝试获取云端离线包信息（供用户参考；失败不阻断离线流程）
-        String cloudUrl = null, cloudVersion = null;
+        String cloudUrl = null, cloudVersion = null, cloudMd5 = null;
         try {
             reporter.setStatus("正在获取云端离线包信息…");
             ClientInit.OfflinePackageInfo pkg = ClientInit.fetchOfflinePackage(ctx, sessionToken);
             cloudUrl     = pkg.downloadUrl;
             cloudVersion = pkg.packageVersion;
-            reporter.log("INFO", "云端离线包版本=" + cloudVersion);
+            cloudMd5     = pkg.md5;
+            reporter.log("INFO", "云端离线包版本=" + cloudVersion
+                    + (cloudMd5 != null ? "，MD5 已获取" : "，MD5 未下发"));
         } catch (Throwable t) {
             reporter.log("WARN", "获取云端离线包信息失败（忽略）: " + t.getMessage());
         }
@@ -592,6 +600,29 @@ public final class ResourceFlow {
         reporter.setStatus("正在校验 zip 格式…");
         reporter.log("INFO", "离线包 URI: " + zipUri);
         verifyZip(zipUri);
+
+        // MD5 校验：仅在服务端下发了 MD5 时执行
+        if (cloudMd5 != null && !cloudMd5.isEmpty()) {
+            reporter.setStatus("正在计算文件 MD5…");
+            reporter.log("INFO", "开始计算离线包 MD5，期望值=" + cloudMd5);
+            String actualMd5;
+            try {
+                actualMd5 = md5HexFromUri(zipUri);
+            } catch (Exception e) {
+                reporter.log("WARN", "MD5 计算失败：" + e.getMessage() + "，跳过校验");
+                actualMd5 = null;
+            }
+            if (actualMd5 != null && !cloudMd5.equalsIgnoreCase(actualMd5)) {
+                reporter.log("WARN", "MD5 校验不通过：期望=" + cloudMd5 + "，实际=" + actualMd5);
+                boolean proceed = reporter.confirmMd5Mismatch(cloudMd5, actualMd5);
+                if (!proceed) {
+                    throw new FatalConfigException("MD5 校验不通过，用户取消注入");
+                }
+                reporter.log("WARN", "用户选择忽略 MD5 校验不通过，继续注入");
+            } else if (actualMd5 != null) {
+                reporter.log("INFO", "MD5 校验通过：" + cloudMd5);
+            }
+        }
 
         // ── 第一阶段：解压外层 zip 到暂存目录（避免直接覆盖 filesDir）──────────
         File stagingDir = new File(ctx.getFilesDir(), "cnv_staging");
@@ -975,6 +1006,31 @@ public final class ResourceFlow {
                 zis.closeEntry();
             }
         }
+    }
+
+    /** 从 content URI 读取文件字节并计算 MD5，同时通过 reporter 汇报进度。 */
+    private String md5HexFromUri(Uri uri) throws Exception {
+        long total = queryStreamLength(uri);
+        java.security.MessageDigest md = java.security.MessageDigest.getInstance("MD5");
+        try (InputStream is = ctx.getContentResolver().openInputStream(uri)) {
+            if (is == null) throw new java.io.IOException("无法打开文件流");
+            byte[] buf = new byte[65536];
+            long processed = 0L;
+            int n;
+            while ((n = is.read(buf)) != -1) {
+                md.update(buf, 0, n);
+                processed += n;
+                if (total > 0) reporter.setOverallProgress(processed, total);
+            }
+        }
+        byte[] hash = md.digest();
+        StringBuilder sb = new StringBuilder(hash.length * 2);
+        for (byte b : hash) {
+            int v = b & 0xff;
+            if (v < 0x10) sb.append('0');
+            sb.append(Integer.toHexString(v));
+        }
+        return sb.toString();
     }
 
     private static String md5Hex(File file) {

@@ -1387,17 +1387,31 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                     getSharedPreferences("cnv_launch_state", 0);
             long lastLaunchMs = launchState.getLong("last_launch_ms", 0L);
             long elapsed = System.currentTimeMillis() - lastLaunchMs;
-            // 距上次启动游戏不超过 20 秒 → 可能发生了崩溃循环，询问用户
+            // 距上次启动游戏不超过 20 秒视为"快速重启"；累计 3 次才弹恢复对话框
             if (lastLaunchMs > 0L && elapsed < 20_000L) {
-                log("启动", "WARN", "检测到游戏可能崩溃（距上次启动仅 " + elapsed + " ms），进入恢复模式");
-                launchState.edit().putLong("last_launch_ms", 0L).apply();
-                boolean shouldReset = askCrashRecovery();
-                if (shouldReset) {
-                    deleteReadyFlag();
-                    alreadyReady = false;
-                    log("启动", "INFO", "用户选择重新注入资源，已清除就绪标志");
+                int rapidCount = launchState.getInt("rapid_restart_count", 0) + 1;
+                log("启动", "WARN", "检测到快速重启（距上次 " + elapsed + " ms），计数=" + rapidCount + "/3");
+                if (rapidCount >= 3) {
+                    launchState.edit()
+                            .putLong("last_launch_ms", 0L)
+                            .putInt("rapid_restart_count", 0)
+                            .apply();
+                    log("启动", "WARN", "连续 3 次快速重启，进入崩溃恢复模式");
+                    boolean shouldReset = askCrashRecovery();
+                    if (shouldReset) {
+                        deleteReadyFlag();
+                        alreadyReady = false;
+                        log("启动", "INFO", "用户选择重新注入资源，已清除就绪标志");
+                    } else {
+                        log("启动", "INFO", "用户选择继续启动游戏");
+                    }
                 } else {
-                    log("启动", "INFO", "用户选择继续启动游戏");
+                    launchState.edit().putInt("rapid_restart_count", rapidCount).apply();
+                }
+            } else {
+                // 正常间隔重启，重置计数器
+                if (launchState.getInt("rapid_restart_count", 0) != 0) {
+                    launchState.edit().putInt("rapid_restart_count", 0).apply();
                 }
             }
         }
@@ -2677,6 +2691,48 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 synchronized (lock) { result[0] = true; done[0] = true; lock.notifyAll(); }
             });
 
+            overlay.setVisibility(View.VISIBLE);
+        });
+        synchronized (lock) {
+            while (!done[0]) {
+                try { lock.wait(500); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt(); return false;
+                }
+            }
+            return result[0];
+        }
+    }
+
+    @Override
+    public boolean confirmMd5Mismatch(final String expected, final String actual) {
+        final Object   lock   = new Object();
+        final boolean[] result = { false };
+        final boolean[] done   = { false };
+        ui.post(() -> {
+            View[] frame = inflateDialogFrame();
+            FrameLayout overlay = (FrameLayout) frame[0];
+            LinearLayout card   = (LinearLayout) frame[1];
+            addDialogTitle(card, "MD5 校验不通过");
+            addDialogMessage(card,
+                    "所选文件的 MD5 与服务端记录不符，可能文件已损坏或来源有误。\n\n"
+                  + "期望：" + (expected != null ? expected : "（未知）") + "\n"
+                  + "实际：" + (actual   != null ? actual   : "（计算失败）") + "\n\n"
+                  + "强行继续可能导致游戏无法正常运行。");
+            LinearLayout row  = addDialogButtonRow(card);
+            Button cancelBtn  = addDialogButton(row, "取消",     true);
+            Button forceBtn   = addDialogButton(row, "强行继续", false);
+            cancelBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                log("离线包", "INFO", "用户取消：MD5 校验不通过");
+                synchronized (lock) { result[0] = false; done[0] = true; lock.notifyAll(); }
+            });
+            forceBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                log("离线包", "WARN", "用户强行继续：忽略 MD5 校验不通过");
+                synchronized (lock) { result[0] = true; done[0] = true; lock.notifyAll(); }
+            });
             overlay.setVisibility(View.VISIBLE);
         });
         synchronized (lock) {
