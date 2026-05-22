@@ -1,4 +1,4 @@
-// MagiaClient.cpp — native runtime hook companion to cnv-bootstrap/
+// MagiaClient.cpp — cnv-bootstrap 的 native 运行时 hook 伴侣
 //
 // 在引擎 .so 加载完之后挂上去，拦截 libmadomagi_native.so 内部那条
 // 「读 asset.json → 决定是否拉 15GB 资源 → 弹下载场景」的流水线。
@@ -58,7 +58,7 @@ void (*downloadSceneLayerCtorOld)(void*, void*) = nullptr;
 bool (*downloadSceneLayerInitOld)(void*) = nullptr;
 void (*downloadSceneLayerOnEnterOld)(void*) = nullptr;
 
-// DownloadSceneLayerInfo::C2(ESceneLayerType, std::function<void()>&, std::string&, DownloadRunningType)
+// DownloadSceneLayerInfo 构造函数：C2(ESceneLayerType, std::function<void()>&, std::string&, DownloadRunningType)
 void (*dslInfoCtorOld)(void*, int, const std::function<void()>&,
                        const std::string&, int) = nullptr;
 
@@ -124,7 +124,7 @@ void downloadSceneLayerCtorNew(void* _this, void* info) {
 }
 
 // ════════════════════════════════════════════════════════
-// DownloadSceneLayer::init
+// DownloadSceneLayer::init — 下载场景初始化
 // ════════════════════════════════════════════════════════
 bool downloadSceneLayerInitNew(void* _this) {
     bool result = downloadSceneLayerInitOld(_this);
@@ -188,7 +188,7 @@ void assetLoadOnDownloadedNew(void* _this) {
 }
 
 // ════════════════════════════════════════════════════════
-// checkParseJson
+// checkParseJson — 解析 asset.json 拦截点
 // ════════════════════════════════════════════════════════
 static cocos2d::Data g_emptyData{ (unsigned char*)"[]", 2 };
 
@@ -218,7 +218,7 @@ bool checkParseJsonNew(void* _this, const cocos2d::Data& data) {
 }
 
 // ════════════════════════════════════════════════════════
-// SelectURL callbacks
+// SelectURL 回调 — 资源 URL 选择
 // ════════════════════════════════════════════════════════
 void selectURLOnRespNew(void* _this, void* session, void* resp) {
     if (resourcesReady()) { LOGI("[SelectURL::onResp] 静默"); return; }
@@ -230,7 +230,7 @@ void selectURLOnErrNew(void* _this, void* session, int code) {
 }
 
 // ════════════════════════════════════════════════════════
-// DLJson callbacks
+// DLJson 回调 — JSON 资源列表下载
 // ════════════════════════════════════════════════════════
 void dlJsonOnRespNew(void* _this, void* session, void* resp) {
     if (resourcesReady()) { return; }
@@ -246,7 +246,7 @@ void dlJsonOnRespErrNew(void* _this) {
 }
 
 // ════════════════════════════════════════════════════════
-// MainScene callbacks
+// MainScene 回调 — 主场景加载
 // ════════════════════════════════════════════════════════
 void mainSceneOnRespNew(void* _this, void* session, void* resp) {
     mainSceneOnRespOld(_this, session, resp);
@@ -261,7 +261,7 @@ void mainSceneOnErrNew(void* _this, void* session, int code) {
 }
 
 // ════════════════════════════════════════════════════════
-// QbScene / QuestData
+// QbScene / QuestData — 任务场景回调
 // ════════════════════════════════════════════════════════
 void qbSceneOnRespNew(void* _this, void* session, void* resp) {
     if (!resourcesReady()) { return; }
@@ -273,7 +273,7 @@ void questDataOnRespNew(void* _this, void* session, void* resp) {
 }
 
 // ════════════════════════════════════════════════════════
-// setURI / Http2::onResp
+// setURI / Http2::onResp — HTTP 请求拦截
 // ════════════════════════════════════════════════════════
 void setURINew(void* _this, const std::string& uri) {
     setURIOld(_this, uri);
@@ -289,7 +289,7 @@ void http2OnRespNew(void* _this, void* resp) {
 }
 
 // ════════════════════════════════════════════════════════
-// JNI_OnLoad
+// JNI_OnLoad — .so 加载入口，注册所有 hook
 // ════════════════════════════════════════════════════════
 extern "C" jint JNI_OnLoad(JavaVM* vm, void* reserved) {
     gJvm = vm;

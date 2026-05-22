@@ -195,6 +195,12 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private volatile boolean launched  = false;
     /** 握手后由服务端签发的会话令牌，传给 ResourceFlow 用于鉴权三件套。 */
     private volatile String  sessionToken = "";
+    /** 服务端功能开关：是否允许在线下载（握手后由 handleCloudInit 写入）。 */
+    private volatile boolean serverOnlineEnabled      = true;
+    /** 服务端功能开关：是否允许离线包注入（握手后由 handleCloudInit 写入）。 */
+    private volatile boolean serverOfflineEnabled     = true;
+    /** 两个功能均关闭时服务端下发的提示文本；null 时展示默认文案。 */
+    private volatile String  serverFeatureDisabledMsg = null;
 
     private final AtomicReference<String> modeChoice  = new AtomicReference<>(null);
     private final Object                  modeLock     = new Object();
@@ -1363,8 +1369,8 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private void runWork() {
         log("启动", "INFO", "工作线程已启动");
 
-        // 调试模式：display_ui_only.flag 存在且内容为 "true" 时，仅展示 UI，跳过所有其他逻辑
-        if (isDebugUiOnly()) {
+        // 调试模式：display_ui_only.flag=true 时仅展示 UI，跳过所有启动逻辑
+        if (isDebugFlag("display_ui_only")) {
             log("启动", "WARN", "调试模式已激活（display_ui_only.flag=true），跳过所有启动逻辑");
             ui.post(this::playTitleSequence);
             setPhase("init");
@@ -1379,12 +1385,53 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         // 自检完毕，触发标题音效序列（system02 → system01 BGM）
         ui.post(this::playTitleSequence);
 
-        // 第 0b 步：选下载模式（在线 / 离线）
-        // 资源已齐时跳过对话框，用占位值发 init（服务端不关心 ready 场景的 method 字段）
-        String userMethod;
-        if (alreadyReady) {
-            userMethod = ResourceFlow.MODE_ONLINE;
+        // 第 0b 步：检查本地封禁记录（心跳写入，早于 init 网络请求）
+        if (!isDebugFlag("skip_ban_check")) {
+            log("启动", "INFO", "检查本地封禁记录…");
+            BanInfo localBan = BanInfo.load(this);
+            if (localBan != null && localBan.isActive()) {
+                log("启动", "ERROR", "检测到有效本地封禁记录：" + localBan.reason
+                        + "（到期=" + localBan.expireTime + "）");
+                showFatalAndExit("账号已被封禁", localBan.buildMessage());
+                return;
+            }
+            log("启动", "INFO", "本地封禁记录检查通过");
         } else {
+            log("启动", "WARN", "调试：skip_ban_check=true，已跳过封禁记录检查");
+        }
+
+        // 第 0c 步：与云端 /client/init 握手（封禁 / 维护 / 版本闸门 / 功能开关）
+        if (!isDebugFlag("skip_cloud_init")) {
+            log("启动", "INFO", "开始与云端握手…");
+            if (!handleCloudInit()) return;
+        } else {
+            log("启动", "WARN", "调试：skip_cloud_init=true，已跳过云端握手（使用默认功能开关）");
+        }
+
+        // 第 0d 步：资源已齐则跳过下载，直接检查热更新
+        if (alreadyReady) {
+            log("启动", "INFO", "资源已就绪，跳过下载，检查热更新");
+            if (!isDebugFlag("skip_hot_update")) {
+                new ResourceFlow(this, this, ResourceFlow.MODE_ONLINE, sessionToken).runHotUpdate();
+            } else {
+                log("启动", "WARN", "调试：skip_hot_update=true，已跳过热更新检查");
+            }
+            log("启动", "INFO", "热更新检查完成，启动游戏");
+            ui.post(this::launchGame);
+            return;
+        }
+
+        // 第 0e 步：根据服务端功能开关和调试 flag 选择下载模式
+        String userMethod;
+        boolean forceOnline  = isDebugFlag("force_online_mode");
+        boolean forceOffline = isDebugFlag("force_offline_mode");
+        if (forceOnline) {
+            userMethod = ResourceFlow.MODE_ONLINE;
+            log("启动", "WARN", "调试：force_online_mode=true，强制使用在线模式");
+        } else if (forceOffline) {
+            userMethod = ResourceFlow.MODE_OFFLINE;
+            log("启动", "WARN", "调试：force_offline_mode=true，强制使用离线模式");
+        } else if (serverOnlineEnabled && serverOfflineEnabled) {
             log("启动", "INFO", "弹出下载模式选择对话框");
             userMethod = askDownloadMethod();
             if (userMethod == null) {
@@ -1393,30 +1440,13 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 return;
             }
             log("启动", "INFO", "用户选择了下载模式：" + userMethod);
-        }
-
-        // 第 0c 步：检查本地封禁记录（心跳写入，早于 init 网络请求）
-        log("启动", "INFO", "检查本地封禁记录…");
-        BanInfo localBan = BanInfo.load(this);
-        if (localBan != null && localBan.isActive()) {
-            log("启动", "ERROR", "检测到有效本地封禁记录：" + localBan.reason
-                    + "（到期=" + localBan.expireTime + "）");
-            showFatalAndExit("账号已被封禁", localBan.buildMessage());
-            return;
-        }
-        log("启动", "INFO", "本地封禁记录检查通过");
-
-        // 第 0d 步：与云端 /client/init 握手（封禁 / 维护 / 版本闸门）
-        log("启动", "INFO", "开始与云端握手…");
-        if (!handleCloudInit()) return;
-
-        // 第 0e 步：资源已齐则跳过下载，直接检查热更新
-        if (alreadyReady) {
-            log("启动", "INFO", "资源已就绪，跳过下载，检查热更新");
-            new ResourceFlow(this, this, ResourceFlow.MODE_ONLINE, sessionToken).runHotUpdate();
-            log("启动", "INFO", "热更新检查完成，启动游戏");
-            ui.post(this::launchGame);
-            return;
+        } else if (serverOnlineEnabled) {
+            userMethod = ResourceFlow.MODE_ONLINE;
+            log("启动", "INFO", "服务端仅开放在线下载，自动选择在线模式");
+        } else {
+            // serverOfflineEnabled must be true（两者均关闭的情况在 handleCloudInit 内已拦截）
+            userMethod = ResourceFlow.MODE_OFFLINE;
+            log("启动", "INFO", "服务端仅开放离线包注入，自动选择离线模式");
         }
 
         // 第 0f 步：启动资源下载流程
@@ -1435,16 +1465,34 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
 
         // 第 0g 步：首次下载完成后同样检查热更新（包可能刚发布就有更新）
         log("启动", "INFO", "资源流程完成，检查热更新");
-        new ResourceFlow(this, this, ResourceFlow.MODE_ONLINE, sessionToken).runHotUpdate();
+        if (!isDebugFlag("skip_hot_update")) {
+            new ResourceFlow(this, this, ResourceFlow.MODE_ONLINE, sessionToken).runHotUpdate();
+        } else {
+            log("启动", "WARN", "调试：skip_hot_update=true，已跳过热更新检查");
+        }
         log("启动", "INFO", "热更新检查完成，即将启动游戏");
         ui.post(this::launchGame);
     }
 
-    /** 检测 &lt;filesDir&gt;/debug/display_ui_only.flag 是否存在且内容为 "true"。 */
-    private boolean isDebugUiOnly() {
+    /**
+     * 检测调试 flag 文件是否存在且内容为 "true"。
+     * Flag 文件位于 &lt;filesDir&gt;/debug/&lt;name&gt;.flag，内容须为字符串 "true"（忽略首尾空白）。
+     *
+     * <p>已定义的 flag：
+     * <ul>
+     *   <li>{@code display_ui_only} — 仅展示 UI，跳过所有启动逻辑（最早检查）</li>
+     *   <li>{@code skip_cloud_init} — 跳过云端握手，使用默认功能开关</li>
+     *   <li>{@code skip_ban_check} — 跳过本地封禁记录检查</li>
+     *   <li>{@code skip_hot_update} — 跳过热更新检查</li>
+     *   <li>{@code force_online_mode} — 强制使用在线下载模式（忽略服务端功能开关）</li>
+     *   <li>{@code force_offline_mode} — 强制使用离线包注入模式（忽略服务端功能开关）</li>
+     *   <li>{@code verbose_net_log} — 启用详细网络日志（由 Net 层读取）</li>
+     * </ul>
+     */
+    boolean isDebugFlag(String name) {
         try {
             java.io.File f = new java.io.File(new java.io.File(getFilesDir(), "debug"),
-                    "display_ui_only.flag");
+                    name + ".flag");
             if (!f.exists()) return false;
             java.io.FileInputStream fis = new java.io.FileInputStream(f);
             byte[] buf = new byte[(int) Math.min(f.length(), 16)];
@@ -1728,6 +1776,22 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         if (init.fakeName != null || init.fakeVersion != null) {
             log("握手", "INFO", "版本伪造参数：fakeName=" + init.fakeName
                     + "，fakeVersion=" + init.fakeVersion);
+        }
+
+        // 功能开关：写入实例字段，供 runWork() 决策下载模式
+        serverOnlineEnabled      = init.onlineDownloadEnabled;
+        serverOfflineEnabled     = init.offlinePackageEnabled;
+        serverFeatureDisabledMsg = init.featureDisabledMessage;
+        log("握手", "INFO", "功能开关：在线下载=" + serverOnlineEnabled
+                + "，离线包注入=" + serverOfflineEnabled);
+
+        // 两个功能均关闭 → 按服务器维护处理
+        if (!serverOnlineEnabled && !serverOfflineEnabled) {
+            String msg = (serverFeatureDisabledMsg != null && !serverFeatureDisabledMsg.isEmpty())
+                    ? serverFeatureDisabledMsg : "服务器暂时关闭了所有下载功能，请稍后再试。";
+            log("握手", "WARN", "所有功能开关均已关闭，按维护处理：" + msg);
+            showFatalAndExit("功能暂不可用", msg);
+            return false;
         }
 
         return true;

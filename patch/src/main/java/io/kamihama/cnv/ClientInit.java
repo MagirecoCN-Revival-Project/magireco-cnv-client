@@ -16,7 +16,7 @@ import java.util.List;
  */
 public final class ClientInit {
 
-    /** /client/init 握手响应：封禁 / 维护 / 版本闸门 / 伪造版本 / 会话令牌。 */
+    /** /client/init 握手响应：封禁 / 维护 / 版本闸门 / 伪造版本 / 会话令牌 / 功能开关。 */
     public static final class Response {
         public boolean      bannedFlag;
         public String       bannedReason;
@@ -35,6 +35,23 @@ public final class ClientInit {
         public String       fakeName;
         /** 服务端签发的会话令牌；后续所有 API 请求的鉴权三件套之一。 */
         public String       accessToken;
+
+        // ── 功能开关（features 字段组）────────────────────────────────
+        /**
+         * 是否开放在线下载功能；默认 true（服务端不返回 features 时退化为开放）。
+         * false 时客户端不显示在线下载选项。
+         */
+        public boolean      onlineDownloadEnabled  = true;
+        /**
+         * 是否开放离线包注入功能；默认 true。
+         * false 时客户端不显示离线包选项。
+         */
+        public boolean      offlinePackageEnabled  = true;
+        /**
+         * 当两个功能均关闭时向用户显示的提示文本。
+         * null 时展示默认维护提示。
+         */
+        public String       featureDisabledMessage;
     }
 
     /** /client/online-download 响应：镜像列表 + S3 资源令牌。 */
@@ -59,6 +76,8 @@ public final class ClientInit {
             public int    version;
             public String md5;
             public String downloadUrl;
+            /** 压缩包字节数；-1 表示服务端未返回（退化为单线程 downloadResume）。 */
+            public long   fileSize = -1L;
         }
         public Entry js       = new Entry();
         public Entry scenario = new Entry();
@@ -115,6 +134,13 @@ public final class ClientInit {
         if (spoof != null) {
             r.fakeVersion = spoof.optString("fake_version", null);
             r.fakeName    = spoof.optString("fake_name",    null);
+        }
+
+        JSONObject features = obj.optJSONObject("features");
+        if (features != null) {
+            r.onlineDownloadEnabled  = features.optBoolean("online_download",  true);
+            r.offlinePackageEnabled  = features.optBoolean("offline_package",  true);
+            r.featureDisabledMessage = features.optString("disabled_message",  null);
         }
 
         return r;
@@ -191,15 +217,17 @@ public final class ClientInit {
 
         JSONObject js = obj.optJSONObject("js");
         if (js != null) {
-            info.js.version     = js.optInt("version",      0);
+            info.js.version     = js.optInt("version",       0);
             info.js.md5         = js.optString("md5",         null);
             info.js.downloadUrl = js.optString("download_url", null);
+            info.js.fileSize    = js.optLong("size",          -1L);
         }
         JSONObject sc = obj.optJSONObject("scenario");
         if (sc != null) {
-            info.scenario.version     = sc.optInt("version",      0);
+            info.scenario.version     = sc.optInt("version",       0);
             info.scenario.md5         = sc.optString("md5",         null);
             info.scenario.downloadUrl = sc.optString("download_url", null);
+            info.scenario.fileSize    = sc.optLong("size",          -1L);
         }
         return info;
     }

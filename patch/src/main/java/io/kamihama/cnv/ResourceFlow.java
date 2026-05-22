@@ -592,60 +592,136 @@ public final class ResourceFlow {
         reporter.setPhase("offline-verify");
         reporter.setStatus("正在校验 zip 格式…");
         reporter.log("INFO", "离线包 URI: " + zipUri);
-
         verifyZip(zipUri);
 
-        // 预扫描条目以建立槽位
-        reporter.setStatus("正在扫描 zip 条目…");
-        List<String> entryNames = scanZipEntries(zipUri);
-        final Map<String, Integer> entrySlotMap = new HashMap<>();
-        if (!entryNames.isEmpty()) {
-            reporter.initSlots(entryNames.size());
-            for (int i = 0; i < entryNames.size(); i++) {
-                reporter.setSlot(i, entryNames.get(i), 0, -1, 0);
-                entrySlotMap.put(entryNames.get(i), i);
-            }
-        } else {
-            reporter.initSlots(1);
-        }
+        // ── 第一阶段：解压外层 zip 到暂存目录（避免直接覆盖 filesDir）──────────
+        File stagingDir = new File(ctx.getFilesDir(), "cnv_staging");
+        deleteRecursive(stagingDir);  // 清理可能残留的旧暂存
+        stagingDir.mkdirs();
 
-        reporter.setPhase("offline-extract");
-        reporter.setStatus("正在解压资源…");
+        reporter.initSlots(1);
+        reporter.setSlot(0, "外层 zip（暂存解压）", 0, -1, 0);
+        reporter.setSlotPhase(0, "extracting");
+        reporter.setPhase("offline-stage1");
+        reporter.setStatus("正在解压外层 zip 到暂存目录…");
+        reporter.log("INFO", "第一阶段：解压外层 zip → " + stagingDir.getAbsolutePath());
 
-        File destDir = ctx.getFilesDir();
         long totalBytes = queryStreamLength(zipUri);
-
         try (InputStream is = ctx.getContentResolver().openInputStream(zipUri)) {
             if (is == null) throw new java.io.IOException("无法打开文件流");
-
-            Unzip.extractFromStream(is, destDir, totalBytes, new Unzip.ProgressSink() {
-                int curSlot = 0;
-                @Override public void onEntry(String name, long entryIndex, long entryTotalEstimate) {
-                    Integer slot = entrySlotMap.get(name);
-                    curSlot = slot != null ? slot : 0;
-                    reporter.setSlotPhase(curSlot, "extracting");
-                    reporter.setStatus("解压: " + name);
+            // 不剥离前缀，保留外层 zip 的原始目录结构，便于找到内层 zip
+            Unzip.extractFromStream(is, stagingDir, totalBytes, "", new Unzip.ProgressSink() {
+                @Override public void onEntry(String name, long idx, long est) {
+                    reporter.setStatus("暂存: " + name);
                 }
                 @Override public void onEntryBytes(long written, long uncompressedSize) {
-                    reporter.setSlot(curSlot, null, written, uncompressedSize, 0);
+                    reporter.setSlot(0, null, written, uncompressedSize, 0);
                 }
-                @Override public void onEntryDone(String name) {
-                    reporter.setSlotPhase(curSlot, "done");
-                }
+                @Override public void onEntryDone(String name) {}
                 @Override public void onBytes(long bytesProcessed, long bytesTotal) {
                     reporter.setOverallProgress(bytesProcessed,
                             bytesTotal > 0 ? bytesTotal : totalBytes);
                 }
-                @Override public boolean isCancelled() {
-                    return reporter.isCancelled();
-                }
+                @Override public boolean isCancelled() { return reporter.isCancelled(); }
             });
         }
+        reporter.setSlotPhase(0, "done");
+        reporter.log("INFO", "第一阶段完成，扫描暂存目录中的内层 zip…");
+
+        // ── 第二阶段：找到所有内层 zip，逐一解压到 filesDir ─────────────────────
+        List<File> innerZips = findInnerZipsRecursive(stagingDir);
+        reporter.log("INFO", "发现内层 zip 数量=" + innerZips.size());
+
+        File destDir = ctx.getFilesDir();
+        if (innerZips.isEmpty()) {
+            // 外层 zip 内无嵌套 zip，将暂存内容复制到目标目录
+            reporter.log("INFO", "未发现内层 zip，直接复制暂存内容到目标目录");
+            reporter.setPhase("offline-stage2");
+            reporter.setStatus("正在复制资源到目标目录…");
+            copyDirectoryRecursive(stagingDir, destDir);
+        } else {
+            reporter.initSlots(innerZips.size());
+            reporter.setPhase("offline-stage2");
+            reporter.setStatus("正在解压内层 zip…");
+
+            for (int i = 0; i < innerZips.size(); i++) {
+                File innerZip = innerZips.get(i);
+                String name   = innerZip.getName();
+                reporter.setSlot(i, name, 0, innerZip.length(), 0);
+                reporter.setSlotPhase(i, "extracting");
+                reporter.log("INFO", "第二阶段[" + i + "]: 解压 " + name + " → " + destDir);
+                final int slot = i;
+                Unzip.extract(innerZip, destDir, new Unzip.ProgressSink() {
+                    @Override public void onEntry(String n, long idx, long est) {
+                        reporter.setStatus("解压: " + n);
+                    }
+                    @Override public void onEntryBytes(long written, long uncompressedSize) {
+                        reporter.setSlot(slot, null, written, uncompressedSize, 0);
+                    }
+                    @Override public void onEntryDone(String n) {}
+                    @Override public void onBytes(long bytesProcessed, long bytesTotal) {
+                        reporter.setOverallProgress(bytesProcessed,
+                                bytesTotal > 0 ? bytesTotal : innerZip.length());
+                    }
+                    @Override public boolean isCancelled() { return reporter.isCancelled(); }
+                });
+                reporter.setSlotPhase(slot, "done");
+                reporter.log("INFO", "第二阶段[" + i + "]: " + name + " 解压完成");
+            }
+        }
+
+        // 清理暂存目录
+        deleteRecursive(stagingDir);
+        reporter.log("INFO", "暂存目录已清理");
 
         reporter.setPhase("done");
         reporter.setStatus("离线资源注入完成");
-        reporter.log("INFO", "离线资源解压完成，写入 ready flag");
+        reporter.log("INFO", "两阶段离线资源解压完成，写入 ready flag");
         writeReadyFlag();
+    }
+
+    /** 递归查找目录中所有 .zip 文件。 */
+    private static List<File> findInnerZipsRecursive(File dir) {
+        List<File> result = new ArrayList<>();
+        File[] entries = dir.listFiles();
+        if (entries == null) return result;
+        for (File f : entries) {
+            if (f.isDirectory()) {
+                result.addAll(findInnerZipsRecursive(f));
+            } else if (f.getName().toLowerCase(Locale.US).endsWith(".zip")) {
+                result.add(f);
+            }
+        }
+        return result;
+    }
+
+    /** 递归删除文件或目录。 */
+    private static void deleteRecursive(File f) {
+        if (f.isDirectory()) {
+            File[] children = f.listFiles();
+            if (children != null) for (File c : children) deleteRecursive(c);
+        }
+        f.delete();
+    }
+
+    /** 递归将 src 目录树复制到 dest（dest 不存在则自动创建）。 */
+    private static void copyDirectoryRecursive(File src, File dest) throws java.io.IOException {
+        dest.mkdirs();
+        File[] entries = src.listFiles();
+        if (entries == null) return;
+        for (File f : entries) {
+            File target = new File(dest, f.getName());
+            if (f.isDirectory()) {
+                copyDirectoryRecursive(f, target);
+            } else {
+                try (java.io.FileInputStream fis  = new java.io.FileInputStream(f);
+                     java.io.FileOutputStream fos = new java.io.FileOutputStream(target)) {
+                    byte[] buf = new byte[65536];
+                    int n;
+                    while ((n = fis.read(buf)) != -1) fos.write(buf, 0, n);
+                }
+            }
+        }
     }
 
     /** 预扫描 zip 条目名列表（剥离 magica/ 前缀，跳过目录条目）。 */
@@ -824,7 +900,12 @@ public final class ResourceFlow {
             };
 
             try {
-                Net.downloadResume(downloadUrl, zipFile, -1L, 30_000, sink);
+                // fileSize > 0 时启用多线程分片下载（4 线程），否则退化为单线程续传
+                if (entry.fileSize > 0) {
+                    Net.downloadChunked(downloadUrl, zipFile, entry.fileSize, 4, 30_000, sink);
+                } else {
+                    Net.downloadResume(downloadUrl, zipFile, -1L, 30_000, sink);
+                }
                 break;  // 下载成功，退出重试循环
             } catch (java.io.IOException e) {
                 if (state.switchPending && !reporter.isCancelled()) {
