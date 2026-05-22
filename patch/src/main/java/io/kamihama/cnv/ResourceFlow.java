@@ -716,8 +716,9 @@ public final class ResourceFlow {
     /**
      * 检查并应用 js / scenario 热更新包。每次进游戏前调用，非致命。
      *
-     * <p>复用下载槽位 UI（initSlots(2)），行为与在线下载一致：
-     * 有更新 → 下载 → MD5 校验 → 解压；无更新直接标 done。
+     * <p>复用下载槽位 UI（initSlots(2)）和心跳体系（HeartbeatSender），
+     * 行为与在线下载一致：有更新 → 下载 → MD5 校验 → 解压；无更新直接标 done。
+     * 心跳向服务端上报热更进度，服务端可响应 switch_mirrors / ban。
      */
     public void runHotUpdate() {
         reporter.setPhase("hot-update");
@@ -738,19 +739,49 @@ public final class ResourceFlow {
         reporter.setSlotPhase(0, "pending");
         reporter.setSlotPhase(1, "pending");
 
+        // 为热更新的两个文件建立心跳状态（热更 currentMirror = 完整下载 URL）
+        ConcurrentHashMap<String, DownloadState> hotStates = new ConcurrentHashMap<>();
+        hotStates.put("cn_js_update.zip",
+                new DownloadState("cn_js_update.zip",
+                        info.js.downloadUrl != null ? info.js.downloadUrl : ""));
+        hotStates.put("cn_scenario_update.zip",
+                new DownloadState("cn_scenario_update.zip",
+                        info.scenario.downloadUrl != null ? info.scenario.downloadUrl : ""));
+
+        String deviceId;
+        try { deviceId = DeviceId.get(ctx); } catch (Throwable t) { deviceId = ""; }
+        HeartbeatSender hb = new HeartbeatSender(hotStates, deviceId, sessionToken);
+        Thread hbThread = new Thread(hb, "cnv-hot-heartbeat");
+        hbThread.setDaemon(true);
+        hbThread.start();
+
         android.content.SharedPreferences prefs =
                 ctx.getSharedPreferences(HOT_UPDATE_PREFS, 0);
 
-        applyHotPatch(0, "cn_js_update.zip",      info.js,       prefs, KEY_JS_VER);
-        applyHotPatch(1, "cn_scenario_update.zip", info.scenario, prefs, KEY_SC_VER);
+        try {
+            applyHotPatch(0, "cn_js_update.zip",       info.js,       prefs, KEY_JS_VER,
+                          hotStates.get("cn_js_update.zip"));
+            applyHotPatch(1, "cn_scenario_update.zip",  info.scenario, prefs, KEY_SC_VER,
+                          hotStates.get("cn_scenario_update.zip"));
+        } finally {
+            hb.stop();
+        }
 
         reporter.setStatus("热更新检查完成");
         reporter.log("热更", "INFO", "热更新检查完成");
     }
 
+    /**
+     * 下载并应用单个热更新包。
+     *
+     * <p>{@code state} 由调用方提供，供心跳线程实时读取；
+     * 方法内通过 {@link DownloadState#switchPending} 协作式取消当前下载并换线重试，
+     * 与 {@link #downloadAll} 中的 worker 机制对称。
+     */
     private void applyHotPatch(int slot, String fileName,
                                 ClientInit.HotUpdateInfo.Entry entry,
-                                android.content.SharedPreferences prefs, String versionKey) {
+                                android.content.SharedPreferences prefs, String versionKey,
+                                DownloadState state) {
         int localVer  = prefs.getInt(versionKey, 0);
         int serverVer = entry.version;
         reporter.log("热更", "INFO",
@@ -758,36 +789,57 @@ public final class ResourceFlow {
 
         if (serverVer <= localVer) {
             reporter.log("热更", "INFO", "[" + fileName + "] 无需更新");
+            state.status = DownloadState.Status.DONE;
             reporter.setSlotPhase(slot, "done");
             return;
         }
         if (entry.downloadUrl == null || entry.downloadUrl.isEmpty()) {
             reporter.log("热更", "WARN", "[" + fileName + "] 服务端未提供下载地址，跳过");
+            state.status = DownloadState.Status.DONE;
             reporter.setSlotPhase(slot, "done");
             return;
         }
 
         reporter.setSlotPhase(slot, "downloading");
-        reporter.log("热更", "INFO", "[" + fileName + "] 开始下载：" + entry.downloadUrl);
+        state.status = DownloadState.Status.DOWNLOADING;
 
         File zipFile = new File(ctx.getCacheDir(), "cnv_hot_" + slot + ".zip");
-        if (zipFile.exists()) zipFile.delete();
 
-        Net.ProgressSink sink = new Net.ProgressSink() {
-            @Override
-            public void onProgress(long soFar, long total, long bps) {
-                reporter.setSlot(slot, fileName, soFar, total, bps);
+        // 带心跳换线的下载重试循环（与 downloadAll worker 对称）
+        while (true) {
+            if (zipFile.exists()) zipFile.delete();
+            String downloadUrl = state.currentMirror;
+            reporter.log("热更", "INFO", "[" + fileName + "] 开始下载：" + downloadUrl);
+
+            Net.ProgressSink sink = new Net.ProgressSink() {
+                @Override public void onProgress(long soFar, long total, long bps) {
+                    state.soFar = soFar;
+                    state.total = total > 0 ? total : -1L;
+                    state.bps   = bps;
+                    reporter.setSlot(slot, fileName, soFar, total, bps);
+                }
+                @Override public boolean isCancelled() {
+                    return reporter.isCancelled() || state.switchPending;
+                }
+            };
+
+            try {
+                Net.downloadResume(downloadUrl, zipFile, -1L, 30_000, sink);
+                break;  // 下载成功，退出重试循环
+            } catch (java.io.IOException e) {
+                if (state.switchPending && !reporter.isCancelled()) {
+                    // 心跳触发换线：清标志，用新 URL 重试
+                    state.switchPending = false;
+                    reporter.log("热更", "INFO",
+                            "[" + fileName + "] 心跳换线 → " + state.currentMirror);
+                } else {
+                    state.status = DownloadState.Status.FAILED;
+                    reporter.log("热更", "WARN", "[" + fileName + "] 下载失败：" + e.getMessage());
+                    reporter.setSlotPhase(slot, "failed");
+                    zipFile.delete();
+                    return;
+                }
             }
-            @Override public boolean isCancelled() { return reporter.isCancelled(); }
-        };
-
-        try {
-            Net.downloadResume(entry.downloadUrl, zipFile, -1L, 30_000, sink);
-        } catch (java.io.IOException e) {
-            reporter.log("热更", "WARN", "[" + fileName + "] 下载失败：" + e.getMessage());
-            reporter.setSlotPhase(slot, "failed");
-            zipFile.delete();
-            return;
         }
 
         if (entry.md5 != null && !entry.md5.isEmpty()) {
@@ -795,6 +847,7 @@ public final class ResourceFlow {
             if (!entry.md5.equalsIgnoreCase(actual)) {
                 reporter.log("热更", "WARN", "[" + fileName + "] MD5 校验失败"
                         + "（期望=" + entry.md5 + " 实际=" + actual + "），跳过");
+                state.status = DownloadState.Status.FAILED;
                 reporter.setSlotPhase(slot, "failed");
                 zipFile.delete();
                 return;
@@ -809,6 +862,7 @@ public final class ResourceFlow {
             unzipHotPatch(zipFile, ctx.getFilesDir());
         } catch (java.io.IOException e) {
             reporter.log("热更", "WARN", "[" + fileName + "] 解压失败：" + e.getMessage());
+            state.status = DownloadState.Status.FAILED;
             reporter.setSlotPhase(slot, "failed");
             zipFile.delete();
             return;
@@ -816,6 +870,7 @@ public final class ResourceFlow {
 
         zipFile.delete();
         prefs.edit().putInt(versionKey, serverVer).apply();
+        state.status = DownloadState.Status.DONE;
         reporter.setSlotPhase(slot, "done");
         reporter.log("热更", "INFO", "[" + fileName + "] 更新完成，版本=" + serverVer);
     }
