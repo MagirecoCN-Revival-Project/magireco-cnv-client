@@ -1,7 +1,6 @@
 package io.kamihama.cnv;
 
 import android.content.Context;
-import android.content.SharedPreferences;
 import android.os.Build;
 import android.provider.Settings;
 
@@ -10,31 +9,26 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 
 /**
- * 持久化的匿名设备 ID。
+ * 硬件绑定的匿名设备 ID。
  *
- * <p>第一次启动时根据硬件 / 系统属性算出一个 SHA-256 摘要、
- * 写入 SharedPreferences；之后所有调用都返回这个固定值。
+ * <p>每次进程启动时从硬件 / 系统属性实时计算 SHA-256 摘要，
+ * 结果缓存到进程级静态 volatile（不写 SharedPreferences）。
  *
- * <p>"匿名"——只采集设备的"型号 + 厂商 + ANDROID_ID"维度，
- * 不读 IMEI / MAC / 序列号等任何可定位真人身份的信息。
+ * <p>"硬件绑定"——基于 MANUFACTURER / BRAND / MODEL / DEVICE /
+ * BOARD / HARDWARE + ANDROID_ID 计算，与 APP 数据存储无关：
+ * 清除应用数据、卸载重装后计算结果不变（Android 8+ 上 ANDROID_ID
+ * 按应用签名密钥作用域，不因重装而改变）；只有出厂重置才会变更。
  *
- * <p>"不变动"——一旦写到 SharedPreferences 就不再重算：
- * 即使 OTA 后 {@link Build} 的某个字段被刷新，也以本机首次
- * 记录的为准。除非用户主动清除 APP 数据 / 卸载重装。
+ * <p>不读 IMEI / MAC / 序列号等需要特权权限或可直接定位真人的信息。
  *
- * <p>线程安全：使用 double-checked locking 缓存到静态 volatile。
+ * <p>线程安全：double-checked locking + volatile。
  */
 public final class DeviceId {
-
-    /** SharedPreferences 名称（与其他 cnv 配置分开避免冲突）。 */
-    private static final String PREFS = "cnv_device";
-    /** 缓存键名。 */
-    private static final String KEY   = "device_id";
 
     private static volatile String cached;
 
     /**
-     * 取本机匿名设备 ID（64 字符小写十六进制 SHA-256）。
+     * 取本机硬件绑定设备 ID（64 字符小写十六进制 SHA-256）。
      * 永不返回 null；硬件信息读不到时退化成空串参与摘要，
      * 摘要本身始终能算出来。
      */
@@ -43,16 +37,7 @@ public final class DeviceId {
         if (c != null) return c;
         synchronized (DeviceId.class) {
             if (cached != null) return cached;
-            SharedPreferences sp = ctx.getApplicationContext()
-                    .getSharedPreferences(PREFS, Context.MODE_PRIVATE);
-            String saved = sp.getString(KEY, null);
-            if (saved != null && !saved.isEmpty()) {
-                cached = saved;
-                return cached;
-            }
-            String generated = generate(ctx);
-            sp.edit().putString(KEY, generated).apply();
-            cached = generated;
+            cached = generate(ctx);
             return cached;
         }
     }

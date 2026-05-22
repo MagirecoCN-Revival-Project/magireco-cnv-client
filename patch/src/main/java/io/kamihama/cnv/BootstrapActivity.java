@@ -216,6 +216,8 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private final Handler ui = new Handler(Looper.getMainLooper());
     private volatile boolean cancelled = false;
     private volatile boolean launched  = false;
+    /** 握手后由服务端签发的会话令牌，传给 ResourceFlow 用于鉴权三件套。 */
+    private volatile String  sessionToken = "";
 
     private final AtomicReference<String> modeChoice  = new AtomicReference<>(null);
     private final Object                  modeLock     = new Object();
@@ -1441,7 +1443,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         // 第 0f 步：启动资源下载流程
         log("启动", "INFO", "启动资源下载流程（模式=" + userMethod + "）");
         try {
-            new ResourceFlow(this, this, userMethod).run();
+            new ResourceFlow(this, this, userMethod, sessionToken).run();
         } catch (ResourceFlow.FatalConfigException fce) {
             log("启动", "ERROR", "资源流程致命错误：" + fce.getMessage());
             return;
@@ -1674,7 +1676,9 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                   + "\n\n请检查网络后重试。");
             return false;
         }
-        log("握手", "INFO", "握手成功，服务端状态=" + init.serverStatus);
+        sessionToken = init.accessToken != null ? init.accessToken : "";
+        log("握手", "INFO", "握手成功，服务端状态=" + init.serverStatus
+                + "，会话令牌=" + (sessionToken.isEmpty() ? "（未下发）" : "已获取"));
 
         // 封禁
         if (init.bannedFlag) {
@@ -2440,6 +2444,79 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             try { finishAndRemoveTask(); } catch (Throwable ignore) {}
             android.os.Process.killProcess(android.os.Process.myPid());
         });
+    }
+
+    @Override
+    public boolean requestOfflineSourceDialog(final String cloudUrl, final String cloudVersion) {
+        final Object   lock   = new Object();
+        final boolean[] result = { false };
+        final boolean[] done   = { false };
+        ui.post(() -> {
+            View[] frame = inflateDialogFrame();
+            FrameLayout overlay = (FrameLayout) frame[0];
+            LinearLayout card   = (LinearLayout) frame[1];
+            addDialogTitle(card, "获取离线资源包");
+
+            StringBuilder msg = new StringBuilder("请选择获取离线资源包的方式：\n\n"
+                    + "• 选择文件：直接从本机选取已有的官方离线 zip 包\n"
+                    + "• 云端下载：打开浏览器下载后返回此界面再选择文件");
+            if (cloudVersion != null && !cloudVersion.isEmpty()) {
+                msg.append("\n\n当前云端版本：").append(cloudVersion);
+            }
+            if (cloudUrl == null) {
+                msg.append("\n\n（暂时无法获取云端下载地址，请使用本地文件）");
+            }
+            addDialogMessage(card, msg.toString());
+
+            LinearLayout row = addDialogButtonRow(card);
+
+            Button cancelBtn = addDialogButton(row, "取消", false);
+            cancelBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                log("离线包", "INFO", "用户取消了离线包来源选择");
+                synchronized (lock) { result[0] = false; done[0] = true; lock.notifyAll(); }
+            });
+
+            if (cloudUrl != null && !cloudUrl.isEmpty()) {
+                Button cloudBtn = addDialogButton(row, "云端下载", false);
+                cloudBtn.setOnClickListener(v -> {
+                    overlay.setVisibility(View.GONE);
+                    vRoot.removeView(overlay);
+                    try {
+                        startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(cloudUrl))
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                        log("离线包", "INFO", "已打开浏览器下载离线包：" + cloudUrl);
+                    } catch (Throwable t) {
+                        Toast.makeText(BootstrapActivity.this,
+                                "无法打开浏览器：" + t.getMessage(), Toast.LENGTH_SHORT).show();
+                        log("离线包", "WARN", "打开浏览器失败：" + t.getMessage());
+                    }
+                    Toast.makeText(BootstrapActivity.this,
+                            "下载完成后请返回此界面，点击"选择文件"选取已下载的 zip 包",
+                            Toast.LENGTH_LONG).show();
+                    synchronized (lock) { result[0] = true; done[0] = true; lock.notifyAll(); }
+                });
+            }
+
+            Button localBtn = addDialogButton(row, "选择文件", true);
+            localBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                log("离线包", "INFO", "用户选择本地文件注入");
+                synchronized (lock) { result[0] = true; done[0] = true; lock.notifyAll(); }
+            });
+
+            overlay.setVisibility(View.VISIBLE);
+        });
+        synchronized (lock) {
+            while (!done[0]) {
+                try { lock.wait(500); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt(); return false;
+                }
+            }
+            return result[0];
+        }
     }
 
     // ======================================================================

@@ -134,17 +134,33 @@ public final class ResourceFlow {
 
         /** 弹致命错误对话框，用户确认后 killProcess；此方法本身会阻塞。 */
         void showFatalAndExit(String title, String message);
+
+        /**
+         * 离线包来源选择对话框。
+         *
+         * <p>展示"本地文件"和（若 cloudUrl 不为 null）"云端下载"两个选项。
+         * 若用户选云端下载，实现方应打开浏览器并以 Toast / 说明文字告知
+         * 下载后返回此界面再选择文件。
+         *
+         * @param cloudUrl     云端离线包下载地址；{@code null} = 服务端未提供，仅显示本地选项
+         * @param cloudVersion 云端离线包版本号；{@code null} = 未知
+         * @return {@code true} = 继续（无论哪种来源，后续会弹文件选择器）；
+         *         {@code false} = 用户取消，中止流程
+         */
+        boolean requestOfflineSourceDialog(String cloudUrl, String cloudVersion);
     }
 
     // ---- 实例字段 ----
     private final Context  ctx;
     private final Reporter reporter;
     private final String   mode;
+    private final String   sessionToken;
 
-    public ResourceFlow(Context ctx, Reporter reporter, String mode) {
-        this.ctx      = ctx;
-        this.reporter = reporter;
-        this.mode     = MODE_OFFLINE.equals(mode) ? MODE_OFFLINE : MODE_ONLINE;
+    public ResourceFlow(Context ctx, Reporter reporter, String mode, String sessionToken) {
+        this.ctx          = ctx;
+        this.reporter     = reporter;
+        this.mode         = MODE_OFFLINE.equals(mode) ? MODE_OFFLINE : MODE_ONLINE;
+        this.sessionToken = sessionToken != null ? sessionToken : "";
     }
 
     /**
@@ -175,16 +191,16 @@ public final class ResourceFlow {
 
         // 1. 上报用户选择的下载方式（忽略失败，服务端容错）
         try {
-            ClientInit.postMethodSelect(ctx, MODE_ONLINE);
+            ClientInit.postMethodSelect(ctx, sessionToken, MODE_ONLINE);
         } catch (Throwable t) {
             reporter.log("WARN", "method-select 上报失败（忽略）: " + t.getMessage());
         }
 
-        // 2. 获取镜像列表和访问令牌
+        // 2. 获取镜像列表和 S3 资源令牌
         reporter.setStatus("正在获取镜像列表…");
         ClientInit.OnlineDownloadInfo dlInfo;
         try {
-            dlInfo = ClientInit.fetchOnlineDownload(ctx);
+            dlInfo = ClientInit.fetchOnlineDownload(ctx, sessionToken);
         } catch (Exception e) {
             reporter.showFatalAndExit("无法取得资源清单",
                     "连接资源服务器失败：" + e.getMessage()
@@ -193,7 +209,7 @@ public final class ResourceFlow {
         }
 
         if (dlInfo.mirrors == null || dlInfo.mirrors.isEmpty()
-                || dlInfo.accessToken == null || dlInfo.accessToken.isEmpty()) {
+                || dlInfo.resourceToken == null || dlInfo.resourceToken.isEmpty()) {
             reporter.showFatalAndExit("资源配置缺失",
                     "服务端未返回资源下载地址或令牌，无法在线下载。\n\n请联系管理员。");
             throw new FatalConfigException("no mirrors");
@@ -217,7 +233,7 @@ public final class ResourceFlow {
         reporter.setStatus("正在获取资源清单…");
         reporter.log("INFO", "使用线路：" + selectedLine + "，镜像数=" + mirrors.size());
 
-        List<S3List.Entry> entries = fetchManifest(mirrors, dlInfo.accessToken);
+        List<S3List.Entry> entries = fetchManifest(mirrors, dlInfo.resourceToken);
         if (entries.isEmpty()) {
             reporter.showFatalAndExit("资源清单为空",
                     "从服务端拿到的资源清单是空的，无法继续下载。\n\n请联系管理员。");
@@ -235,7 +251,7 @@ public final class ResourceFlow {
         int concurrency = reporter.requestConcurrency(Math.min(4, mirrors.size()));
 
         // 6. 下载所有文件
-        downloadAll(entries, mirrors, dlInfo.accessToken, concurrency);
+        downloadAll(entries, mirrors, dlInfo.resourceToken, concurrency);
 
         // 7. 完成
         reporter.setPhase("done");
@@ -248,16 +264,13 @@ public final class ResourceFlow {
      * 从镜像列表中轮询获取 S3 XML 清单，返回 Entry 列表。
      * 每个镜像最多尝试一次；全部失败时抛 IOException。
      */
-    private List<S3List.Entry> fetchManifest(List<String> mirrors, String token) throws Exception {
+    private List<S3List.Entry> fetchManifest(List<String> mirrors, String resourceToken) throws Exception {
         Exception last = null;
         for (String mirror : mirrors) {
             try {
-                // S3 list endpoint：直接 GET 镜像根路径（ListBucketResult）
                 String url = mirror.endsWith("/") ? mirror : mirror + "/";
                 reporter.log("INFO", "拉取清单：" + url);
-                // 把 token 附在 Authorization header 里由 openConnection 完成
-                // Net.getString 不支持额外 header，改用 openAuthConnection
-                String xml = getWithToken(url, token, 20_000);
+                String xml = Net.getStringWithToken(url, resourceToken, 20_000);
                 List<S3List.Entry> result = S3List.parse(xml);
                 if (!result.isEmpty()) return result;
                 reporter.log("WARN", "清单 XML 解析结果为空，尝试下一个镜像");
@@ -269,38 +282,10 @@ public final class ResourceFlow {
         throw last != null ? last : new java.io.IOException("所有镜像均无法拉取清单");
     }
 
-    /** GET 请求，附带 Authorization: Bearer <token> 头部。 */
-    private static String getWithToken(String url, String token, int timeoutMs) throws java.io.IOException {
-        java.net.HttpURLConnection c = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
-        c.setConnectTimeout(timeoutMs > 0 ? timeoutMs : 15_000);
-        c.setReadTimeout(30_000);
-        c.setInstanceFollowRedirects(true);
-        c.setRequestProperty("User-Agent", Net.UA);
-        c.setRequestProperty("Accept", "*/*");
-        if (token != null && !token.isEmpty()) {
-            c.setRequestProperty("Authorization", "Bearer " + token);
-        }
-        c.setRequestMethod("GET");
-        int code = c.getResponseCode();
-        if (code >= 400) {
-            try { c.disconnect(); } catch (Throwable ignore) {}
-            throw new java.io.IOException("HTTP " + code + " for " + url);
-        }
-        try (InputStream is = c.getInputStream()) {
-            java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
-            byte[] buf = new byte[8192];
-            int n;
-            while ((n = is.read(buf)) > 0) baos.write(buf, 0, n);
-            return baos.toString("UTF-8");
-        } finally {
-            try { c.disconnect(); } catch (Throwable ignore) {}
-        }
-    }
-
     /** 多线程并发下载所有条目，同时启动心跳线程向服务端汇报进度。 */
     private void downloadAll(List<S3List.Entry> entries,
                              List<String> mirrors,
-                             String token,
+                             String resourceToken,
                              int concurrency) throws Exception {
         File destDir = ctx.getFilesDir();
         long totalBytes = 0L;
@@ -323,7 +308,7 @@ public final class ResourceFlow {
         // 启动心跳线程
         String deviceId;
         try { deviceId = DeviceId.get(ctx); } catch (Throwable t) { deviceId = ""; }
-        HeartbeatSender hb = new HeartbeatSender(fileStates, deviceId);
+        HeartbeatSender hb = new HeartbeatSender(fileStates, deviceId, sessionToken);
         Thread hbThread = new Thread(hb, "cnv-heartbeat");
         hbThread.setDaemon(true);
         hbThread.start();
@@ -477,11 +462,14 @@ public final class ResourceFlow {
     private final class HeartbeatSender implements Runnable {
         private final ConcurrentHashMap<String, DownloadState> states;
         private final String deviceId;
+        private final String sessionToken;
         private volatile boolean stopped = false;
 
-        HeartbeatSender(ConcurrentHashMap<String, DownloadState> states, String deviceId) {
-            this.states   = states;
-            this.deviceId = deviceId;
+        HeartbeatSender(ConcurrentHashMap<String, DownloadState> states,
+                        String deviceId, String sessionToken) {
+            this.states       = states;
+            this.deviceId     = deviceId;
+            this.sessionToken = sessionToken != null ? sessionToken : "";
         }
 
         void stop() { stopped = true; }
@@ -499,8 +487,7 @@ public final class ResourceFlow {
         }
 
         private void sendHeartbeat() throws Exception {
-            JSONObject body = new JSONObject();
-            body.put("device_id", deviceId);
+            JSONObject body = ClientInit.authTriple(ctx, sessionToken);
             JSONArray files = new JSONArray();
             for (DownloadState s : states.values()) {
                 JSONObject f = new JSONObject();
@@ -569,14 +556,32 @@ public final class ResourceFlow {
         reporter.setStatus("正在上报下载方式…");
 
         try {
-            ClientInit.postMethodSelect(ctx, MODE_OFFLINE);
+            ClientInit.postMethodSelect(ctx, sessionToken, MODE_OFFLINE);
         } catch (Throwable t) {
             reporter.log("WARN", "method-select 上报失败（忽略）: " + t.getMessage());
         }
 
-        reporter.setPhase("offline-pick");
-        reporter.setStatus("请选择离线资源 zip 文件…");
+        // 尝试获取云端离线包信息（供用户参考；失败不阻断离线流程）
+        String cloudUrl = null, cloudVersion = null;
+        try {
+            reporter.setStatus("正在获取云端离线包信息…");
+            ClientInit.OfflinePackageInfo pkg = ClientInit.fetchOfflinePackage(ctx, sessionToken);
+            cloudUrl     = pkg.downloadUrl;
+            cloudVersion = pkg.packageVersion;
+            reporter.log("INFO", "云端离线包版本=" + cloudVersion + "，URL=" + cloudUrl);
+        } catch (Throwable t) {
+            reporter.log("WARN", "获取云端离线包信息失败（忽略）: " + t.getMessage());
+        }
 
+        // 展示来源选择对话框
+        reporter.setPhase("offline-pick");
+        reporter.setStatus("选择离线包来源…");
+        if (!reporter.requestOfflineSourceDialog(cloudUrl, cloudVersion)) {
+            reporter.showFatalAndExit("已取消", "未选择文件，无法完成离线资源注入。");
+            throw new FatalConfigException("user cancelled offline source dialog");
+        }
+
+        reporter.setStatus("请选择离线资源 zip 文件…");
         Uri zipUri = reporter.requestFilePick();
         if (zipUri == null) {
             reporter.showFatalAndExit("已取消", "未选择文件，无法完成离线资源注入。");

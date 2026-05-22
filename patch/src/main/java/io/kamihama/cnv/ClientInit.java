@@ -16,7 +16,7 @@ import java.util.List;
  */
 public final class ClientInit {
 
-    /** /client/init 握手响应：封禁 / 维护 / 版本闸门 / 伪造版本。 */
+    /** /client/init 握手响应：封禁 / 维护 / 版本闸门 / 伪造版本 / 会话令牌。 */
     public static final class Response {
         public boolean      bannedFlag;
         public String       bannedReason;
@@ -33,14 +33,16 @@ public final class ClientInit {
         public String       fakeVersion;
         /** 向游戏 native 层伪造的应用名；null 表示服务端未配置。 */
         public String       fakeName;
+        /** 服务端签发的会话令牌；后续所有 API 请求的鉴权三件套之一。 */
+        public String       accessToken;
     }
 
-    /** /client/online-download 响应：镜像列表 + 访问令牌 + 进度上报接口。 */
+    /** /client/online-download 响应：镜像列表 + S3 资源令牌。 */
     public static final class OnlineDownloadInfo {
         /** 资源下载镜像 URL 列表（按优先级排列）。 */
         public List<String> mirrors       = new ArrayList<>();
-        public String       accessToken;
-        public String       reportApi;
+        /** S3/CDN 资源访问令牌，用于 Authorization: Bearer 头（与会话令牌独立）。 */
+        public String       resourceToken;
     }
 
     /** /client/offline-package 响应：离线包下载 URL + 版本 + MD5。 */
@@ -57,12 +59,17 @@ public final class ClientInit {
      * @param clientVersion 本次携带的客户端版本号（来自 {@link ResourceFlow#BUILD_VERSION}）
      * @throws Exception    网络错误 / JSON 解析失败 / HTTP &ge; 400
      */
+    /**
+     * 同步发送握手请求，返回解析后的 {@link Response}。
+     * 握手是首次调用，此时尚无会话令牌；server 通过 device_id + signature 验证合法性
+     * 并在响应体内签发 access_token 供后续请求使用。
+     */
     public static Response fetch(Context ctx, String clientVersion) throws Exception {
         JSONObject body = new JSONObject();
-        body.put("version",    clientVersion);
-        body.put("signature",  ClientSignature.get(ctx));
-        body.put("device_id",  DeviceId.get(ctx));
-        body.put("channel",    BuildChannel.get(ctx));
+        body.put("version",   clientVersion);
+        body.put("device_id", DeviceId.get(ctx));
+        body.put("signature", ClientSignature.get(ctx));
+        body.put("channel",   BuildChannel.get(ctx));
 
         String raw = Net.postJson(CloudEndpoint.CLIENT_INIT, body.toString(), 15_000);
         return parse(raw);
@@ -73,8 +80,9 @@ public final class ClientInit {
         if (raw == null || raw.isEmpty()) return r;
         JSONObject obj = new JSONObject(raw);
 
-        r.bannedFlag   = obj.optBoolean("banned",     false);
-        r.bannedReason = obj.optString("ban_reason",  null);
+        r.bannedFlag   = obj.optBoolean("banned",      false);
+        r.bannedReason = obj.optString("ban_reason",   null);
+        r.accessToken  = obj.optString("access_token", null);
 
         JSONObject srv = obj.optJSONObject("server");
         if (srv != null) {
@@ -103,25 +111,27 @@ public final class ClientInit {
     /**
      * 上报用户选择的下载方式；忽略响应体（服务端只需知晓）。
      *
-     * @param ctx    Context
-     * @param method {@link io.kamihama.cnv.ResourceFlow#MODE_ONLINE} 或 {@link io.kamihama.cnv.ResourceFlow#MODE_OFFLINE}
+     * @param ctx         Context
+     * @param sessionToken 握手阶段获取的会话令牌
+     * @param method       {@link io.kamihama.cnv.ResourceFlow#MODE_ONLINE} 或 OFFLINE
      */
-    public static void postMethodSelect(Context ctx, String method) throws Exception {
-        JSONObject body = new JSONObject();
-        body.put("device_id", DeviceId.get(ctx));
-        body.put("method",    method);
+    public static void postMethodSelect(Context ctx, String sessionToken,
+                                        String method) throws Exception {
+        JSONObject body = authTriple(ctx, sessionToken);
+        body.put("method", method);
         Net.postJson(CloudEndpoint.CLIENT_METHOD_SELECT, body.toString(), 10_000);
     }
 
     /**
-     * 获取在线下载所需的镜像列表和访问令牌。
+     * 获取在线下载所需的镜像列表和 S3 资源令牌。
      *
-     * @throws Exception 网络错误 / HTTP &ge; 400
+     * @param sessionToken 握手阶段获取的会话令牌
+     * @throws Exception   网络错误 / HTTP &ge; 400
      */
-    public static OnlineDownloadInfo fetchOnlineDownload(Context ctx) throws Exception {
-        JSONObject body = new JSONObject();
-        body.put("device_id", DeviceId.get(ctx));
-        String raw = Net.postJson(CloudEndpoint.CLIENT_ONLINE_DOWNLOAD, body.toString(), 15_000);
+    public static OnlineDownloadInfo fetchOnlineDownload(Context ctx,
+                                                         String sessionToken) throws Exception {
+        String raw = Net.postJson(CloudEndpoint.CLIENT_ONLINE_DOWNLOAD,
+                authTriple(ctx, sessionToken).toString(), 15_000);
         OnlineDownloadInfo info = new OnlineDownloadInfo();
         if (raw == null || raw.isEmpty()) return info;
         JSONObject obj = new JSONObject(raw);
@@ -129,27 +139,39 @@ public final class ClientInit {
         if (mirrors != null) {
             for (int i = 0; i < mirrors.length(); i++) info.mirrors.add(mirrors.getString(i));
         }
-        info.accessToken = obj.optString("access_token", null);
-        info.reportApi   = obj.optString("report_api",   null);
+        info.resourceToken = obj.optString("resource_token", null);
         return info;
     }
 
     /**
-     * 获取离线包下载 URL、版本号和 MD5。
+     * 获取云端离线包的下载地址、版本号和 MD5。
      *
-     * @throws Exception 网络错误 / HTTP &ge; 400
+     * @param sessionToken 握手阶段获取的会话令牌
+     * @throws Exception   网络错误 / HTTP &ge; 400
      */
-    public static OfflinePackageInfo fetchOfflinePackage(Context ctx) throws Exception {
-        JSONObject body = new JSONObject();
-        body.put("device_id", DeviceId.get(ctx));
-        String raw = Net.postJson(CloudEndpoint.CLIENT_OFFLINE_PACKAGE, body.toString(), 15_000);
+    public static OfflinePackageInfo fetchOfflinePackage(Context ctx,
+                                                         String sessionToken) throws Exception {
+        String raw = Net.postJson(CloudEndpoint.CLIENT_OFFLINE_PACKAGE,
+                authTriple(ctx, sessionToken).toString(), 15_000);
         OfflinePackageInfo info = new OfflinePackageInfo();
         if (raw == null || raw.isEmpty()) return info;
         JSONObject obj = new JSONObject(raw);
-        info.downloadUrl     = obj.optString("download_url",     null);
-        info.packageVersion  = obj.optString("package_version",  null);
-        info.md5             = obj.optString("md5",              null);
+        info.downloadUrl    = obj.optString("download_url",    null);
+        info.packageVersion = obj.optString("package_version", null);
+        info.md5            = obj.optString("md5",             null);
         return info;
+    }
+
+    /**
+     * 构建包含鉴权三件套的基础请求体：
+     * {@code device_id}、{@code access_token}、{@code signature}。
+     */
+    static JSONObject authTriple(Context ctx, String sessionToken) throws Exception {
+        JSONObject body = new JSONObject();
+        body.put("device_id",    DeviceId.get(ctx));
+        body.put("access_token", sessionToken != null ? sessionToken : "");
+        body.put("signature",    ClientSignature.get(ctx));
+        return body;
     }
 
     private ClientInit() {}

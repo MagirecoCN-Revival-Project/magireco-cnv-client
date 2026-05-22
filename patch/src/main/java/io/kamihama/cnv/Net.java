@@ -492,7 +492,37 @@ public final class Net {
         catch (NumberFormatException e) { return -1L; }
     }
 
-    /** 打开一个统一配置好超时、UA、跟随重定向的 HttpURLConnection。 */
+    /**
+     * GET 请求，附带 {@code Authorization: Bearer <token>} 头。
+     * 用于需要令牌鉴权的 S3/CDN 资源清单拉取。
+     */
+    public static String getStringWithToken(String url, String token,
+                                            int timeoutMs) throws IOException {
+        HttpURLConnection c = openConnection(url, timeoutMs);
+        c.setRequestMethod("GET");
+        if (token != null && !token.isEmpty()) {
+            c.setRequestProperty("Authorization", "Bearer " + token);
+        }
+        int code = c.getResponseCode();
+        if (code >= 400) {
+            try { c.disconnect(); } catch (Throwable ignore) {}
+            throw new IOException("HTTP " + code + " for " + url);
+        }
+        try (InputStream is = c.getInputStream()) {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = is.read(buf)) > 0) baos.write(buf, 0, n);
+            return baos.toString("UTF-8");
+        } finally {
+            try { c.disconnect(); } catch (Throwable ignore) {}
+        }
+    }
+
+    /**
+     * 打开一个统一配置好超时、UA、跟随重定向的 HttpURLConnection。
+     * 若目标为 HTTPS 且主机在 {@link CertPin} 白名单内，自动安装 Pin 验证。
+     */
     private static HttpURLConnection openConnection(String url, int timeoutMs) throws IOException {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
         c.setConnectTimeout(timeoutMs > 0 ? timeoutMs : 10_000);
@@ -500,6 +530,9 @@ public final class Net {
         c.setInstanceFollowRedirects(true);
         c.setRequestProperty("User-Agent", UA);
         c.setRequestProperty("Accept", "*/*");
+        if (c instanceof javax.net.ssl.HttpsURLConnection) {
+            CertPin.applyIfNeeded((javax.net.ssl.HttpsURLConnection) c);
+        }
         return c;
     }
 }
