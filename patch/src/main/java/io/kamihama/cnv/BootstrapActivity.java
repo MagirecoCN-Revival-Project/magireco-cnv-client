@@ -1379,9 +1379,28 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             return;
         }
 
-        // 第 0a 步：检查本机资源是否已准备就绪
+        // 第 0a 步：检查本机资源是否已准备就绪；同时检测是否处于游戏崩溃循环中
         boolean alreadyReady = isResourcesAlreadyReady();
         log("启动", "INFO", "资源就绪检查：" + (alreadyReady ? "已就绪，跳过下载" : "未就绪，进入下载流程"));
+        if (alreadyReady) {
+            android.content.SharedPreferences launchState =
+                    getSharedPreferences("cnv_launch_state", 0);
+            long lastLaunchMs = launchState.getLong("last_launch_ms", 0L);
+            long elapsed = System.currentTimeMillis() - lastLaunchMs;
+            // 距上次启动游戏不超过 20 秒 → 可能发生了崩溃循环，询问用户
+            if (lastLaunchMs > 0L && elapsed < 20_000L) {
+                log("启动", "WARN", "检测到游戏可能崩溃（距上次启动仅 " + elapsed + " ms），进入恢复模式");
+                launchState.edit().putLong("last_launch_ms", 0L).apply();
+                boolean shouldReset = askCrashRecovery();
+                if (shouldReset) {
+                    deleteReadyFlag();
+                    alreadyReady = false;
+                    log("启动", "INFO", "用户选择重新注入资源，已清除就绪标志");
+                } else {
+                    log("启动", "INFO", "用户选择继续启动游戏");
+                }
+            }
+        }
 
         // 自检完毕，触发标题音效序列（system02 → system01 BGM）
         ui.post(this::playTitleSequence);
@@ -1455,7 +1474,9 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         try {
             new ResourceFlow(this, this, userMethod, sessionToken).run();
         } catch (ResourceFlow.FatalConfigException fce) {
-            log("启动", "ERROR", "资源流程致命错误：" + fce.getMessage());
+            log("启动", "ERROR", "资源流程配置错误：" + fce.getMessage());
+            ui.post(() -> showFatalWithRetry("资源配置错误",
+                    "无法准备游戏资源：" + fce.getMessage() + "\n\n请检查网络连接后重试，或联系管理员。"));
             return;
         } catch (final Throwable t) {
             log("启动", "ERROR", "资源流程异常：" + t.getClass().getSimpleName()
@@ -1820,6 +1841,10 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         if (launched) return;
         launched = true;
         log("启动", "INFO", "准备启动游戏：停止 BGM，跳转至 " + GAME_ACTIVITY);
+        // 记录本次游戏启动时间（用于下次启动时检测是否发生了崩溃循环）
+        getSharedPreferences("cnv_launch_state", 0).edit()
+                .putLong("last_launch_ms", System.currentTimeMillis())
+                .apply();
         // 停掉 BGM，让原版游戏自己的音频栈接管；必须在 startActivity 之前停
         stopBgm();
         stopSfx();
@@ -1943,21 +1968,91 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         return btn;
     }
 
-    private void showFatal(Throwable t) {
-        if (!isFinishing()) {
+    /** 非阻塞错误弹窗：重试 = recreate；供工作线程通过 ui.post 调用。 */
+    private void showFatalWithRetry(String title, String message) {
+        if (isFinishing()) return;
+        final Runnable[] showRef = new Runnable[1];
+        showRef[0] = () -> {
             View[] frame = inflateDialogFrame();
             FrameLayout overlay = (FrameLayout) frame[0];
             LinearLayout card   = (LinearLayout) frame[1];
-            addDialogTitle(card, "资源准备失败");
-            addDialogMessage(card, "无法继续启动游戏: " + t.getMessage()
-                    + "\n\n请检查网络后重试，或尝试切换为离线包注入方式。");
+            addDialogTitle(card, title);
+            addDialogMessage(card, message);
             LinearLayout row = addDialogButtonRow(card);
-            Button logBtn = addDialogButton(row, "查看日志", false);
-            Button retryBtn = addDialogButton(row, "重试", true);
-            logBtn.setOnClickListener(v -> { overlay.setVisibility(View.GONE); openLogModal(); });
+            Button logBtn   = addDialogButton(row, "查看日志", false);
+            Button retryBtn = addDialogButton(row, "重试",     true);
+            logBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                fatalRetrigger = showRef[0];
+                openLogModal();
+            });
             retryBtn.setOnClickListener(v -> { overlay.setVisibility(View.GONE); recreate(); });
             overlay.setVisibility(View.VISIBLE);
+        };
+        showRef[0].run();
+    }
+
+    private void showFatal(Throwable t) {
+        showFatalWithRetry("资源准备失败",
+                "无法继续启动游戏：" + t.getMessage()
+                + "\n\n请检查网络后重试，或尝试切换为离线包注入方式。");
+    }
+
+    /**
+     * 阻塞型崩溃恢复对话框：询问用户是否重新注入资源（true）或直接进入游戏（false）。
+     * 在工作线程调用。
+     */
+    private boolean askCrashRecovery() {
+        final Object    lock   = new Object();
+        final boolean[] result = { false };
+        final boolean[] done   = { false };
+        ui.post(() -> {
+            View[] frame = inflateDialogFrame();
+            FrameLayout overlay = (FrameLayout) frame[0];
+            LinearLayout card   = (LinearLayout) frame[1];
+            addDialogTitle(card, "检测到游戏启动异常");
+            addDialogMessage(card,
+                    "上次游戏在启动后很短时间内退出，可能发生了崩溃。\n\n"
+                  + "• 重新注入资源：清除现有资源并重新选择资源包（推荐）\n"
+                  + "• 继续启动：忽略此提示，直接启动游戏");
+            LinearLayout row    = addDialogButtonRow(card);
+            Button logBtn       = addDialogButton(row, "查看日志",   false);
+            Button continueBtn  = addDialogButton(row, "继续启动",   false);
+            Button reinjectBtn  = addDialogButton(row, "重新注入资源", true);
+            logBtn.setOnClickListener(v -> { overlay.setVisibility(View.GONE); openLogModal(); });
+            continueBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { result[0] = false; done[0] = true; lock.notifyAll(); }
+            });
+            reinjectBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { result[0] = true; done[0] = true; lock.notifyAll(); }
+            });
+            overlay.setVisibility(View.VISIBLE);
+        });
+        synchronized (lock) {
+            while (!done[0]) {
+                try { lock.wait(500); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt(); return false;
+                }
+            }
+            return result[0];
         }
+    }
+
+    /** 删除资源就绪标志文件（以及旧版 flag）以触发重新注入流程。 */
+    private void deleteReadyFlag() {
+        try {
+            new java.io.File(new java.io.File(getFilesDir(), "cnv_inject"),
+                    "cn_resources_ready.flag").delete();
+        } catch (Throwable ignore) {}
+        try {
+            new java.io.File(new java.io.File(
+                    new java.io.File(getFilesDir(), "madomagi"), "magica"),
+                    "cn_base_done.flag").delete();
+        } catch (Throwable ignore) {}
     }
 
     @Override
@@ -2421,23 +2516,29 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
 
     @Override
     public void showFatalAndExit(final String title, final String message) {
-        final Object   lock = new Object();
-        final boolean[] done = { false };
-        final Runnable[] showRef = new Runnable[1];
+        final Object    lock      = new Object();
+        final boolean[] done      = { false };
+        final boolean[] doRetry   = { false };
+        final Runnable[] showRef  = new Runnable[1];
         showRef[0] = () -> {
             View[] frame = inflateDialogFrame();
             FrameLayout overlay = (FrameLayout) frame[0];
             LinearLayout card   = (LinearLayout) frame[1];
             addDialogTitle(card, title);
             addDialogMessage(card, message);
-            LinearLayout row = addDialogButtonRow(card);
-            Button logBtn  = addDialogButton(row, "查看日志", false);
-            Button exitBtn = addDialogButton(row, "退出", true);
+            LinearLayout row  = addDialogButtonRow(card);
+            Button logBtn     = addDialogButton(row, "查看日志", false);
+            Button retryBtn   = addDialogButton(row, "重试",     false);
+            Button exitBtn    = addDialogButton(row, "退出",     true);
             logBtn.setOnClickListener(v -> {
                 overlay.setVisibility(View.GONE);
-                // 关闭日志面板后重新展示此对话框
                 fatalRetrigger = showRef[0];
                 openLogModal();
+            });
+            retryBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { doRetry[0] = true; done[0] = true; lock.notifyAll(); }
             });
             exitBtn.setOnClickListener(v -> {
                 overlay.setVisibility(View.GONE);
@@ -2454,6 +2555,10 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 }
             }
         }
+        if (doRetry[0]) {
+            ui.post(this::recreate);
+            return;  // 工作线程退出；Activity 将被重建
+        }
         ui.post(() -> {
             try { finishAndRemoveTask(); } catch (Throwable ignore) {}
             android.os.Process.killProcess(android.os.Process.myPid());
@@ -2463,17 +2568,19 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     /** 带"跳转"按钮的 FATAL 对话框（仅内部使用，不进 Reporter 接口）。 */
     private void showFatalAndExitWithJump(final String title, final String message,
                                           final String jumpLabel, final String jumpUrl) {
-        final Object   lock = new Object();
-        final boolean[] done = { false };
+        final Object    lock    = new Object();
+        final boolean[] done    = { false };
+        final boolean[] doRetry = { false };
         ui.post(() -> {
             View[] frame = inflateDialogFrame();
             FrameLayout overlay = (FrameLayout) frame[0];
             LinearLayout card   = (LinearLayout) frame[1];
             addDialogTitle(card, title);
             addDialogMessage(card, message);
-            LinearLayout row = addDialogButtonRow(card);
-            Button jumpBtn = addDialogButton(row, jumpLabel, false);
-            Button exitBtn = addDialogButton(row, "退出", true);
+            LinearLayout row  = addDialogButtonRow(card);
+            Button jumpBtn  = addDialogButton(row, jumpLabel, false);
+            Button retryBtn = addDialogButton(row, "重试",    false);
+            Button exitBtn  = addDialogButton(row, "退出",    true);
             jumpBtn.setOnClickListener(v -> {
                 try {
                     startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(jumpUrl))
@@ -2482,6 +2589,11 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                     Toast.makeText(BootstrapActivity.this,
                             "无法打开浏览器：" + t.getMessage(), Toast.LENGTH_LONG).show();
                 }
+            });
+            retryBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { doRetry[0] = true; done[0] = true; lock.notifyAll(); }
             });
             exitBtn.setOnClickListener(v -> {
                 overlay.setVisibility(View.GONE);
@@ -2497,6 +2609,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 }
             }
         }
+        if (doRetry[0]) { ui.post(this::recreate); return; }
         ui.post(() -> {
             try { finishAndRemoveTask(); } catch (Throwable ignore) {}
             android.os.Process.killProcess(android.os.Process.myPid());

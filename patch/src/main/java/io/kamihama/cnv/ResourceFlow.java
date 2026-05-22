@@ -598,81 +598,82 @@ public final class ResourceFlow {
         deleteRecursive(stagingDir);  // 清理可能残留的旧暂存
         stagingDir.mkdirs();
 
-        reporter.initSlots(1);
-        reporter.setSlot(0, "外层 zip（暂存解压）", 0, -1, 0);
-        reporter.setSlotPhase(0, "extracting");
-        reporter.setPhase("offline-stage1");
-        reporter.setStatus("正在解压外层 zip 到暂存目录…");
-        reporter.log("INFO", "第一阶段：解压外层 zip → " + stagingDir.getAbsolutePath());
+        try {
+            reporter.initSlots(1);
+            reporter.setSlot(0, "外层 zip（暂存解压）", 0, -1, 0);
+            reporter.setSlotPhase(0, "extracting");
+            reporter.setPhase("offline-stage1");
+            reporter.setStatus("正在解压外层 zip 到暂存目录…");
 
-        long totalBytes = queryStreamLength(zipUri);
-        try (InputStream is = ctx.getContentResolver().openInputStream(zipUri)) {
-            if (is == null) throw new java.io.IOException("无法打开文件流");
-            // 不剥离前缀，保留外层 zip 的原始目录结构，便于找到内层 zip
-            Unzip.extractFromStream(is, stagingDir, totalBytes, "", new Unzip.ProgressSink() {
-                @Override public void onEntry(String name, long idx, long est) {
-                    reporter.setStatus("暂存: " + name);
-                }
-                @Override public void onEntryBytes(long written, long uncompressedSize) {
-                    reporter.setSlot(0, null, written, uncompressedSize, 0);
-                }
-                @Override public void onEntryDone(String name) {}
-                @Override public void onBytes(long bytesProcessed, long bytesTotal) {
-                    reporter.setOverallProgress(bytesProcessed,
-                            bytesTotal > 0 ? bytesTotal : totalBytes);
-                }
-                @Override public boolean isCancelled() { return reporter.isCancelled(); }
-            });
-        }
-        reporter.setSlotPhase(0, "done");
-        reporter.log("INFO", "第一阶段完成，扫描暂存目录中的内层 zip…");
-
-        // ── 第二阶段：找到所有内层 zip，逐一解压到 filesDir ─────────────────────
-        List<File> innerZips = findInnerZipsRecursive(stagingDir);
-        reporter.log("INFO", "发现内层 zip 数量=" + innerZips.size());
-
-        File destDir = ctx.getFilesDir();
-        if (innerZips.isEmpty()) {
-            // 外层 zip 内无嵌套 zip，将暂存内容复制到目标目录
-            reporter.log("INFO", "未发现内层 zip，直接复制暂存内容到目标目录");
-            reporter.setPhase("offline-stage2");
-            reporter.setStatus("正在复制资源到目标目录…");
-            copyDirectoryRecursive(stagingDir, destDir);
-        } else {
-            reporter.initSlots(innerZips.size());
-            reporter.setPhase("offline-stage2");
-            reporter.setStatus("正在解压内层 zip…");
-
-            for (int i = 0; i < innerZips.size(); i++) {
-                File innerZip = innerZips.get(i);
-                String name   = innerZip.getName();
-                reporter.setSlot(i, name, 0, innerZip.length(), 0);
-                reporter.setSlotPhase(i, "extracting");
-                reporter.log("INFO", "第二阶段[" + i + "]: 解压 " + name + " → " + destDir);
-                final int slot = i;
-                Unzip.extract(innerZip, destDir, new Unzip.ProgressSink() {
-                    @Override public void onEntry(String n, long idx, long est) {
-                        reporter.setStatus("解压: " + n);
+            long totalBytes = queryStreamLength(zipUri);
+            try (InputStream is = ctx.getContentResolver().openInputStream(zipUri)) {
+                if (is == null) throw new java.io.IOException("无法打开文件流");
+                // 不剥离前缀，保留外层 zip 的原始目录结构，便于找到内层 zip
+                Unzip.extractFromStream(is, stagingDir, totalBytes, "", new Unzip.ProgressSink() {
+                    @Override public void onEntry(String name, long idx, long est) {
+                        reporter.setStatus("暂存: " + name);
                     }
                     @Override public void onEntryBytes(long written, long uncompressedSize) {
-                        reporter.setSlot(slot, null, written, uncompressedSize, 0);
+                        reporter.setSlot(0, null, written, uncompressedSize, 0);
                     }
-                    @Override public void onEntryDone(String n) {}
+                    @Override public void onEntryDone(String name) {}
                     @Override public void onBytes(long bytesProcessed, long bytesTotal) {
                         reporter.setOverallProgress(bytesProcessed,
-                                bytesTotal > 0 ? bytesTotal : innerZip.length());
+                                bytesTotal > 0 ? bytesTotal : totalBytes);
                     }
                     @Override public boolean isCancelled() { return reporter.isCancelled(); }
                 });
-                reporter.setSlotPhase(slot, "done");
-                reporter.log("INFO", "第二阶段[" + i + "]: " + name + " 解压完成");
             }
+            reporter.setSlotPhase(0, "done");
+            reporter.log("INFO", "第一阶段完成，扫描暂存目录中的内层 zip…");
+
+            // ── 第二阶段：找到所有内层 zip，逐一解压到 filesDir ─────────────────────
+            List<File> innerZips = findInnerZipsRecursive(stagingDir);
+            reporter.log("INFO", "发现内层 zip 数量=" + innerZips.size());
+
+            File destDir = ctx.getFilesDir();
+            if (innerZips.isEmpty()) {
+                // 外层 zip 内无嵌套 zip，将暂存内容复制到目标目录
+                reporter.log("INFO", "未发现内层 zip，直接复制暂存内容到目标目录");
+                reporter.setPhase("offline-stage2");
+                reporter.setStatus("正在复制资源到目标目录…");
+                copyDirectoryRecursive(stagingDir, destDir);
+            } else {
+                reporter.initSlots(innerZips.size());
+                reporter.setPhase("offline-stage2");
+                reporter.setStatus("正在解压内层 zip…");
+
+                for (int i = 0; i < innerZips.size(); i++) {
+                    File innerZip = innerZips.get(i);
+                    String name   = innerZip.getName();
+                    reporter.setSlot(i, name, 0, innerZip.length(), 0);
+                    reporter.setSlotPhase(i, "extracting");
+                    reporter.log("INFO", "第二阶段[" + i + "]: 解压 " + name);
+                    final int slot = i;
+                    Unzip.extract(innerZip, destDir, new Unzip.ProgressSink() {
+                        @Override public void onEntry(String n, long idx, long est) {
+                            reporter.setStatus("解压: " + n);
+                        }
+                        @Override public void onEntryBytes(long written, long uncompressedSize) {
+                            reporter.setSlot(slot, null, written, uncompressedSize, 0);
+                        }
+                        @Override public void onEntryDone(String n) {}
+                        @Override public void onBytes(long bytesProcessed, long bytesTotal) {
+                            reporter.setOverallProgress(bytesProcessed,
+                                    bytesTotal > 0 ? bytesTotal : innerZip.length());
+                        }
+                        @Override public boolean isCancelled() { return reporter.isCancelled(); }
+                    });
+                    reporter.setSlotPhase(slot, "done");
+                    reporter.log("INFO", "第二阶段[" + i + "]: " + name + " 解压完成");
+                }
+            }
+        } finally {
+            // 无论成功或失败，始终清理暂存目录，避免占用存储空间
+            deleteRecursive(stagingDir);
+            reporter.log("INFO", "暂存目录已清理");
         }
-
-        // 清理暂存目录
-        deleteRecursive(stagingDir);
-        reporter.log("INFO", "暂存目录已清理");
-
+        // writeReadyFlag 仅在 try 块全部正常完成后执行（finally 无法阻止 throw）
         reporter.setPhase("done");
         reporter.setStatus("离线资源注入完成");
         reporter.log("INFO", "两阶段离线资源解压完成，写入 ready flag");
