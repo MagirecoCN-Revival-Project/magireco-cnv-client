@@ -13,13 +13,8 @@ package io.kamihama.cnv;
  */
 public final class CloudEndpoint {
 
-    /**
-     * 主 API 域名（含协议，不含末尾斜杠）。
-     *
-     * <p>构建时由 CI 通过 {@code CNV_API_HOST} 环境变量注入；
-     * 源码中保留默认值，本地构建无需额外配置。
-     */
-    static final String API_HOST = "https://api.magi-reco.top";
+    /** 主 API 域名（含协议，不含末尾斜杠）；由 CI 从 Secret CNV_API_HOST 注入。 */
+    static final String API_HOST = "";
 
     /**
      * 客户端启动握手接口。
