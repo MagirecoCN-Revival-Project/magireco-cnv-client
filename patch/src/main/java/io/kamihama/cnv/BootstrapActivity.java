@@ -242,10 +242,10 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
      */
     private static final Object[][] CONTRIBUTORS = {
         // { 头像色, 名字, 贡献说明, 主页 URL, 头像图片 URL }
-        { 0xFF3D7BFF, "CyberNova",   "新端APK修改 · 云端提供",     "https://github.com/magirecocn-revival-project", "https://avatar-proxy.magireco.top/?username=CyberNova2123" },
-        { 0xFF8BB87A, "MadeInMagius","旧端APK修改 · 资源打包",     "https://github.com/magirecocn-revival-project", "https://i0.hdslb.com/bfs/face/1bc30c0bd8ee3b2d1e0c291af40a3683c70486a5.jpg" },
-        { 0xFFE667A0, "水银h2oag",   "日服绝大部分剧情汉化",       "https://github.com/magirecocn-revival-project", "https://i1.hdslb.com/bfs/face/d82f2f2225c32036c6568fc0d5cd208fbdd2bff1.jpg" },
-        { 0xFF4FB7E6, "segfault",    "提供国服文件存档",           "https://github.com/magirecocn-revival-project", "https://i1.hdslb.com/bfs/face/7d11ac840148cfc0d282a3f4924f02f68d3631ad.jpg" },
+        { 0xFF3D7BFF, "CyberNova",   "新端APK修改 · 云端提供",     "https://b23.tv/OVR55Qe", "https://avatar-proxy.magireco.top/?username=CyberNova2123" },
+        { 0xFF8BB87A, "MadeInMagius","旧端APK修改 · 资源打包",     "https://b23.tv/7qGBY6d", "https://i0.hdslb.com/bfs/face/1bc30c0bd8ee3b2d1e0c291af40a3683c70486a5.jpg" },
+        { 0xFFE667A0, "水银h2oag",   "日服绝大部分剧情汉化",       "https://b23.tv/1QH0KSR", "https://i1.hdslb.com/bfs/face/d82f2f2225c32036c6568fc0d5cd208fbdd2bff1.jpg" },
+        { 0xFF4FB7E6, "segfault",    "提供国服文件存档",           "https://b23.tv/ioKLd25", "https://i1.hdslb.com/bfs/face/7d11ac840148cfc0d282a3f4924f02f68d3631ad.jpg" },
     };
 
     /** URL → 已解码 Bitmap 的内存缓存；static 保证 Activity 重建后不重复下载。 */
