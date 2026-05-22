@@ -12,24 +12,36 @@ import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
 import android.graphics.RectF;
+import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.util.Log;
+import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
+import android.widget.Button;
+import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.TextView;
 import android.widget.Toast;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 /**
- * 悬浮存档窗口服务。
+ * 悬浮存档窗口 + 游戏阶段心跳服务。
  *
- * <p>游戏启动后以 Foreground Service 运行，通过 WindowManager 在屏幕上显示
- * 一个可拖动的圆形按钮：外圈粉红色进度环（600 秒转满），中心上传图标。
- * 进度环转满时自动触发云端存档上传；点击（非拖动）触发手动上传。
+ * <p>游戏启动后以 Foreground Service 运行：
+ * <ul>
+ *   <li>通过 WindowManager 在屏幕上显示可拖动圆形按钮（粉红进度环，600 秒自动存档）。</li>
+ *   <li>每 5 秒向 /client/heartbeat 发送心跳；任何时刻收到封禁或维护响应均立即处理。</li>
+ * </ul>
  */
 public class SaveOverlayService extends Service {
 
@@ -38,14 +50,19 @@ public class SaveOverlayService extends Service {
     private static final String KEY_POS_X     = "x";
     private static final String KEY_POS_Y     = "y";
     private static final long   CYCLE_MS      = 600_000L;
+    private static final long   HEARTBEAT_MS  = 5_000L;
 
-    private static final int    NOTIF_ID      = 0x5356;
-    private static final String CHAN_ID       = "cnv_save_overlay";
+    private static final int    NOTIF_ID = 0x5356;
+    private static final String CHAN_ID  = "cnv_save_overlay";
 
     private WindowManager  wm;
     private SaveButtonView buttonView;
     private Handler        handler;
     private long           cycleStartMs;
+    /** 避免因重复心跳响应多次弹出封禁/维护覆盖层。 */
+    private volatile boolean fatalShown     = false;
+    /** 游戏阶段心跳是否已停止（封禁/维护触发后停止）。 */
+    private volatile boolean heartbeatDone  = false;
 
     // ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -57,7 +74,8 @@ public class SaveOverlayService extends Service {
         startForegroundCompat();
         createOverlayView();
         resetCycle();
-        handler.post(ticker);
+        handler.post(saveTicker);
+        handler.postDelayed(heartbeatRunnable, HEARTBEAT_MS);
     }
 
     @Override
@@ -71,7 +89,9 @@ public class SaveOverlayService extends Service {
     @Override
     public void onDestroy() {
         super.onDestroy();
-        handler.removeCallbacks(ticker);
+        heartbeatDone = true;
+        handler.removeCallbacks(saveTicker);
+        handler.removeCallbacks(heartbeatRunnable);
         if (buttonView != null) {
             try { wm.removeView(buttonView); } catch (Throwable ignore) {}
             buttonView = null;
@@ -144,13 +164,13 @@ public class SaveOverlayService extends Service {
         }
     }
 
-    // ── Timer ────────────────────────────────────────────────────────────────
+    // ── Save timer ───────────────────────────────────────────────────────────
 
     private void resetCycle() {
         cycleStartMs = SystemClock.elapsedRealtime();
     }
 
-    private final Runnable ticker = new Runnable() {
+    private final Runnable saveTicker = new Runnable() {
         @Override public void run() {
             long elapsed = SystemClock.elapsedRealtime() - cycleStartMs;
             float progress = Math.min(1f, (float) elapsed / CYCLE_MS);
@@ -163,7 +183,175 @@ public class SaveOverlayService extends Service {
         }
     };
 
-    // ── Save ─────────────────────────────────────────────────────────────────
+    // ── Game-phase heartbeat ─────────────────────────────────────────────────
+
+    private final Runnable heartbeatRunnable = new Runnable() {
+        @Override public void run() {
+            if (heartbeatDone) return;
+            sendGameHeartbeat();
+            handler.postDelayed(this, HEARTBEAT_MS);
+        }
+    };
+
+    /**
+     * 在子线程发送一次心跳，解析响应。
+     * 服务端在连接中返回封禁或维护包时立即触发覆盖层提示并终止进程，
+     * 不依赖客户端刚发送心跳包——任何心跳响应均有效。
+     */
+    private void sendGameHeartbeat() {
+        new Thread(() -> {
+            try {
+                JSONObject body = ClientInit.authTriple(getApplicationContext(), sessionToken());
+                body.put("files", new JSONArray()); // 游戏阶段无下载文件
+                String raw = Net.postJson(
+                        CloudEndpoint.CLIENT_HEARTBEAT, body.toString(), 10_000);
+                if (raw == null || raw.isEmpty()) return;
+                handleHeartbeatResponse(new JSONObject(raw));
+            } catch (Throwable t) {
+                Log.w(TAG, "游戏阶段心跳失败（将在下次重试）：" + t.getMessage());
+            }
+        }, "cnv-game-heartbeat").start();
+    }
+
+    private void handleHeartbeatResponse(JSONObject resp) {
+        String action = resp.optString("action", "ok");
+        if ("ban".equals(action)) {
+            if (fatalShown) return;
+            fatalShown    = true;
+            heartbeatDone = true;
+            String reason     = resp.optString("reason", "（服务端未提供原因）");
+            long   expireTime = resp.optLong("expire_time", 0L);
+            BanInfo.save(getApplicationContext(), reason, expireTime);
+            String msg = buildBanMsg(reason, expireTime);
+            handler.post(() -> showFatalOverlay("账号已被封禁", msg));
+
+        } else if ("maintenance".equals(action)) {
+            if (fatalShown) return;
+            fatalShown    = true;
+            heartbeatDone = true;
+            String msg = resp.optString("message", "服务器正在维护，请稍后再试。");
+            long end = resp.optLong("end_time", 0L);
+            if (end > 0L) {
+                try {
+                    String ts = new java.text.SimpleDateFormat(
+                            "yyyy-MM-dd HH:mm", java.util.Locale.getDefault())
+                            .format(new java.util.Date(end * 1000L));
+                    msg += "\n预计完成时间：" + ts;
+                } catch (Throwable ignore) {}
+            }
+            handler.post(() -> showFatalOverlay("服务器维护中", msg));
+        }
+        // action=ok / switch_mirrors → irrelevant during game phase, ignore
+    }
+
+    private String sessionToken() {
+        return getSharedPreferences("cnv_account", MODE_PRIVATE)
+                .getString("session_token", "");
+    }
+
+    private static String buildBanMsg(String reason, long expireTime) {
+        String msg = "原因：" + reason;
+        if (expireTime > 0L) {
+            try {
+                String ts = new java.text.SimpleDateFormat(
+                        "yyyy-MM-dd HH:mm", java.util.Locale.getDefault())
+                        .format(new java.util.Date(expireTime * 1000L));
+                msg += "\n解封时间：" + ts;
+            } catch (Throwable ignore) {
+                msg += "\n解封时间戳：" + expireTime;
+            }
+        } else {
+            msg += "\n封禁类型：永久";
+        }
+        return msg;
+    }
+
+    /**
+     * 通过 WindowManager 在游戏画面上层显示封禁/维护模态对话框。
+     * 用户点击确定后终止进程。
+     */
+    private void showFatalOverlay(String title, String message) {
+        int type = Build.VERSION.SDK_INT >= 26
+                ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                : WindowManager.LayoutParams.TYPE_PHONE;
+
+        // Full-screen dim layer that captures all touches
+        FrameLayout root = new FrameLayout(this);
+        root.setBackgroundColor(0xAA000000);
+
+        // Card
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(20), dp(20), dp(20), dp(16));
+        GradientDrawable cardBg = new GradientDrawable();
+        cardBg.setColor(0xFF1F1030);
+        cardBg.setCornerRadius(dp(18));
+        card.setBackground(cardBg);
+
+        FrameLayout.LayoutParams cardLp = new FrameLayout.LayoutParams(
+                (int) (getResources().getDisplayMetrics().widthPixels * 0.80f),
+                FrameLayout.LayoutParams.WRAP_CONTENT);
+        cardLp.gravity = Gravity.CENTER;
+        root.addView(card, cardLp);
+
+        TextView tvTitle = new TextView(this);
+        tvTitle.setText(title);
+        tvTitle.setTextColor(0xFFFF6BAF);
+        tvTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f);
+        tvTitle.setTypeface(tvTitle.getTypeface(), Typeface.BOLD);
+        LinearLayout.LayoutParams titleLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        titleLp.bottomMargin = dp(10);
+        card.addView(tvTitle, titleLp);
+
+        TextView tvMsg = new TextView(this);
+        tvMsg.setText(message);
+        tvMsg.setTextColor(0xFFEFE4F8);
+        tvMsg.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
+        LinearLayout.LayoutParams msgLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        msgLp.bottomMargin = dp(16);
+        card.addView(tvMsg, msgLp);
+
+        Button btn = new Button(this);
+        btn.setText("确定");
+        btn.setAllCaps(false);
+        btn.setTextColor(0xFFFFFFFF);
+        btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f);
+        GradientDrawable btnBg = new GradientDrawable();
+        btnBg.setColor(0xFFFF6BAF);
+        btnBg.setCornerRadius(dp(10));
+        btn.setBackground(btnBg);
+        btn.setPadding(dp(16), dp(8), dp(16), dp(8));
+        LinearLayout.LayoutParams btnLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        card.addView(btn, btnLp);
+
+        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                type,
+                WindowManager.LayoutParams.FLAG_DIM_BEHIND,
+                PixelFormat.TRANSLUCENT);
+        lp.dimAmount = 0.6f;
+
+        btn.setOnClickListener(v -> {
+            try { wm.removeView(root); } catch (Throwable ignore) {}
+            android.os.Process.killProcess(android.os.Process.myPid());
+        });
+
+        try {
+            wm.addView(root, lp);
+        } catch (Throwable t) {
+            Log.e(TAG, "无法显示覆盖层：" + t.getMessage());
+            android.os.Process.killProcess(android.os.Process.myPid());
+        }
+    }
+
+    // ── Save logic ───────────────────────────────────────────────────────────
 
     private void performSave(boolean isAuto) {
         SharedPreferences prefs = getSharedPreferences("cnv_account", MODE_PRIVATE);
@@ -222,13 +410,11 @@ public class SaveOverlayService extends Service {
             float w = getWidth(), h = getHeight();
             float cx = w / 2f, cy = h / 2f;
             float r  = Math.min(cx, cy);
-            float sw = r * 0.12f;           // ring stroke width
-            float arcR = r - sw;            // ring center radius
+            float sw = r * 0.12f;
+            float arcR = r - sw;
 
-            // Background
             canvas.drawCircle(cx, cy, arcR - sw / 2f, bgPaint);
 
-            // Ring track + fill
             arcBounds.set(cx - arcR, cy - arcR, cx + arcR, cy + arcR);
             ringTrack.setStrokeWidth(sw);
             ringFill.setStrokeWidth(sw);
@@ -237,14 +423,12 @@ public class SaveOverlayService extends Service {
                 canvas.drawArc(arcBounds, -90f, progress * 360f, false, ringFill);
             }
 
-            // Upload icon: upward arrow + base line
-            float ir  = arcR * 0.38f;        // icon half-width
-            float sw2 = r * 0.115f;          // icon stroke width
-            float tipY  = cy - ir * 1.1f;    // arrow tip (top)
-            float midY  = cy - ir * 0.05f;   // shaft bottom / arrow head base
-            float baseY = cy + ir * 0.75f;   // horizontal baseline
+            float ir  = arcR * 0.38f;
+            float sw2 = r * 0.115f;
+            float tipY  = cy - ir * 1.1f;
+            float midY  = cy - ir * 0.05f;
+            float baseY = cy + ir * 0.75f;
 
-            // Arrowhead (filled triangle pointing up)
             Path head = new Path();
             head.moveTo(cx, tipY);
             head.lineTo(cx - ir * 0.75f, midY);
@@ -253,13 +437,10 @@ public class SaveOverlayService extends Service {
             iconPaint.setStyle(Paint.Style.FILL);
             canvas.drawPath(head, iconPaint);
 
-            // Shaft
             iconPaint.setStyle(Paint.Style.STROKE);
             iconPaint.setStrokeWidth(sw2);
             iconPaint.setStrokeCap(Paint.Cap.ROUND);
             canvas.drawLine(cx, midY, cx, baseY - sw2 / 2f, iconPaint);
-
-            // Base line
             canvas.drawLine(cx - ir * 1.0f, baseY, cx + ir * 1.0f, baseY, iconPaint);
         }
     }

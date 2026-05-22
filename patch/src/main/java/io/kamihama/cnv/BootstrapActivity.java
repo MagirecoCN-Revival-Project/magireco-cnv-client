@@ -1792,6 +1792,11 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             return false;
         }
         sessionToken = init.accessToken != null ? init.accessToken : "";
+        if (!sessionToken.isEmpty()) {
+            getSharedPreferences(PREFS_ACCOUNT, MODE_PRIVATE).edit()
+                    .putString("session_token", sessionToken)
+                    .apply();
+        }
         log("握手", "INFO", "握手成功，服务端状态=" + init.serverStatus
                 + "，会话令牌=" + (sessionToken.isEmpty() ? "（未下发）" : "已获取"));
 

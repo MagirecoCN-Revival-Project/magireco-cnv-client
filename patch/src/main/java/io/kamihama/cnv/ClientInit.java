@@ -54,12 +54,39 @@ public final class ClientInit {
         public String       featureDisabledMessage;
     }
 
-    /** /client/online-download 响应：镜像列表 + S3 资源令牌。 */
+    /** /client/online-download 响应：镜像组列表 + S3 资源令牌。 */
     public static final class OnlineDownloadInfo {
-        /** 资源下载镜像 URL 列表（按优先级排列）。 */
-        public List<String> mirrors       = new ArrayList<>();
+
+        /** 单个镜像条目：一个 URL，可选附带该镜像提供的文件列表。 */
+        public static final class MirrorEntry {
+            public String url;
+            /** null = 服务端未提供，需用 S3 XML 发现；非 null = 直接使用此列表。 */
+            public List<S3List.Entry> files;
+        }
+
+        /** 一组镜像（同一线路的多个 CDN 节点）。 */
+        public static final class MirrorGroup {
+            public String name = "默认线路";
+            public List<MirrorEntry> entries = new ArrayList<>();
+
+            /** 返回该组所有镜像的 URL 列表（供 UI 展示）。 */
+            public List<String> urls() {
+                List<String> out = new ArrayList<>();
+                for (MirrorEntry e : entries) if (e.url != null) out.add(e.url);
+                return out;
+            }
+
+            /** 该组内是否至少有一个镜像附带了文件列表。 */
+            public boolean hasFileLists() {
+                for (MirrorEntry e : entries) if (e.files != null) return true;
+                return false;
+            }
+        }
+
+        /** 按线路分组的镜像列表。 */
+        public List<MirrorGroup> groups = new ArrayList<>();
         /** S3/CDN 资源访问令牌，用于 Authorization: Bearer 头（与会话令牌独立）。 */
-        public String       resourceToken;
+        public String            resourceToken;
     }
 
     /** /client/offline-package 响应：离线包下载 URL + 版本 + SHA-256。 */
@@ -173,11 +200,61 @@ public final class ClientInit {
         OnlineDownloadInfo info = new OnlineDownloadInfo();
         if (raw == null || raw.isEmpty()) return info;
         JSONObject obj = new JSONObject(raw);
-        JSONArray mirrors = obj.optJSONArray("mirrors");
-        if (mirrors != null) {
-            for (int i = 0; i < mirrors.length(); i++) info.mirrors.add(mirrors.getString(i));
-        }
         info.resourceToken = obj.optString("resource_token", null);
+
+        JSONArray groups = obj.optJSONArray("groups");
+        if (groups != null && groups.length() > 0) {
+            // 新格式：groups 数组
+            for (int gi = 0; gi < groups.length(); gi++) {
+                JSONObject gObj = groups.getJSONObject(gi);
+                OnlineDownloadInfo.MirrorGroup group = new OnlineDownloadInfo.MirrorGroup();
+                group.name = gObj.optString("name", "线路" + (gi + 1));
+                JSONArray entries = gObj.optJSONArray("mirrors");
+                if (entries != null) {
+                    for (int ei = 0; ei < entries.length(); ei++) {
+                        Object item = entries.get(ei);
+                        OnlineDownloadInfo.MirrorEntry me = new OnlineDownloadInfo.MirrorEntry();
+                        if (item instanceof String) {
+                            me.url = (String) item;
+                        } else if (item instanceof JSONObject) {
+                            JSONObject mObj = (JSONObject) item;
+                            me.url = mObj.optString("url", null);
+                            JSONArray files = mObj.optJSONArray("files");
+                            if (files != null) {
+                                me.files = new ArrayList<>();
+                                for (int fi = 0; fi < files.length(); fi++) {
+                                    Object fItem = files.get(fi);
+                                    if (fItem instanceof String) {
+                                        me.files.add(new S3List.Entry((String) fItem, -1L));
+                                    } else if (fItem instanceof JSONObject) {
+                                        JSONObject fObj = (JSONObject) fItem;
+                                        String key = fObj.optString("key", null);
+                                        long size   = fObj.optLong("size", -1L);
+                                        if (key != null && !key.isEmpty())
+                                            me.files.add(new S3List.Entry(key, size));
+                                    }
+                                }
+                            }
+                        }
+                        if (me.url != null && !me.url.isEmpty()) group.entries.add(me);
+                    }
+                }
+                if (!group.entries.isEmpty()) info.groups.add(group);
+            }
+        } else {
+            // 旧格式兼容：平铺的 mirrors 字符串数组 → 包装为单组，无文件列表（触发 S3 XML 发现）
+            JSONArray mirrors = obj.optJSONArray("mirrors");
+            if (mirrors != null && mirrors.length() > 0) {
+                OnlineDownloadInfo.MirrorGroup group = new OnlineDownloadInfo.MirrorGroup();
+                group.name = "默认线路";
+                for (int i = 0; i < mirrors.length(); i++) {
+                    OnlineDownloadInfo.MirrorEntry me = new OnlineDownloadInfo.MirrorEntry();
+                    me.url = mirrors.getString(i);
+                    group.entries.add(me);
+                }
+                info.groups.add(group);
+            }
+        }
         return info;
     }
 

@@ -202,7 +202,7 @@ public final class ResourceFlow {
             reporter.log("WARN", "method-select 上报失败（忽略）: " + t.getMessage());
         }
 
-        // 2. 获取镜像列表和 S3 资源令牌
+        // 2. 获取镜像组列表和 S3 资源令牌
         reporter.setStatus("正在获取镜像列表…");
         ClientInit.OnlineDownloadInfo dlInfo;
         try {
@@ -214,33 +214,37 @@ public final class ResourceFlow {
             throw new FatalConfigException("fetchOnlineDownload failed");
         }
 
-        if (dlInfo.mirrors == null || dlInfo.mirrors.isEmpty()
+        if (dlInfo.groups == null || dlInfo.groups.isEmpty()
                 || dlInfo.resourceToken == null || dlInfo.resourceToken.isEmpty()) {
             reporter.showFatalAndExit("资源配置缺失",
                     "服务端未返回资源下载地址或令牌，无法在线下载。\n\n请联系管理员。");
             throw new FatalConfigException("no mirrors");
         }
 
-        // 3. 构建线路表（当前只有一条"默认线路"）
+        // 3. 构建线路表（每个 MirrorGroup 对应一条线路）
         LinkedHashMap<String, List<String>> lines = new LinkedHashMap<>();
-        lines.put("默认线路", new ArrayList<>(dlInfo.mirrors));
+        Map<String, ClientInit.OnlineDownloadInfo.MirrorGroup> groupByName = new LinkedHashMap<>();
+        for (ClientInit.OnlineDownloadInfo.MirrorGroup g : dlInfo.groups) {
+            lines.put(g.name, g.urls());
+            groupByName.put(g.name, g);
+        }
 
         String selectedLine = lines.size() > 1
                 ? reporter.requestLineChoice(lines)
                 : lines.keySet().iterator().next();
 
-        List<String> mirrors = lines.get(selectedLine);
-        if (mirrors == null || mirrors.isEmpty()) {
+        ClientInit.OnlineDownloadInfo.MirrorGroup selectedGroup = groupByName.get(selectedLine);
+        if (selectedGroup == null || selectedGroup.entries.isEmpty()) {
             throw new FatalConfigException("empty mirrors for line: " + selectedLine);
         }
 
-        // 4. 获取文件清单（从第一个可用镜像）
+        // 4. 获取文件清单
         reporter.setPhase("download");
         reporter.setStatus("正在获取资源清单…");
-        reporter.log("INFO", "下载线路已选定，镜像数=" + mirrors.size());
+        reporter.log("INFO", "下载线路已选定，镜像数=" + selectedGroup.entries.size());
 
-        List<S3List.Entry> entries = fetchManifest(mirrors, dlInfo.resourceToken);
-        entries = filterHotUpdateFiles(entries);   // js/scenario 由热更新单独处理
+        List<FileEntry> entries = fetchManifestForGroup(selectedGroup, dlInfo.resourceToken);
+        entries = filterHotUpdateFiles(entries);
         if (entries.isEmpty()) {
             reporter.showFatalAndExit("资源清单为空",
                     "从服务端拿到的资源清单是空的，无法继续下载。\n\n请联系管理员。");
@@ -248,19 +252,19 @@ public final class ResourceFlow {
         }
         reporter.log("INFO", "清单条目数=" + entries.size());
 
-        // 4. 预建所有文件槽位（每文件固定一个，灰色待命状态）
+        // 5. 预建所有文件槽位（每文件固定一个，灰色待命状态）
         reporter.initSlots(entries.size());
         for (int pi = 0; pi < entries.size(); pi++) {
-            reporter.setSlot(pi, entries.get(pi).key, 0, entries.get(pi).size, 0);
+            reporter.setSlot(pi, entries.get(pi).entry.key, 0, entries.get(pi).entry.size, 0);
         }
 
-        // 5. 并发数
-        int concurrency = reporter.requestConcurrency(Math.min(4, mirrors.size()));
+        // 6. 并发数
+        int concurrency = reporter.requestConcurrency(Math.min(4, selectedGroup.entries.size()));
 
-        // 6. 下载所有文件
-        downloadAll(entries, mirrors, dlInfo.resourceToken, concurrency);
+        // 7. 下载所有文件
+        downloadAll(entries, dlInfo.resourceToken, concurrency);
 
-        // 7. 完成
+        // 8. 完成
         reporter.setPhase("done");
         reporter.setStatus("下载完成");
         reporter.log("INFO", "所有资源下载完成");
@@ -268,35 +272,54 @@ public final class ResourceFlow {
     }
 
     /**
-     * 从镜像列表中轮询获取 S3 XML 清单，返回 Entry 列表。
-     * 每个镜像最多尝试一次；全部失败时抛 IOException。
+     * 获取镜像组的文件清单，返回 FileEntry 列表。
+     *
+     * <p>若该组镜像提供了文件列表，则直接合并各镜像的文件列表（同一 key 首次出现者胜）；
+     * 否则对每个镜像 URL 根目录请求 S3 XML 并合并结果。
      */
-    private List<S3List.Entry> fetchManifest(List<String> mirrors, String resourceToken) throws Exception {
-        Exception last = null;
-        for (String mirror : mirrors) {
-            try {
-                String url = mirror.endsWith("/") ? mirror : mirror + "/";
-                reporter.log("INFO", "正在拉取资源清单…");
-                String xml = Net.getStringWithToken(url, resourceToken, 20_000);
-                List<S3List.Entry> result = S3List.parse(xml);
-                if (!result.isEmpty()) return result;
-                reporter.log("WARN", "清单 XML 解析结果为空，尝试下一个镜像");
-            } catch (Exception e) {
-                reporter.log("WARN", "清单拉取失败，尝试下一个镜像：" + e.getMessage());
-                last = e;
+    private List<FileEntry> fetchManifestForGroup(
+            ClientInit.OnlineDownloadInfo.MirrorGroup group, String resourceToken) throws Exception {
+        Map<String, FileEntry> byKey = new LinkedHashMap<>();
+        if (group.hasFileLists()) {
+            for (ClientInit.OnlineDownloadInfo.MirrorEntry me : group.entries) {
+                if (me.files == null) continue;
+                for (S3List.Entry e : me.files)
+                    if (!byKey.containsKey(e.key))
+                        byKey.put(e.key, new FileEntry(e, me.url));
             }
+        } else {
+            Exception last = null;
+            for (ClientInit.OnlineDownloadInfo.MirrorEntry me : group.entries) {
+                try {
+                    String url = me.url.endsWith("/") ? me.url : me.url + "/";
+                    reporter.log("INFO", "正在拉取资源清单…");
+                    String xml = Net.getStringWithToken(url, resourceToken, 20_000);
+                    List<S3List.Entry> result = S3List.parse(xml);
+                    if (result.isEmpty()) {
+                        reporter.log("WARN", "清单 XML 解析结果为空，尝试下一个镜像");
+                        continue;
+                    }
+                    for (S3List.Entry e : result)
+                        if (!byKey.containsKey(e.key))
+                            byKey.put(e.key, new FileEntry(e, me.url));
+                } catch (Exception e) {
+                    reporter.log("WARN", "清单拉取失败，尝试下一个镜像：" + e.getMessage());
+                    last = e;
+                }
+            }
+            if (byKey.isEmpty())
+                throw last != null ? last : new java.io.IOException("所有镜像均无法拉取清单");
         }
-        throw last != null ? last : new java.io.IOException("所有镜像均无法拉取清单");
+        return new ArrayList<>(byKey.values());
     }
 
     /** 多线程并发下载所有条目，同时启动心跳线程向服务端汇报进度。 */
-    private void downloadAll(List<S3List.Entry> entries,
-                             List<String> mirrors,
+    private void downloadAll(List<FileEntry> entries,
                              String resourceToken,
                              int concurrency) throws Exception {
         File destDir = ctx.getFilesDir();
         long totalBytes = 0L;
-        for (S3List.Entry e : entries) totalBytes += Math.max(0, e.size);
+        for (FileEntry fe : entries) totalBytes += Math.max(0, fe.entry.size);
         final long totalBytesF = totalBytes;
         final int  total       = entries.size();
 
@@ -307,9 +330,8 @@ public final class ResourceFlow {
 
         // 每个文件的下载状态（心跳读取；download worker 写入）
         ConcurrentHashMap<String, DownloadState> fileStates = new ConcurrentHashMap<>();
-        String defaultMirror = mirrors.get(0);
-        for (S3List.Entry e : entries) {
-            fileStates.put(e.key, new DownloadState(e.key, defaultMirror));
+        for (FileEntry fe : entries) {
+            fileStates.put(fe.entry.key, new DownloadState(fe.entry.key, fe.mirror));
         }
 
         // 启动心跳线程
@@ -330,7 +352,8 @@ public final class ResourceFlow {
         CountDownLatch latch = new CountDownLatch(total);
 
         for (int i = 0; i < total; i++) {
-            final S3List.Entry entry = entries.get(i);
+            final FileEntry fe = entries.get(i);
+            final S3List.Entry entry = fe.entry;
             if (firstErr.get() != null || reporter.isCancelled()) {
                 latch.countDown();
                 continue;
@@ -435,6 +458,13 @@ public final class ResourceFlow {
     }
 
     // ── 心跳系统内部类 ────────────────────────────────────────────────────
+
+    /** 文件条目：S3 Entry + 该文件归属的初始镜像 URL。 */
+    private static final class FileEntry {
+        final S3List.Entry entry;
+        final String       mirror;
+        FileEntry(S3List.Entry e, String m) { entry = e; mirror = m; }
+    }
 
     /** 单个文件的实时下载状态，由 download worker 写入，HeartbeatSender 读取。 */
     private static final class DownloadState {
@@ -810,12 +840,12 @@ public final class ResourceFlow {
             new java.util.HashSet<>(java.util.Arrays.asList(
                     "cn_js_update.zip", "cn_scenario_update.zip"));
 
-    private static List<S3List.Entry> filterHotUpdateFiles(List<S3List.Entry> entries) {
-        List<S3List.Entry> out = new ArrayList<>();
-        for (S3List.Entry e : entries) {
-            String name = e.key.contains("/")
-                    ? e.key.substring(e.key.lastIndexOf('/') + 1) : e.key;
-            if (!HOT_UPDATE_FILES.contains(name)) out.add(e);
+    private static List<FileEntry> filterHotUpdateFiles(List<FileEntry> entries) {
+        List<FileEntry> out = new ArrayList<>();
+        for (FileEntry fe : entries) {
+            String name = fe.entry.key.contains("/")
+                    ? fe.entry.key.substring(fe.entry.key.lastIndexOf('/') + 1) : fe.entry.key;
+            if (!HOT_UPDATE_FILES.contains(name)) out.add(fe);
         }
         return out;
     }
