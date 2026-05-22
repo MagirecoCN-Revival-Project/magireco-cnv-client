@@ -72,10 +72,10 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private static final String BG_ASSET          = "cnv/background_light.png";
     /** 资源目录内的游戏 Logo 路径（assets/cnv/logo.png）。 */
     private static final String LOGO_ASSET        = "cnv/logo.png";
-    /** CI 将 HCA 转换成 OGG 后落在 assets 内的循环 BGM 路径（system02 = 系统菜单循环曲）。 */
-    private static final String BGM_ASSET         = "resource/sound_native/bgm/bgm00_system02_hca.ogg";
-    /** 自检完毕后播放一次的标题音效（system01 = "Magia Record！" 片段）。 */
-    private static final String TITLE_SFX_ASSET   = "resource/sound_native/bgm/bgm00_system01_hca.ogg";
+    /** CI 将 HCA 转换成 OGG 后落在 assets 内的循环 BGM 路径（system01 = 系统菜单循环曲）。 */
+    private static final String BGM_ASSET         = "resource/sound_native/bgm/bgm00_system01_hca.ogg";
+    /** 自检完毕后播放一次的标题音效（system02 = "Magia Record！" 片段）。 */
+    private static final String TITLE_SFX_ASSET   = "resource/sound_native/bgm/bgm00_system02_hca.ogg";
 
     // ---- 配色 ----
     private int COLOR_CARD;          // 卡片/面板背景
