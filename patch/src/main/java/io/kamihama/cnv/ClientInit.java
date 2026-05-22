@@ -16,7 +16,7 @@ import java.util.List;
  */
 public final class ClientInit {
 
-    /** /client/init 握手响应：封禁 / 维护 / 版本闸门 / 伪造版本 / 会话令牌。 */
+    /** /client/init 握手响应：封禁 / 维护 / 版本闸门 / 伪造版本 / 会话令牌 / 功能开关。 */
     public static final class Response {
         public boolean      bannedFlag;
         public String       bannedReason;
@@ -35,6 +35,23 @@ public final class ClientInit {
         public String       fakeName;
         /** 服务端签发的会话令牌；后续所有 API 请求的鉴权三件套之一。 */
         public String       accessToken;
+
+        // ── 功能开关（features 字段组）────────────────────────────────
+        /**
+         * 是否开放在线下载功能；默认 true（服务端不返回 features 时退化为开放）。
+         * false 时客户端不显示在线下载选项。
+         */
+        public boolean      onlineDownloadEnabled  = true;
+        /**
+         * 是否开放离线包注入功能；默认 true。
+         * false 时客户端不显示离线包选项。
+         */
+        public boolean      offlinePackageEnabled  = true;
+        /**
+         * 当两个功能均关闭时向用户显示的提示文本。
+         * null 时展示默认维护提示。
+         */
+        public String       featureDisabledMessage;
     }
 
     /** /client/online-download 响应：镜像列表 + S3 资源令牌。 */
@@ -45,20 +62,22 @@ public final class ClientInit {
         public String       resourceToken;
     }
 
-    /** /client/offline-package 响应：离线包下载 URL + 版本 + MD5。 */
+    /** /client/offline-package 响应：离线包下载 URL + 版本 + SHA-256。 */
     public static final class OfflinePackageInfo {
         public String downloadUrl;
         public String packageVersion;
-        public String md5;
+        public String sha256;
     }
 
-    /** /client/hot-update 响应：js 包和 scenario 包各自的版本 / MD5 / 下载地址。 */
+    /** /client/hot-update 响应：js 包和 scenario 包各自的版本 / SHA-256 / 下载地址。 */
     public static final class HotUpdateInfo {
         public static final class Entry {
             /** 服务端版本号（整数递增）；0 表示服务端未返回。 */
             public int    version;
-            public String md5;
+            public String sha256;
             public String downloadUrl;
+            /** 压缩包字节数；-1 表示服务端未返回（退化为单线程 downloadResume）。 */
+            public long   fileSize = -1L;
         }
         public Entry js       = new Entry();
         public Entry scenario = new Entry();
@@ -117,6 +136,13 @@ public final class ClientInit {
             r.fakeName    = spoof.optString("fake_name",    null);
         }
 
+        JSONObject features = obj.optJSONObject("features");
+        if (features != null) {
+            r.onlineDownloadEnabled  = features.optBoolean("online_download",  true);
+            r.offlinePackageEnabled  = features.optBoolean("offline_package",  true);
+            r.featureDisabledMessage = features.optString("disabled_message",  null);
+        }
+
         return r;
     }
 
@@ -156,7 +182,7 @@ public final class ClientInit {
     }
 
     /**
-     * 获取云端离线包的下载地址、版本号和 MD5。
+     * 获取云端离线包的下载地址、版本号和 SHA-256。
      *
      * @param sessionToken 握手阶段获取的会话令牌
      * @throws Exception   网络错误 / HTTP &ge; 400
@@ -170,7 +196,7 @@ public final class ClientInit {
         JSONObject obj = new JSONObject(raw);
         info.downloadUrl    = obj.optString("download_url",    null);
         info.packageVersion = obj.optString("package_version", null);
-        info.md5            = obj.optString("md5",             null);
+        info.sha256         = obj.optString("sha256",          null);
         return info;
     }
 
@@ -191,15 +217,17 @@ public final class ClientInit {
 
         JSONObject js = obj.optJSONObject("js");
         if (js != null) {
-            info.js.version     = js.optInt("version",      0);
-            info.js.md5         = js.optString("md5",         null);
+            info.js.version     = js.optInt("version",        0);
+            info.js.sha256      = js.optString("sha256",      null);
             info.js.downloadUrl = js.optString("download_url", null);
+            info.js.fileSize    = js.optLong("size",          -1L);
         }
         JSONObject sc = obj.optJSONObject("scenario");
         if (sc != null) {
-            info.scenario.version     = sc.optInt("version",      0);
-            info.scenario.md5         = sc.optString("md5",         null);
+            info.scenario.version     = sc.optInt("version",        0);
+            info.scenario.sha256      = sc.optString("sha256",      null);
             info.scenario.downloadUrl = sc.optString("download_url", null);
+            info.scenario.fileSize    = sc.optLong("size",          -1L);
         }
         return info;
     }

@@ -72,10 +72,12 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private static final String BG_ASSET          = "cnv/background_light.png";
     /** 资源目录内的游戏 Logo 路径（assets/cnv/logo.png）。 */
     private static final String LOGO_ASSET        = "cnv/logo.png";
-    /** CI 将 HCA 转换成 OGG 后落在 assets 内的循环 BGM 路径（system02 = 系统菜单循环曲）。 */
-    private static final String BGM_ASSET         = "resource/sound_native/bgm/bgm00_system02_hca.ogg";
-    /** 自检完毕后播放一次的标题音效（system01 = "Magia Record！" 片段）。 */
-    private static final String TITLE_SFX_ASSET   = "resource/sound_native/bgm/bgm00_system01_hca.ogg";
+    /** CI 将 HCA 转换成 OGG 后落在 assets 内的循环 BGM 路径（system01 = 系统菜单循环曲）。 */
+    private static final String BGM_ASSET          = "resource/sound_native/bgm/bgm00_system01_hca.ogg";
+    /** 启动音效第一段（startgame01，约 2.0 秒）。 */
+    private static final String TITLE_SFX1_ASSET   = "resource/sound_native/se/startgame01_hca.ogg";
+    /** 启动音效第二段（startgame02，约 2.5 秒），接第一段后播放，完成后启动循环 BGM。 */
+    private static final String TITLE_SFX2_ASSET   = "resource/sound_native/se/startgame02_hca.ogg";
 
     // ---- 配色 ----
     private int COLOR_CARD;          // 卡片/面板背景
@@ -184,7 +186,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private boolean bgmDisabled = false;
     /** true = 用户手动关闭 BGM。 */
     private boolean bgmMuted = false;
-    /** 标题音效播放器（system02，一次性）。 */
+    /** 标题音效播放器（一次性）。 */
     private MediaPlayer sfxPlayer;
     /** true = 本次会话内不再尝试播标题音效。 */
     private boolean sfxDisabled = false;
@@ -195,6 +197,12 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private volatile boolean launched  = false;
     /** 握手后由服务端签发的会话令牌，传给 ResourceFlow 用于鉴权三件套。 */
     private volatile String  sessionToken = "";
+    /** 服务端功能开关：是否允许在线下载（握手后由 handleCloudInit 写入）。 */
+    private volatile boolean serverOnlineEnabled      = true;
+    /** 服务端功能开关：是否允许离线包注入（握手后由 handleCloudInit 写入）。 */
+    private volatile boolean serverOfflineEnabled     = true;
+    /** 两个功能均关闭时服务端下发的提示文本；null 时展示默认文案。 */
+    private volatile String  serverFeatureDisabledMsg = null;
 
     private final AtomicReference<String> modeChoice  = new AtomicReference<>(null);
     private final Object                  modeLock     = new Object();
@@ -1092,9 +1100,8 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     // ======================================================================
 
     /**
-     * 在资源自检完毕后调用：
-     * 先播放一次标题音效（system02），播完后自动启动循环 BGM（system01）。
-     * 若标题音效资源缺失，直接启动 BGM。
+     * 在资源自检完毕后调用：依次播放 startgame01 → startgame02，再启动循环 BGM。
+     * 任一音效资源缺失或播放出错时直接跳到启动 BGM。
      */
     private void playTitleSequence() {
         if (sfxDisabled) {
@@ -1104,8 +1111,14 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         }
         if (sfxPlayer != null) return;
         log("音频", "INFO", "开始播放标题音效序列");
+        playSfxSegment(TITLE_SFX1_ASSET,
+                () -> playSfxSegment(TITLE_SFX2_ASSET, this::startBgm));
+    }
+
+    /** 播放单段音效资源；完成后在主线程执行 onDone。出错或资源缺失时直接调 startBgm()。 */
+    private void playSfxSegment(String asset, Runnable onDone) {
         try {
-            AssetFileDescriptor afd = getAssets().openFd(TITLE_SFX_ASSET);
+            AssetFileDescriptor afd = getAssets().openFd(asset);
             MediaPlayer mp = new MediaPlayer();
             mp.setAudioStreamType(AudioManager.STREAM_MUSIC);
             mp.setDataSource(afd.getFileDescriptor(),
@@ -1113,15 +1126,14 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             try { afd.close(); } catch (Throwable ignore) {}
             mp.setLooping(false);
             mp.setOnCompletionListener(p -> {
-                log("音频", "INFO", "标题音效播放完毕，启动 BGM");
                 try { p.release(); } catch (Throwable ignore) {}
                 sfxPlayer = null;
-                startBgm();
+                onDone.run();
             });
             mp.setOnErrorListener((p, what, extra) -> {
                 log("音频", "WARN", "标题音效播放出错（what=" + what + "，extra=" + extra + "），启动 BGM");
                 try { p.release(); } catch (Throwable ignore) {}
-                sfxPlayer  = null;
+                sfxPlayer   = null;
                 sfxDisabled = true;
                 startBgm();
                 return true;
@@ -1130,9 +1142,8 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             mp.setOnPreparedListener(MediaPlayer::start);
             mp.prepareAsync();
         } catch (Throwable t) {
-            // 资源缺失（CI 还没转换）——直接启动 BGM
             log("音频", "WARN", "标题音效资源缺失，直接启动 BGM：" + t.getMessage());
-            sfxPlayer  = null;
+            sfxPlayer   = null;
             sfxDisabled = true;
             startBgm();
         }
@@ -1178,6 +1189,12 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             try { afd.close(); } catch (Throwable ignore) {}
             mp.setLooping(true);
             mp.setOnPreparedListener(p -> {
+                // 准备完成时若已静音（用户在 prepareAsync 期间点了静音），直接丢弃
+                if (bgmMuted || bgmPlayer == null) {
+                    try { p.reset(); p.release(); } catch (Throwable ignore) {}
+                    if (bgmPlayer == p) bgmPlayer = null;
+                    return;
+                }
                 log("音频", "INFO", "BGM 准备就绪，开始循环播放");
                 try { p.start(); } catch (Throwable ignore) {}
             });
@@ -1210,7 +1227,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     }
 
     private void resumeBgm() {
-        if (bgmPlayer == null || !bgmWasPlayingWhenPaused) return;
+        if (bgmPlayer == null || !bgmWasPlayingWhenPaused || bgmMuted) return;
         try {
             bgmPlayer.start();
             bgmWasPlayingWhenPaused = false;
@@ -1222,7 +1239,8 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         MediaPlayer mp = bgmPlayer;
         bgmPlayer = null;
         if (mp == null) return;
-        try { if (mp.isPlaying()) mp.stop(); } catch (Throwable ignore) {}
+        // reset() 适用于所有状态（包括 PREPARING），可靠地停止音频输出
+        try { mp.reset(); } catch (Throwable ignore) {}
         try { mp.release(); } catch (Throwable ignore) {}
     }
 
@@ -1350,8 +1368,9 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         }
         ui.post(() -> {
             if (logModal != null && logModal.getVisibility() == View.VISIBLE) {
+                boolean atBottom = isAtLogBottom();
                 renderLogModal();
-                vLogScroll.post(() -> vLogScroll.fullScroll(View.FOCUS_DOWN));
+                if (atBottom) vLogScroll.post(() -> vLogScroll.fullScroll(View.FOCUS_DOWN));
             }
         });
     }
@@ -1363,8 +1382,8 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private void runWork() {
         log("启动", "INFO", "工作线程已启动");
 
-        // 调试模式：display_ui_only.flag 存在且内容为 "true" 时，仅展示 UI，跳过所有其他逻辑
-        if (isDebugUiOnly()) {
+        // 调试模式：display_ui_only.flag=true 时仅展示 UI，跳过所有启动逻辑
+        if (isDebugFlag("display_ui_only")) {
             log("启动", "WARN", "调试模式已激活（display_ui_only.flag=true），跳过所有启动逻辑");
             ui.post(this::playTitleSequence);
             setPhase("init");
@@ -1372,19 +1391,93 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             return;
         }
 
-        // 第 0a 步：检查本机资源是否已准备就绪
+        // 第 0a 步：检查本机资源是否已准备就绪；同时检测是否处于游戏崩溃循环中
         boolean alreadyReady = isResourcesAlreadyReady();
         log("启动", "INFO", "资源就绪检查：" + (alreadyReady ? "已就绪，跳过下载" : "未就绪，进入下载流程"));
+        if (alreadyReady) {
+            android.content.SharedPreferences launchState =
+                    getSharedPreferences("cnv_launch_state", 0);
+            long lastLaunchMs = launchState.getLong("last_launch_ms", 0L);
+            long elapsed = System.currentTimeMillis() - lastLaunchMs;
+            // 距上次启动游戏不超过 20 秒视为"快速重启"；累计 3 次才弹恢复对话框
+            if (lastLaunchMs > 0L && elapsed < 20_000L) {
+                int rapidCount = launchState.getInt("rapid_restart_count", 0) + 1;
+                log("启动", "WARN", "检测到快速重启（距上次 " + elapsed + " ms），计数=" + rapidCount + "/3");
+                if (rapidCount >= 3) {
+                    launchState.edit()
+                            .putLong("last_launch_ms", 0L)
+                            .putInt("rapid_restart_count", 0)
+                            .apply();
+                    log("启动", "WARN", "连续 3 次快速重启，进入崩溃恢复模式");
+                    boolean shouldReset = askCrashRecovery();
+                    if (shouldReset) {
+                        deleteReadyFlag();
+                        alreadyReady = false;
+                        log("启动", "INFO", "用户选择重新注入资源，已清除就绪标志");
+                    } else {
+                        log("启动", "INFO", "用户选择继续启动游戏");
+                    }
+                } else {
+                    launchState.edit().putInt("rapid_restart_count", rapidCount).apply();
+                }
+            } else {
+                // 正常间隔重启，重置计数器
+                if (launchState.getInt("rapid_restart_count", 0) != 0) {
+                    launchState.edit().putInt("rapid_restart_count", 0).apply();
+                }
+            }
+        }
 
         // 自检完毕，触发标题音效序列（system02 → system01 BGM）
         ui.post(this::playTitleSequence);
 
-        // 第 0b 步：选下载模式（在线 / 离线）
-        // 资源已齐时跳过对话框，用占位值发 init（服务端不关心 ready 场景的 method 字段）
-        String userMethod;
-        if (alreadyReady) {
-            userMethod = ResourceFlow.MODE_ONLINE;
+        // 第 0b 步：检查本地封禁记录（心跳写入，早于 init 网络请求）
+        if (!isDebugFlag("skip_ban_check")) {
+            log("启动", "INFO", "检查本地封禁记录…");
+            BanInfo localBan = BanInfo.load(this);
+            if (localBan != null && localBan.isActive()) {
+                log("启动", "ERROR", "检测到有效本地封禁记录：" + localBan.reason
+                        + "（到期=" + localBan.expireTime + "）");
+                showFatalAndExit("账号已被封禁", localBan.buildMessage());
+                return;
+            }
+            log("启动", "INFO", "本地封禁记录检查通过");
         } else {
+            log("启动", "WARN", "调试：skip_ban_check=true，已跳过封禁记录检查");
+        }
+
+        // 第 0c 步：与云端 /client/init 握手（封禁 / 维护 / 版本闸门 / 功能开关）
+        if (!isDebugFlag("skip_cloud_init")) {
+            log("启动", "INFO", "开始与云端握手…");
+            if (!handleCloudInit()) return;
+        } else {
+            log("启动", "WARN", "调试：skip_cloud_init=true，已跳过云端握手（使用默认功能开关）");
+        }
+
+        // 第 0d 步：资源已齐则跳过下载，直接检查热更新
+        if (alreadyReady) {
+            log("启动", "INFO", "资源已就绪，跳过下载，检查热更新");
+            if (!isDebugFlag("skip_hot_update")) {
+                new ResourceFlow(this, this, ResourceFlow.MODE_ONLINE, sessionToken).runHotUpdate();
+            } else {
+                log("启动", "WARN", "调试：skip_hot_update=true，已跳过热更新检查");
+            }
+            log("启动", "INFO", "热更新检查完成，启动游戏");
+            ui.post(this::launchGame);
+            return;
+        }
+
+        // 第 0e 步：根据服务端功能开关和调试 flag 选择下载模式
+        String userMethod;
+        boolean forceOnline  = isDebugFlag("force_online_mode");
+        boolean forceOffline = isDebugFlag("force_offline_mode");
+        if (forceOnline) {
+            userMethod = ResourceFlow.MODE_ONLINE;
+            log("启动", "WARN", "调试：force_online_mode=true，强制使用在线模式");
+        } else if (forceOffline) {
+            userMethod = ResourceFlow.MODE_OFFLINE;
+            log("启动", "WARN", "调试：force_offline_mode=true，强制使用离线模式");
+        } else if (serverOnlineEnabled && serverOfflineEnabled) {
             log("启动", "INFO", "弹出下载模式选择对话框");
             userMethod = askDownloadMethod();
             if (userMethod == null) {
@@ -1393,30 +1486,13 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 return;
             }
             log("启动", "INFO", "用户选择了下载模式：" + userMethod);
-        }
-
-        // 第 0c 步：检查本地封禁记录（心跳写入，早于 init 网络请求）
-        log("启动", "INFO", "检查本地封禁记录…");
-        BanInfo localBan = BanInfo.load(this);
-        if (localBan != null && localBan.isActive()) {
-            log("启动", "ERROR", "检测到有效本地封禁记录：" + localBan.reason
-                    + "（到期=" + localBan.expireTime + "）");
-            showFatalAndExit("账号已被封禁", localBan.buildMessage());
-            return;
-        }
-        log("启动", "INFO", "本地封禁记录检查通过");
-
-        // 第 0d 步：与云端 /client/init 握手（封禁 / 维护 / 版本闸门）
-        log("启动", "INFO", "开始与云端握手…");
-        if (!handleCloudInit()) return;
-
-        // 第 0e 步：资源已齐则跳过下载，直接检查热更新
-        if (alreadyReady) {
-            log("启动", "INFO", "资源已就绪，跳过下载，检查热更新");
-            new ResourceFlow(this, this, ResourceFlow.MODE_ONLINE, sessionToken).runHotUpdate();
-            log("启动", "INFO", "热更新检查完成，启动游戏");
-            ui.post(this::launchGame);
-            return;
+        } else if (serverOnlineEnabled) {
+            userMethod = ResourceFlow.MODE_ONLINE;
+            log("启动", "INFO", "服务端仅开放在线下载，自动选择在线模式");
+        } else {
+            // serverOfflineEnabled must be true（两者均关闭的情况在 handleCloudInit 内已拦截）
+            userMethod = ResourceFlow.MODE_OFFLINE;
+            log("启动", "INFO", "服务端仅开放离线包注入，自动选择离线模式");
         }
 
         // 第 0f 步：启动资源下载流程
@@ -1424,7 +1500,9 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         try {
             new ResourceFlow(this, this, userMethod, sessionToken).run();
         } catch (ResourceFlow.FatalConfigException fce) {
-            log("启动", "ERROR", "资源流程致命错误：" + fce.getMessage());
+            log("启动", "ERROR", "资源流程配置错误：" + fce.getMessage());
+            ui.post(() -> showFatalWithRetry("资源配置错误",
+                    "无法准备游戏资源：" + fce.getMessage() + "\n\n请检查网络连接后重试，或联系管理员。"));
             return;
         } catch (final Throwable t) {
             log("启动", "ERROR", "资源流程异常：" + t.getClass().getSimpleName()
@@ -1435,16 +1513,34 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
 
         // 第 0g 步：首次下载完成后同样检查热更新（包可能刚发布就有更新）
         log("启动", "INFO", "资源流程完成，检查热更新");
-        new ResourceFlow(this, this, ResourceFlow.MODE_ONLINE, sessionToken).runHotUpdate();
+        if (!isDebugFlag("skip_hot_update")) {
+            new ResourceFlow(this, this, ResourceFlow.MODE_ONLINE, sessionToken).runHotUpdate();
+        } else {
+            log("启动", "WARN", "调试：skip_hot_update=true，已跳过热更新检查");
+        }
         log("启动", "INFO", "热更新检查完成，即将启动游戏");
         ui.post(this::launchGame);
     }
 
-    /** 检测 &lt;filesDir&gt;/debug/display_ui_only.flag 是否存在且内容为 "true"。 */
-    private boolean isDebugUiOnly() {
+    /**
+     * 检测调试 flag 文件是否存在且内容为 "true"。
+     * Flag 文件位于 &lt;filesDir&gt;/debug/&lt;name&gt;.flag，内容须为字符串 "true"（忽略首尾空白）。
+     *
+     * <p>已定义的 flag：
+     * <ul>
+     *   <li>{@code display_ui_only} — 仅展示 UI，跳过所有启动逻辑（最早检查）</li>
+     *   <li>{@code skip_cloud_init} — 跳过云端握手，使用默认功能开关</li>
+     *   <li>{@code skip_ban_check} — 跳过本地封禁记录检查</li>
+     *   <li>{@code skip_hot_update} — 跳过热更新检查</li>
+     *   <li>{@code force_online_mode} — 强制使用在线下载模式（忽略服务端功能开关）</li>
+     *   <li>{@code force_offline_mode} — 强制使用离线包注入模式（忽略服务端功能开关）</li>
+     *   <li>{@code verbose_net_log} — 启用详细网络日志（由 Net 层读取）</li>
+     * </ul>
+     */
+    boolean isDebugFlag(String name) {
         try {
             java.io.File f = new java.io.File(new java.io.File(getFilesDir(), "debug"),
-                    "display_ui_only.flag");
+                    name + ".flag");
             if (!f.exists()) return false;
             java.io.FileInputStream fis = new java.io.FileInputStream(f);
             byte[] buf = new byte[(int) Math.min(f.length(), 16)];
@@ -1455,6 +1551,15 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         } catch (Throwable t) {
             return false;
         }
+    }
+
+    /**
+     * 检查日志 ScrollView 当前是否已滚动到底部（或距底部在 32dp 以内）。
+     * 在 UI 线程调用；用于决定新日志到来时是否自动追底。
+     */
+    private boolean isAtLogBottom() {
+        if (vLogScroll == null || vLogFull == null) return true;
+        return vLogScroll.getScrollY() + vLogScroll.getHeight() + dp(32) >= vLogFull.getHeight();
     }
 
     /**
@@ -1537,7 +1642,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         };
 
         try {
-            log("更新", "INFO", "开始下载客户端更新：" + url);
+            log("更新", "INFO", "开始下载客户端更新");
             Net.downloadResume(url, apkFile, -1L, 30_000, sink);
             log("更新", "INFO", "更新 APK 下载完成，大小：" + apkFile.length() + " 字节");
         } catch (Exception e) {
@@ -1644,7 +1749,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
      * 全部检查通过返回 true；任何一项命中时已弹 FATAL 框，返回 false。
      */
     private boolean handleCloudInit() {
-        log("握手", "INFO", "向 " + CloudEndpoint.CLIENT_INIT + " 发起握手请求…");
+        log("握手", "INFO", "向云端握手接口发起请求…");
         ClientInit.Response init;
         try {
             init = ClientInit.fetch(this, ResourceFlow.BUILD_VERSION);
@@ -1652,8 +1757,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             log("握手", "ERROR", "握手请求失败：" + t.getClass().getSimpleName()
                     + (t.getMessage() != null ? "：" + t.getMessage() : ""));
             showFatalAndExit("无法联系服务器",
-                    "客户端启动需要先和云端 init 接口握手，但本次请求失败了。\n\n"
-                  + "API：" + CloudEndpoint.CLIENT_INIT + "\n"
+                    "客户端启动需要先和云端握手，但本次请求失败了。\n\n"
                   + "错误：" + t.getClass().getSimpleName()
                   + (t.getMessage() != null ? (": " + t.getMessage()) : "")
                   + "\n\n请检查网络后重试。");
@@ -1730,6 +1834,22 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                     + "，fakeVersion=" + init.fakeVersion);
         }
 
+        // 功能开关：写入实例字段，供 runWork() 决策下载模式
+        serverOnlineEnabled      = init.onlineDownloadEnabled;
+        serverOfflineEnabled     = init.offlinePackageEnabled;
+        serverFeatureDisabledMsg = init.featureDisabledMessage;
+        log("握手", "INFO", "功能开关：在线下载=" + serverOnlineEnabled
+                + "，离线包注入=" + serverOfflineEnabled);
+
+        // 两个功能均关闭 → 按服务器维护处理
+        if (!serverOnlineEnabled && !serverOfflineEnabled) {
+            String msg = (serverFeatureDisabledMsg != null && !serverFeatureDisabledMsg.isEmpty())
+                    ? serverFeatureDisabledMsg : "服务器暂时关闭了所有下载功能，请稍后再试。";
+            log("握手", "WARN", "所有功能开关均已关闭，按维护处理：" + msg);
+            showFatalAndExit("功能暂不可用", msg);
+            return false;
+        }
+
         return true;
     }
 
@@ -1747,6 +1867,10 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         if (launched) return;
         launched = true;
         log("启动", "INFO", "准备启动游戏：停止 BGM，跳转至 " + GAME_ACTIVITY);
+        // 记录本次游戏启动时间（用于下次启动时检测是否发生了崩溃循环）
+        getSharedPreferences("cnv_launch_state", 0).edit()
+                .putLong("last_launch_ms", System.currentTimeMillis())
+                .apply();
         // 停掉 BGM，让原版游戏自己的音频栈接管；必须在 startActivity 之前停
         stopBgm();
         stopSfx();
@@ -1870,21 +1994,91 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         return btn;
     }
 
-    private void showFatal(Throwable t) {
-        if (!isFinishing()) {
+    /** 非阻塞错误弹窗：重试 = recreate；供工作线程通过 ui.post 调用。 */
+    private void showFatalWithRetry(String title, String message) {
+        if (isFinishing()) return;
+        final Runnable[] showRef = new Runnable[1];
+        showRef[0] = () -> {
             View[] frame = inflateDialogFrame();
             FrameLayout overlay = (FrameLayout) frame[0];
             LinearLayout card   = (LinearLayout) frame[1];
-            addDialogTitle(card, "资源准备失败");
-            addDialogMessage(card, "无法继续启动游戏: " + t.getMessage()
-                    + "\n\n请检查网络后重试，或尝试切换为离线包注入方式。");
+            addDialogTitle(card, title);
+            addDialogMessage(card, message);
             LinearLayout row = addDialogButtonRow(card);
-            Button logBtn = addDialogButton(row, "查看日志", false);
-            Button retryBtn = addDialogButton(row, "重试", true);
-            logBtn.setOnClickListener(v -> { overlay.setVisibility(View.GONE); openLogModal(); });
+            Button logBtn   = addDialogButton(row, "查看日志", false);
+            Button retryBtn = addDialogButton(row, "重试",     true);
+            logBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                fatalRetrigger = showRef[0];
+                openLogModal();
+            });
             retryBtn.setOnClickListener(v -> { overlay.setVisibility(View.GONE); recreate(); });
             overlay.setVisibility(View.VISIBLE);
+        };
+        showRef[0].run();
+    }
+
+    private void showFatal(Throwable t) {
+        showFatalWithRetry("资源准备失败",
+                "无法继续启动游戏：" + t.getMessage()
+                + "\n\n请检查网络后重试，或尝试切换为离线包注入方式。");
+    }
+
+    /**
+     * 阻塞型崩溃恢复对话框：询问用户是否重新注入资源（true）或直接进入游戏（false）。
+     * 在工作线程调用。
+     */
+    private boolean askCrashRecovery() {
+        final Object    lock   = new Object();
+        final boolean[] result = { false };
+        final boolean[] done   = { false };
+        ui.post(() -> {
+            View[] frame = inflateDialogFrame();
+            FrameLayout overlay = (FrameLayout) frame[0];
+            LinearLayout card   = (LinearLayout) frame[1];
+            addDialogTitle(card, "检测到游戏启动异常");
+            addDialogMessage(card,
+                    "上次游戏在启动后很短时间内退出，可能发生了崩溃。\n\n"
+                  + "• 重新注入资源：清除现有资源并重新选择资源包（推荐）\n"
+                  + "• 继续启动：忽略此提示，直接启动游戏");
+            LinearLayout row    = addDialogButtonRow(card);
+            Button logBtn       = addDialogButton(row, "查看日志",   false);
+            Button continueBtn  = addDialogButton(row, "继续启动",   false);
+            Button reinjectBtn  = addDialogButton(row, "重新注入资源", true);
+            logBtn.setOnClickListener(v -> { overlay.setVisibility(View.GONE); openLogModal(); });
+            continueBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { result[0] = false; done[0] = true; lock.notifyAll(); }
+            });
+            reinjectBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { result[0] = true; done[0] = true; lock.notifyAll(); }
+            });
+            overlay.setVisibility(View.VISIBLE);
+        });
+        synchronized (lock) {
+            while (!done[0]) {
+                try { lock.wait(500); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt(); return false;
+                }
+            }
+            return result[0];
         }
+    }
+
+    /** 删除资源就绪标志文件（以及旧版 flag）以触发重新注入流程。 */
+    private void deleteReadyFlag() {
+        try {
+            new java.io.File(new java.io.File(getFilesDir(), "cnv_inject"),
+                    "cn_resources_ready.flag").delete();
+        } catch (Throwable ignore) {}
+        try {
+            new java.io.File(new java.io.File(
+                    new java.io.File(getFilesDir(), "madomagi"), "magica"),
+                    "cn_base_done.flag").delete();
+        } catch (Throwable ignore) {}
     }
 
     @Override
@@ -2272,8 +2466,9 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         }
         ui.post(() -> {
             if (logModal != null && logModal.getVisibility() == View.VISIBLE) {
+                boolean atBottom = isAtLogBottom();
                 renderLogModal();
-                vLogScroll.post(() -> vLogScroll.fullScroll(View.FOCUS_DOWN));
+                if (atBottom) vLogScroll.post(() -> vLogScroll.fullScroll(View.FOCUS_DOWN));
             }
         });
     }
@@ -2347,23 +2542,29 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
 
     @Override
     public void showFatalAndExit(final String title, final String message) {
-        final Object   lock = new Object();
-        final boolean[] done = { false };
-        final Runnable[] showRef = new Runnable[1];
+        final Object    lock      = new Object();
+        final boolean[] done      = { false };
+        final boolean[] doRetry   = { false };
+        final Runnable[] showRef  = new Runnable[1];
         showRef[0] = () -> {
             View[] frame = inflateDialogFrame();
             FrameLayout overlay = (FrameLayout) frame[0];
             LinearLayout card   = (LinearLayout) frame[1];
             addDialogTitle(card, title);
             addDialogMessage(card, message);
-            LinearLayout row = addDialogButtonRow(card);
-            Button logBtn  = addDialogButton(row, "查看日志", false);
-            Button exitBtn = addDialogButton(row, "退出", true);
+            LinearLayout row  = addDialogButtonRow(card);
+            Button logBtn     = addDialogButton(row, "查看日志", false);
+            Button retryBtn   = addDialogButton(row, "重试",     false);
+            Button exitBtn    = addDialogButton(row, "退出",     true);
             logBtn.setOnClickListener(v -> {
                 overlay.setVisibility(View.GONE);
-                // 关闭日志面板后重新展示此对话框
                 fatalRetrigger = showRef[0];
                 openLogModal();
+            });
+            retryBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { doRetry[0] = true; done[0] = true; lock.notifyAll(); }
             });
             exitBtn.setOnClickListener(v -> {
                 overlay.setVisibility(View.GONE);
@@ -2380,6 +2581,10 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 }
             }
         }
+        if (doRetry[0]) {
+            ui.post(this::recreate);
+            return;  // 工作线程退出；Activity 将被重建
+        }
         ui.post(() -> {
             try { finishAndRemoveTask(); } catch (Throwable ignore) {}
             android.os.Process.killProcess(android.os.Process.myPid());
@@ -2389,17 +2594,19 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     /** 带"跳转"按钮的 FATAL 对话框（仅内部使用，不进 Reporter 接口）。 */
     private void showFatalAndExitWithJump(final String title, final String message,
                                           final String jumpLabel, final String jumpUrl) {
-        final Object   lock = new Object();
-        final boolean[] done = { false };
+        final Object    lock    = new Object();
+        final boolean[] done    = { false };
+        final boolean[] doRetry = { false };
         ui.post(() -> {
             View[] frame = inflateDialogFrame();
             FrameLayout overlay = (FrameLayout) frame[0];
             LinearLayout card   = (LinearLayout) frame[1];
             addDialogTitle(card, title);
             addDialogMessage(card, message);
-            LinearLayout row = addDialogButtonRow(card);
-            Button jumpBtn = addDialogButton(row, jumpLabel, false);
-            Button exitBtn = addDialogButton(row, "退出", true);
+            LinearLayout row  = addDialogButtonRow(card);
+            Button jumpBtn  = addDialogButton(row, jumpLabel, false);
+            Button retryBtn = addDialogButton(row, "重试",    false);
+            Button exitBtn  = addDialogButton(row, "退出",    true);
             jumpBtn.setOnClickListener(v -> {
                 try {
                     startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(jumpUrl))
@@ -2408,6 +2615,11 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                     Toast.makeText(BootstrapActivity.this,
                             "无法打开浏览器：" + t.getMessage(), Toast.LENGTH_LONG).show();
                 }
+            });
+            retryBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { doRetry[0] = true; done[0] = true; lock.notifyAll(); }
             });
             exitBtn.setOnClickListener(v -> {
                 overlay.setVisibility(View.GONE);
@@ -2423,6 +2635,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 }
             }
         }
+        if (doRetry[0]) { ui.post(this::recreate); return; }
         ui.post(() -> {
             try { finishAndRemoveTask(); } catch (Throwable ignore) {}
             android.os.Process.killProcess(android.os.Process.myPid());
@@ -2469,7 +2682,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                     try {
                         startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(cloudUrl))
                                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
-                        log("离线包", "INFO", "已打开浏览器下载离线包：" + cloudUrl);
+                        log("离线包", "INFO", "已打开浏览器下载离线包");
                     } catch (Throwable t) {
                         Toast.makeText(BootstrapActivity.this,
                                 "无法打开浏览器：" + t.getMessage(), Toast.LENGTH_SHORT).show();
@@ -2490,6 +2703,48 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 synchronized (lock) { result[0] = true; done[0] = true; lock.notifyAll(); }
             });
 
+            overlay.setVisibility(View.VISIBLE);
+        });
+        synchronized (lock) {
+            while (!done[0]) {
+                try { lock.wait(500); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt(); return false;
+                }
+            }
+            return result[0];
+        }
+    }
+
+    @Override
+    public boolean confirmSha256Mismatch(final String expected, final String actual) {
+        final Object   lock   = new Object();
+        final boolean[] result = { false };
+        final boolean[] done   = { false };
+        ui.post(() -> {
+            View[] frame = inflateDialogFrame();
+            FrameLayout overlay = (FrameLayout) frame[0];
+            LinearLayout card   = (LinearLayout) frame[1];
+            addDialogTitle(card, "SHA-256 校验不通过");
+            addDialogMessage(card,
+                    "所选文件的 SHA-256 哈希与服务端记录不符，可能文件已损坏或来源有误。\n\n"
+                  + "期望：" + (expected != null ? expected : "（未知）") + "\n"
+                  + "实际：" + (actual   != null ? actual   : "（计算失败）") + "\n\n"
+                  + "强行继续可能导致游戏无法正常运行。");
+            LinearLayout row  = addDialogButtonRow(card);
+            Button cancelBtn  = addDialogButton(row, "取消",     true);
+            Button forceBtn   = addDialogButton(row, "强行继续", false);
+            cancelBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                log("离线包", "INFO", "用户取消：SHA-256 校验不通过");
+                synchronized (lock) { result[0] = false; done[0] = true; lock.notifyAll(); }
+            });
+            forceBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                log("离线包", "WARN", "用户强行继续：忽略 SHA-256 校验不通过");
+                synchronized (lock) { result[0] = true; done[0] = true; lock.notifyAll(); }
+            });
             overlay.setVisibility(View.VISIBLE);
         });
         synchronized (lock) {
