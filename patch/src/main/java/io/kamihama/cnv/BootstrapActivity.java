@@ -5,6 +5,10 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
+import android.text.InputType;
+import android.view.inputmethod.EditorInfo;
+import android.widget.EditText;
 import android.content.res.AssetFileDescriptor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -67,6 +71,9 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private static final int    REQ_FILE_PICK     = 0x4D47;
     private static final String PREFS_NAME        = "cnv_bootstrap_ui";
     private static final String PREF_DARK_MODE    = "dark_mode";
+    private static final String PREFS_ACCOUNT     = "cnv_account";
+    private static final String KEY_ACCOUNT_ID    = "account_id";
+    private static final String KEY_ACCOUNT_TOKEN = "account_token";
 
     /** 资源目录内的背景图路径（assets/cnv/background_light.png）。 */
     private static final String BG_ASSET          = "cnv/background_light.png";
@@ -1462,8 +1469,8 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             } else {
                 log("启动", "WARN", "调试：skip_hot_update=true，已跳过热更新检查");
             }
-            log("启动", "INFO", "热更新检查完成，启动游戏");
-            ui.post(this::launchGame);
+            log("启动", "INFO", "热更新检查完成，显示登录界面");
+            ui.post(() -> showLoginDialog(this::launchGame));
             return;
         }
 
@@ -1518,8 +1525,8 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         } else {
             log("启动", "WARN", "调试：skip_hot_update=true，已跳过热更新检查");
         }
-        log("启动", "INFO", "热更新检查完成，即将启动游戏");
-        ui.post(this::launchGame);
+        log("启动", "INFO", "热更新检查完成，显示登录界面");
+        ui.post(() -> showLoginDialog(this::launchGame));
     }
 
     /**
@@ -1861,6 +1868,197 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         } catch (Throwable t) {
             return String.valueOf(sec);
         }
+    }
+
+    // ======================================================================
+    // 账号登录对话框
+    // ======================================================================
+
+    /**
+     * 热更新完成后显示登录对话框。若 SharedPreferences 已保存有效会话则直接跳过。
+     * 登录成功后调用 onSuccess（通常为 {@link #launchGame()}）。
+     * 必须在主线程调用。
+     */
+    private void showLoginDialog(Runnable onSuccess) {
+        SharedPreferences prefs = getSharedPreferences(PREFS_ACCOUNT, MODE_PRIVATE);
+        String savedId    = prefs.getString(KEY_ACCOUNT_ID, null);
+        String savedToken = prefs.getString(KEY_ACCOUNT_TOKEN, null);
+        if (savedId != null && !savedId.isEmpty()
+                && savedToken != null && !savedToken.isEmpty()) {
+            onSuccess.run();
+            return;
+        }
+
+        View[] frame   = inflateDialogFrame();
+        FrameLayout overlay = (FrameLayout) frame[0];
+        LinearLayout card   = (LinearLayout) frame[1];
+
+        addDialogTitle(card, "账号登录");
+
+        // ── 账号输入框 ──────────────────────────────────────────────────────
+        EditText etUser = buildFormEditText(false, "账号");
+        card.addView(etUser, formInputLp(dp(10)));
+
+        // ── 密码输入框 ──────────────────────────────────────────────────────
+        EditText etPass = buildFormEditText(true, "密码");
+        card.addView(etPass, formInputLp(dp(6)));
+
+        // ── 注册账号 / 忘记密码 ────────────────────────────────────────────
+        LinearLayout linksRow = new LinearLayout(this);
+        linksRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams linksLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        linksLp.bottomMargin = dp(16);
+
+        TextView tvRegister = buildLinkText("注册账号");
+        tvRegister.setOnClickListener(v -> openUrlInBrowser(CloudEndpoint.ACCOUNT_REGISTER));
+
+        View linkSpacer = new View(this);
+
+        TextView tvForgot = buildLinkText("忘记密码");
+        tvForgot.setOnClickListener(v -> openUrlInBrowser(CloudEndpoint.ACCOUNT_FORGOT));
+
+        linksRow.addView(tvRegister, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        linksRow.addView(linkSpacer, new LinearLayout.LayoutParams(0, 1, 1f));
+        linksRow.addView(tvForgot, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        card.addView(linksRow, linksLp);
+
+        // ── 错误提示（默认隐藏）─────────────────────────────────────────────
+        TextView tvError = new TextView(this);
+        tvError.setTextColor(0xFFE53935);
+        tvError.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
+        tvError.setVisibility(View.GONE);
+        LinearLayout.LayoutParams errLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        errLp.bottomMargin = dp(8);
+        card.addView(tvError, errLp);
+
+        // ── 登录按钮（全宽）────────────────────────────────────────────────
+        Button btnLogin = new Button(this);
+        btnLogin.setText("登录");
+        btnLogin.setAllCaps(false);
+        btnLogin.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f);
+        btnLogin.setTextColor(0xFFFFFFFF);
+        GradientDrawable btnBg = new GradientDrawable();
+        btnBg.setColor(COLOR_ACCENT);
+        btnBg.setCornerRadius(dp(10));
+        btnLogin.setBackground(btnBg);
+        btnLogin.setPadding(dp(16), dp(10), dp(16), dp(10));
+        card.addView(btnLogin, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        // ── 登录点击逻辑 ────────────────────────────────────────────────────
+        btnLogin.setOnClickListener(v -> {
+            String user = etUser.getText().toString().trim();
+            String pass = etPass.getText().toString();
+            if (user.isEmpty() || pass.isEmpty()) {
+                tvError.setText("账号和密码不能为空");
+                tvError.setVisibility(View.VISIBLE);
+                return;
+            }
+            tvError.setVisibility(View.GONE);
+            btnLogin.setEnabled(false);
+            btnLogin.setText("验证中…");
+
+            CapWorkerSolver.solve(this, vRoot, CloudEndpoint.CAP_WORKER_URL,
+                new CapWorkerSolver.Callback() {
+                    @Override public void onToken(String capToken) {
+                        btnLogin.setText("登录中…");
+                        new Thread(() -> {
+                            try {
+                                String body = "{\"username\":" + jsonEscape(user)
+                                    + ",\"password\":" + jsonEscape(pass)
+                                    + ",\"cap_token\":" + jsonEscape(capToken) + "}";
+                                String resp = Net.postJson(
+                                        CloudEndpoint.ACCOUNT_LOGIN, body, 15_000);
+                                org.json.JSONObject json = new org.json.JSONObject(resp);
+                                if (json.optBoolean("success", false)) {
+                                    String accountId = json.optString("account_id", "");
+                                    String token     = json.optString("token", "");
+                                    getSharedPreferences(PREFS_ACCOUNT, MODE_PRIVATE)
+                                        .edit()
+                                        .putString(KEY_ACCOUNT_ID, accountId)
+                                        .putString(KEY_ACCOUNT_TOKEN, token)
+                                        .apply();
+                                    ui.post(() -> {
+                                        vRoot.removeView(overlay);
+                                        onSuccess.run();
+                                    });
+                                } else {
+                                    String err = json.optString("error", "登录失败，请重试");
+                                    ui.post(() -> {
+                                        tvError.setText(err);
+                                        tvError.setVisibility(View.VISIBLE);
+                                        btnLogin.setEnabled(true);
+                                        btnLogin.setText("登录");
+                                    });
+                                }
+                            } catch (Exception e) {
+                                ui.post(() -> {
+                                    tvError.setText("网络错误，请检查连接后重试");
+                                    tvError.setVisibility(View.VISIBLE);
+                                    btnLogin.setEnabled(true);
+                                    btnLogin.setText("登录");
+                                });
+                            }
+                        }, "cnv-login").start();
+                    }
+                    @Override public void onError(String error) {
+                        tvError.setText("人机验证失败：" + error);
+                        tvError.setVisibility(View.VISIBLE);
+                        btnLogin.setEnabled(true);
+                        btnLogin.setText("登录");
+                    }
+                });
+        });
+
+        overlay.setVisibility(View.VISIBLE);
+    }
+
+    private EditText buildFormEditText(boolean isPassword, String hint) {
+        EditText et = new EditText(this);
+        et.setHint(hint);
+        et.setHintTextColor(COLOR_SUB);
+        et.setTextColor(COLOR_TEXT);
+        et.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(darkMode ? 0x22FFFFFF : 0x11000000);
+        bg.setCornerRadius(dp(8));
+        bg.setStroke(dp(1), COLOR_CARD_STK);
+        et.setBackground(bg);
+        et.setPadding(dp(12), dp(10), dp(12), dp(10));
+        et.setInputType(isPassword
+                ? InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD
+                : InputType.TYPE_CLASS_TEXT);
+        et.setImeOptions(isPassword ? EditorInfo.IME_ACTION_DONE : EditorInfo.IME_ACTION_NEXT);
+        return et;
+    }
+
+    private LinearLayout.LayoutParams formInputLp(int bottomMargin) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.bottomMargin = bottomMargin;
+        return lp;
+    }
+
+    private TextView buildLinkText(String text) {
+        TextView tv = new TextView(this);
+        tv.setText(text);
+        tv.setTextColor(COLOR_ACCENT);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
+        tv.setPaintFlags(tv.getPaintFlags() | android.graphics.Paint.UNDERLINE_TEXT_FLAG);
+        return tv;
+    }
+
+    private void openUrlInBrowser(String url) {
+        try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url))); }
+        catch (Exception ignored) {}
+    }
+
+    private static String jsonEscape(String s) {
+        return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
     }
 
     private void launchGame() {

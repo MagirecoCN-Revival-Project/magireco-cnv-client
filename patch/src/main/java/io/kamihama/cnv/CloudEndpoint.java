@@ -96,5 +96,34 @@ public final class CloudEndpoint {
      */
     public static final String CLIENT_HOT_UPDATE = "https://api.magi-reco.top/client/hot-update";
 
+    // ── 账号系统 ──────────────────────────────────────────────────────────────
+
+    /**
+     * 账号登录接口。
+     *
+     * <p>请求：POST，{@code application/json}。Body：
+     * <pre>{ "username": "...", "password": "...", "cap_token": "..." }</pre>
+     *
+     * <p>成功响应（200）：
+     * <pre>{ "success": true, "account_id": "...", "token": "..." }</pre>
+     *
+     * <p>失败响应（401/403 等）：
+     * <pre>{ "success": false, "error": "..." }</pre>
+     */
+    public static final String ACCOUNT_LOGIN = "https://api.magi-reco.top/account/login";
+
+    /** 注册账号页面（浏览器打开）。 */
+    public static final String ACCOUNT_REGISTER = "https://api.magi-reco.top/account/register";
+
+    /** 忘记密码页面（浏览器打开）。 */
+    public static final String ACCOUNT_FORGOT = "https://api.magi-reco.top/account/forgot";
+
+    /**
+     * cap-worker 部署 URL（不含末尾斜杠），用于人机验证。
+     *
+     * @see <a href="https://github.com/xyTom/cap-worker">cap-worker</a>
+     */
+    public static final String CAP_WORKER_URL = "https://captcha.gurl.eu.org";
+
     private CloudEndpoint() {}
 }

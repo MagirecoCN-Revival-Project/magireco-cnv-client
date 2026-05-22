@@ -1,6 +1,7 @@
 package io.kamihama.magianative;
 
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.util.Log;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
@@ -38,14 +39,21 @@ public class WebViewInterceptor {
      */
     public static void installJsBridge(WebView view) {
         Context ctx = view.getContext().getApplicationContext();
-        String accountId;
-        try {
-            accountId = io.kamihama.cnv.DeviceId.get(ctx);
-        } catch (Throwable t) {
-            accountId = "default";
-        }
-        CnvJsBridge bridge = new CnvJsBridge(PlayerStateCache.get(ctx), accountId);
+        CnvJsBridge bridge = new CnvJsBridge(PlayerStateCache.get(ctx), resolveAccountId(ctx));
         view.addJavascriptInterface(bridge, "CnvBridge");
+    }
+
+    /**
+     * 账号 ID 解析优先级：
+     * 1. SharedPreferences cnv_account/account_id（登录成功后写入）
+     * 2. 硬件绑定设备 ID（未登录时的匿名标识）
+     */
+    private static String resolveAccountId(Context ctx) {
+        SharedPreferences prefs = ctx.getSharedPreferences("cnv_account", Context.MODE_PRIVATE);
+        String saved = prefs.getString("account_id", null);
+        if (saved != null && !saved.isEmpty()) return saved;
+        try { return io.kamihama.cnv.DeviceId.get(ctx); }
+        catch (Throwable t) { return "default"; }
     }
 
     // ── 完整请求拦截（含 GET API 缓存注入）──────────────────────────────────────
