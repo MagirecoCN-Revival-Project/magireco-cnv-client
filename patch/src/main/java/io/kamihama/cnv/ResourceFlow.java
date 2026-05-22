@@ -117,6 +117,11 @@ public final class ResourceFlow {
         /** 输出一条日志；type 为 INFO / WARN / ERROR / FATAL。 */
         void log(String type, String msg);
 
+        /** 输出带组件标签的日志；默认委托给无组件版本。 */
+        default void log(String component, String type, String msg) {
+            log(type, "[" + component + "] " + msg);
+        }
+
         /** 弹纯信息对话框，阻塞到用户点确定。 */
         void showInfoDialog(String title, String message);
 

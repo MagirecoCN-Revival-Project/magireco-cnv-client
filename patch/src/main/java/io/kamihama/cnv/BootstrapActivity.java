@@ -225,11 +225,12 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
 
     // ---- 日志缓冲 ----
     private final Deque<String>        logBuffer    = new ArrayDeque<>();
-    private static final int           LOG_BUFFER_MAX = 500;
+    private static final int           LOG_BUFFER_MAX = 1000;
     private java.io.BufferedWriter     logFileWriter;
     private final Object               logFileLock  = new Object();
+    private Thread                     logcatThread;
     private static final java.text.SimpleDateFormat LOG_TS =
-            new java.text.SimpleDateFormat("yyyy/MM/dd HH:mm:ss", Locale.US);
+            new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US);
 
     // ---- 贡献者数据 ----
     /**
@@ -256,8 +257,11 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 .getBoolean(PREF_DARK_MODE, false);
         loadPalette(darkMode);
         openLogFile();
+        startLogcatCapture();
         setContentView(buildLayout());
         initSlots(1);
+        log("生命周期", "INFO", "Activity 已创建，主题=" + (darkMode ? "夜间" : "亮色")
+                + "，客户端版本=" + ResourceFlow.BUILD_VERSION);
         // 工作线程：资源自检 → 自检完毕后播放标题音效 + BGM → 下载/启动
         Thread t = new Thread(this::runWork, "cnv-bootstrap");
         t.setDaemon(true);
@@ -267,18 +271,22 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     @Override
     protected void onResume() {
         super.onResume();
+        log("生命周期", "INFO", "Activity 恢复前台");
         resumeBgm();
     }
 
     @Override
     protected void onPause() {
         super.onPause();
+        log("生命周期", "INFO", "Activity 进入后台，暂停 BGM");
         pauseBgm();
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        log("生命周期", "INFO", "Activity 销毁，释放所有资源");
+        if (logcatThread != null) logcatThread.interrupt();
         stopBgm();
         stopSfx();
         closeLogFile();
@@ -969,7 +977,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         loadPalette(darkMode);
         setContentView(buildLayout());
         initSlots(Math.max(1, slotList.size()));
-        log("INFO", "[UI] 切换主题：" + (darkMode ? "夜间" : "亮色"));
+        log("UI", "INFO", "切换主题：" + (darkMode ? "夜间" : "亮色"));
     }
 
     /**
@@ -1111,10 +1119,12 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
      */
     private void playTitleSequence() {
         if (sfxDisabled) {
+            log("音频", "INFO", "标题音效不可用，直接启动 BGM");
             startBgm();
             return;
         }
         if (sfxPlayer != null) return;
+        log("音频", "INFO", "开始播放标题音效序列");
         try {
             AssetFileDescriptor afd = getAssets().openFd(TITLE_SFX_ASSET);
             MediaPlayer mp = new MediaPlayer();
@@ -1124,12 +1134,13 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             try { afd.close(); } catch (Throwable ignore) {}
             mp.setLooping(false);
             mp.setOnCompletionListener(p -> {
-                // 音效播完后释放并启动 BGM
+                log("音频", "INFO", "标题音效播放完毕，启动 BGM");
                 try { p.release(); } catch (Throwable ignore) {}
                 sfxPlayer = null;
                 startBgm();
             });
             mp.setOnErrorListener((p, what, extra) -> {
+                log("音频", "WARN", "标题音效播放出错（what=" + what + "，extra=" + extra + "），启动 BGM");
                 try { p.release(); } catch (Throwable ignore) {}
                 sfxPlayer  = null;
                 sfxDisabled = true;
@@ -1141,6 +1152,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             mp.prepareAsync();
         } catch (Throwable t) {
             // 资源缺失（CI 还没转换）——直接启动 BGM
+            log("音频", "WARN", "标题音效资源缺失，直接启动 BGM：" + t.getMessage());
             sfxPlayer  = null;
             sfxDisabled = true;
             startBgm();
@@ -1150,6 +1162,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     /** 切换 BGM 开/关状态并更新胶囊按钮外观。 */
     private void toggleBgm() {
         bgmMuted = !bgmMuted;
+        log("音频", "INFO", "BGM 状态切换：" + (bgmMuted ? "静音" : "恢复播放"));
         if (bgmMuted) {
             stopBgm();
         } else {
@@ -1176,6 +1189,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
      */
     private void startBgm() {
         if (bgmDisabled || bgmPlayer != null || bgmMuted) return;
+        log("音频", "INFO", "启动 BGM 播放");
         try {
             AssetFileDescriptor afd = getAssets().openFd(BGM_ASSET);
             MediaPlayer mp = new MediaPlayer();
@@ -1185,9 +1199,11 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             try { afd.close(); } catch (Throwable ignore) {}
             mp.setLooping(true);
             mp.setOnPreparedListener(p -> {
+                log("音频", "INFO", "BGM 准备就绪，开始循环播放");
                 try { p.start(); } catch (Throwable ignore) {}
             });
             mp.setOnErrorListener((p, what, extra) -> {
+                log("音频", "WARN", "BGM 播放出错（what=" + what + "，extra=" + extra + "），本会话内禁用 BGM");
                 try { p.release(); } catch (Throwable ignore) {}
                 bgmPlayer   = null;
                 bgmDisabled = true;
@@ -1197,6 +1213,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             mp.prepareAsync();
         } catch (Throwable t) {
             // 资源缺失（CI 还没跑 HCA→OGG 转换）——本会话内不再尝试
+            log("音频", "WARN", "BGM 资源缺失，本会话内禁用 BGM：" + t.getMessage());
             bgmPlayer   = null;
             bgmDisabled = true;
         }
@@ -1208,6 +1225,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             if (bgmPlayer.isPlaying()) {
                 bgmPlayer.pause();
                 bgmWasPlayingWhenPaused = true;
+                log("音频", "INFO", "BGM 已暂停");
             }
         } catch (Throwable ignore) {}
     }
@@ -1217,6 +1235,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         try {
             bgmPlayer.start();
             bgmWasPlayingWhenPaused = false;
+            log("音频", "INFO", "BGM 已恢复播放");
         } catch (Throwable ignore) {}
     }
 
@@ -1268,13 +1287,106 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         }
     }
 
+    // ── Logcat 捕获 ───────────────────────────────────────────────────────
+
+    /**
+     * 启动后台线程，持续读取本进程的 logcat 输出并注入日志面板。
+     * 使用 {@code --pid} 过滤仅本进程；跳过我们自己 TAG 的条目（已由 log() 写入）。
+     */
+    private void startLogcatCapture() {
+        String pid = String.valueOf(android.os.Process.myPid());
+        logcatThread = new Thread(() -> {
+            try {
+                // -v time 格式：MM-DD HH:MM:SS.mmm Level/Tag(PID): message
+                Process proc = Runtime.getRuntime().exec(
+                        new String[]{"logcat", "--pid=" + pid, "-v", "time"});
+                java.io.BufferedReader br = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(proc.getInputStream(), "UTF-8"));
+                String line;
+                while (!Thread.currentThread().isInterrupted()
+                        && (line = br.readLine()) != null) {
+                    ingestLogcatLine(line);
+                }
+                proc.destroy();
+            } catch (Throwable ignore) {}
+        }, "cnv-logcat");
+        logcatThread.setDaemon(true);
+        logcatThread.start();
+    }
+
+    /**
+     * 解析一行 logcat（-v time 格式）并写入日志缓冲区。
+     * 格式示例：{@code 05-22 14:23:45.123 I/SomeTag(1234): 消息}
+     */
+    private void ingestLogcatLine(String line) {
+        if (line == null || line.length() < 20) return;
+        if (line.startsWith("---------")) return; // 日志分组分隔符
+
+        // 位置 19 是 Level 字符，格式 "MM-DD HH:MM:SS.mmm L/..."
+        char levelChar = line.charAt(19);
+        String lvl;
+        switch (levelChar) {
+            case 'W': lvl = "WARN";  break;
+            case 'E': case 'F': lvl = "ERROR"; break;
+            case 'V': case 'D': lvl = "INFO";  break;
+            default:  lvl = "INFO";
+        }
+
+        // 提取 Tag：Level/Tag(PID): message → TAG 在 '/' 和 '(' 之间
+        String comp = "系统";
+        String msg  = line;
+        try {
+            int slash = line.indexOf('/', 20);
+            int paren = slash > 0 ? line.indexOf('(', slash) : -1;
+            int colon = paren > 0 ? line.indexOf(':', paren) : -1;
+            if (slash > 0 && paren > slash && colon > paren) {
+                comp = line.substring(slash + 1, paren).trim();
+                msg  = colon + 2 < line.length() ? line.substring(colon + 2) : "";
+            }
+        } catch (Throwable ignore) {}
+
+        // 跳过我们自己 TAG（已经由 log() 写入过 buffer）
+        if (TAG.equals(comp)) return;
+
+        // 补全时间戳：logcat 只给 MM-DD，需要加年份
+        String year    = new java.text.SimpleDateFormat("yyyy", Locale.US)
+                .format(new java.util.Date());
+        String mmdd    = line.substring(0, 5);   // "MM-DD"
+        String hhmmss  = line.length() >= 18
+                ? line.substring(6, 14) : "??:??:??"; // "HH:MM:SS"
+        String fullTs  = "［" + year + "-" + mmdd + " " + hhmmss + "］[" + comp + "][" + lvl + "] " + msg;
+
+        synchronized (logBuffer) {
+            logBuffer.addLast(fullTs);
+            while (logBuffer.size() > LOG_BUFFER_MAX) logBuffer.removeFirst();
+        }
+        synchronized (logFileLock) {
+            if (logFileWriter != null) {
+                try {
+                    logFileWriter.write(fullTs);
+                    logFileWriter.write('\n');
+                    logFileWriter.flush();
+                } catch (Throwable ignore) {}
+            }
+        }
+        ui.post(() -> {
+            if (logModal != null && logModal.getVisibility() == View.VISIBLE) {
+                renderLogModal();
+                vLogScroll.post(() -> vLogScroll.fullScroll(View.FOCUS_DOWN));
+            }
+        });
+    }
+
     // ======================================================================
     // 后台工作线程
     // ======================================================================
 
     private void runWork() {
+        log("启动", "INFO", "工作线程已启动");
+
         // 调试模式：display_ui_only.flag 存在且内容为 "true" 时，仅展示 UI，跳过所有其他逻辑
         if (isDebugUiOnly()) {
+            log("启动", "WARN", "调试模式已激活（display_ui_only.flag=true），跳过所有启动逻辑");
             ui.post(this::playTitleSequence);
             setPhase("init");
             setStatus("调试模式：仅展示 UI");
@@ -1283,6 +1395,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
 
         // 第 0a 步：检查本机资源是否已准备就绪
         boolean alreadyReady = isResourcesAlreadyReady();
+        log("启动", "INFO", "资源就绪检查：" + (alreadyReady ? "已就绪，跳过下载" : "未就绪，进入下载流程"));
 
         // 自检完毕，触发标题音效序列（system02 → system01 BGM）
         ui.post(this::playTitleSequence);
@@ -1293,39 +1406,52 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         if (alreadyReady) {
             userMethod = ResourceFlow.MODE_ONLINE;
         } else {
+            log("启动", "INFO", "弹出下载模式选择对话框");
             userMethod = askDownloadMethod();
             if (userMethod == null) {
+                log("启动", "WARN", "用户取消了下载模式选择，APP 即将退出");
                 showFatalAndExit("已取消", "下载模式选择被取消，APP 即将退出。");
                 return;
             }
+            log("启动", "INFO", "用户选择了下载模式：" + userMethod);
         }
 
         // 第 0c 步：检查本地封禁记录（心跳写入，早于 init 网络请求）
+        log("启动", "INFO", "检查本地封禁记录…");
         BanInfo localBan = BanInfo.load(this);
         if (localBan != null && localBan.isActive()) {
+            log("启动", "ERROR", "检测到有效本地封禁记录：" + localBan.reason
+                    + "（到期=" + localBan.expireTime + "）");
             showFatalAndExit("账号已被封禁", localBan.buildMessage());
             return;
         }
+        log("启动", "INFO", "本地封禁记录检查通过");
 
         // 第 0d 步：与云端 /client/init 握手（封禁 / 维护 / 版本闸门）
+        log("启动", "INFO", "开始与云端握手…");
         if (!handleCloudInit()) return;
 
         // 第 0e 步：资源已齐则直接启动游戏
         if (alreadyReady) {
+            log("启动", "INFO", "资源已就绪，直接启动游戏");
             ui.post(this::launchGame);
             return;
         }
 
         // 第 0f 步：启动资源下载流程
+        log("启动", "INFO", "启动资源下载流程（模式=" + userMethod + "）");
         try {
             new ResourceFlow(this, this, userMethod).run();
         } catch (ResourceFlow.FatalConfigException fce) {
-            // showFatalAndExit 已经弹框，此处静默返回
+            log("启动", "ERROR", "资源流程致命错误：" + fce.getMessage());
             return;
         } catch (final Throwable t) {
+            log("启动", "ERROR", "资源流程异常：" + t.getClass().getSimpleName()
+                    + "：" + t.getMessage());
             ui.post(() -> showFatal(t));
             return;
         }
+        log("启动", "INFO", "资源流程完成，即将启动游戏");
         ui.post(this::launchGame);
     }
 
@@ -1426,11 +1552,11 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         };
 
         try {
-            log("INFO", "开始下载客户端更新: " + url);
+            log("更新", "INFO", "开始下载客户端更新：" + url);
             Net.downloadResume(url, apkFile, -1L, 30_000, sink);
-            log("INFO", "更新 APK 下载完成，大小: " + apkFile.length() + " bytes");
+            log("更新", "INFO", "更新 APK 下载完成，大小：" + apkFile.length() + " 字节");
         } catch (Exception e) {
-            log("ERROR", "下载更新失败: " + e.getMessage());
+            log("更新", "ERROR", "下载更新失败：" + e.getMessage());
             showFatalAndExit("下载更新失败",
                     "APK 下载过程中出错：" + e.getMessage() + "\n\n请稍后重试。");
             return;
@@ -1438,7 +1564,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
 
         setSlotPhase(0, "done");
         setStatus("正在启动安装器…");
-        log("INFO", "启动系统安装器");
+        log("更新", "INFO", "正在启动系统安装器");
 
         ui.post(() -> {
             try {
@@ -1449,7 +1575,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                         | Intent.FLAG_GRANT_READ_URI_PERMISSION);
                 startActivity(it);
             } catch (Throwable t) {
-                log("ERROR", "启动安装器失败: " + t.getMessage());
+                log("更新", "ERROR", "启动安装器失败：" + t.getMessage());
             }
             ui.postDelayed(() -> {
                 try { finishAndRemoveTask(); } catch (Throwable ignore) {}
@@ -1533,10 +1659,13 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
      * 全部检查通过返回 true；任何一项命中时已弹 FATAL 框，返回 false。
      */
     private boolean handleCloudInit() {
+        log("握手", "INFO", "向 " + CloudEndpoint.CLIENT_INIT + " 发起握手请求…");
         ClientInit.Response init;
         try {
             init = ClientInit.fetch(this, ResourceFlow.BUILD_VERSION);
         } catch (Throwable t) {
+            log("握手", "ERROR", "握手请求失败：" + t.getClass().getSimpleName()
+                    + (t.getMessage() != null ? "：" + t.getMessage() : ""));
             showFatalAndExit("无法联系服务器",
                     "客户端启动需要先和云端 init 接口握手，但本次请求失败了。\n\n"
                   + "API：" + CloudEndpoint.CLIENT_INIT + "\n"
@@ -1545,11 +1674,13 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                   + "\n\n请检查网络后重试。");
             return false;
         }
+        log("握手", "INFO", "握手成功，服务端状态=" + init.serverStatus);
 
         // 封禁
         if (init.bannedFlag) {
             String reason = (init.bannedReason != null && !init.bannedReason.isEmpty())
                     ? init.bannedReason : "（服务端未提供原因）";
+            log("握手", "ERROR", "服务端封禁：" + reason);
             showFatalAndExit("访问被服务端拒绝", "原因：" + reason);
             return false;
         }
@@ -1560,12 +1691,14 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                     ? init.maintenanceMessage : "服务器正在维护，请稍后再试。";
             if (init.maintenanceEndTime > 0L)
                 msg += "\n\n预计完成时间：" + formatUnixSeconds(init.maintenanceEndTime);
+            log("握手", "WARN", "服务器维护中：" + msg);
             showFatalAndExit("服务器维护中", msg);
             return false;
         }
         if ("error".equals(init.serverStatus)) {
             String msg = (init.maintenanceMessage != null && !init.maintenanceMessage.isEmpty())
                     ? init.maintenanceMessage : "服务端报告错误状态，请稍后再试。";
+            log("握手", "ERROR", "服务端错误状态：" + msg);
             showFatalAndExit("服务端错误", msg);
             return false;
         }
@@ -1574,6 +1707,8 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         if (init.allowedVersions != null
                 && !init.allowedVersions.isEmpty()
                 && !init.allowedVersions.contains(ResourceFlow.BUILD_VERSION)) {
+            log("握手", "WARN", "版本不在允许列表内：" + ResourceFlow.BUILD_VERSION
+                    + "，允许列表=" + init.allowedVersions);
             boolean internalTest = BuildChannel.isInternalTest(this);
             String  channelName  = internalTest ? "内测版" : "正常版";
             String  url          = internalTest
@@ -1603,6 +1738,10 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         // 版本伪造：将服务端下发的 fake_version / fake_name 写入 Spoof 静态缓存，
         // NativeBridge.getAppVersion() 会优先返回该值（null = 自动退化为真实版本）
         Spoof.set(init.fakeName, init.fakeVersion);
+        if (init.fakeName != null || init.fakeVersion != null) {
+            log("握手", "INFO", "版本伪造参数：fakeName=" + init.fakeName
+                    + "，fakeVersion=" + init.fakeVersion);
+        }
 
         return true;
     }
@@ -1620,6 +1759,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private void launchGame() {
         if (launched) return;
         launched = true;
+        log("启动", "INFO", "准备启动游戏：停止 BGM，跳转至 " + GAME_ACTIVITY);
         // 停掉 BGM，让原版游戏自己的音频栈接管；必须在 startActivity 之前停
         stopBgm();
         stopSfx();
@@ -1630,9 +1770,12 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             Intent orig = getIntent();
             if (orig != null && orig.getData() != null) it.setData(orig.getData());
             startActivity(it);
+            log("启动", "INFO", "游戏 Activity 已启动，BootstrapActivity 退出");
             finish();
             overridePendingTransition(0, 0);
         } catch (Throwable t) {
+            log("启动", "ERROR", "启动游戏失败：" + t.getClass().getSimpleName()
+                    + (t.getMessage() != null ? "：" + t.getMessage() : ""));
             showFatal(t);
         }
     }
@@ -2099,24 +2242,36 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     @Override
     public boolean isCancelled() { return cancelled; }
 
+    /** Reporter 接口实现：无组件标签，委托给带组件版本。 */
     @Override
     public void log(final String type, final String msg) {
-        String tag = type == null ? "INFO" : type;
-        switch (tag) {
-            case "WARN":  android.util.Log.w(TAG, msg); break;
+        log("应用", type, msg);
+    }
+
+    /** 核心日志方法。格式：［yyyy-MM-dd HH:mm:ss］[组件][级别] 内容 */
+    public void log(final String component, final String type, final String msg) {
+        String lvl  = type      == null ? "INFO" : type;
+        String comp = component == null ? "应用" : component;
+        String adbMsg = "[" + comp + "] " + msg;
+        switch (lvl) {
+            case "WARN":  android.util.Log.w(TAG, adbMsg); break;
             case "ERROR":
-            case "FATAL": android.util.Log.e(TAG, msg); break;
-            default:      android.util.Log.i(TAG, msg);
+            case "FATAL": android.util.Log.e(TAG, adbMsg); break;
+            default:      android.util.Log.i(TAG, adbMsg);
         }
+        writeToBuffer(comp, lvl, msg);
+    }
+
+    /** 直接写入日志缓冲区（不再调用 android.util.Log，供 logcat 捕获器使用）。 */
+    private void writeToBuffer(String comp, String lvl, String msg) {
         final String ts;
         synchronized (LOG_TS) {
-            ts = "[" + LOG_TS.format(new java.util.Date()) + "] [" + tag + "] " + msg;
+            ts = "［" + LOG_TS.format(new java.util.Date()) + "］[" + comp + "][" + lvl + "] " + msg;
         }
         synchronized (logBuffer) {
             logBuffer.addLast(ts);
             while (logBuffer.size() > LOG_BUFFER_MAX) logBuffer.removeFirst();
         }
-        // 同步落盘到 latest.log
         synchronized (logFileLock) {
             if (logFileWriter != null) {
                 try {
@@ -2128,7 +2283,6 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 }
             }
         }
-        // 日志面板打开时实时更新
         ui.post(() -> {
             if (logModal != null && logModal.getVisibility() == View.VISIBLE) {
                 renderLogModal();
