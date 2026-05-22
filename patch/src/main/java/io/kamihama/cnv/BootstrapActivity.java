@@ -2493,7 +2493,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                         log("离线包", "WARN", "打开浏览器失败：" + t.getMessage());
                     }
                     Toast.makeText(BootstrapActivity.this,
-                            "下载完成后请返回此界面，点击"选择文件"选取已下载的 zip 包",
+                            "下载完成后请返回此界面，点击【选择文件】选取已下载的 zip 包",
                             Toast.LENGTH_LONG).show();
                     synchronized (lock) { result[0] = true; done[0] = true; lock.notifyAll(); }
                 });
