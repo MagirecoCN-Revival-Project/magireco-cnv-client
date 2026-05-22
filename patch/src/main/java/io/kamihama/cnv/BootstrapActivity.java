@@ -242,11 +242,14 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
      */
     private static final Object[][] CONTRIBUTORS = {
         // { 头像色, 名字, 贡献说明, 主页 URL, 头像图片 URL }
-        { 0xFF3D7BFF, "CyberNova",   "新端APK修改 · 云端提供",     "https://github.com/magirecocn-revival-project", null },
-        { 0xFF8BB87A, "MadeInMagius","旧端APK修改 · 资源打包",     "https://github.com/magirecocn-revival-project", null },
-        { 0xFFE667A0, "水银h2oag",   "日服绝大部分剧情汉化",       "https://github.com/magirecocn-revival-project", null },
-        { 0xFF4FB7E6, "segfault",    "提供国服文件存档",           "https://github.com/magirecocn-revival-project", null },
+        { 0xFF3D7BFF, "CyberNova",   "新端APK修改 · 云端提供",     "https://github.com/magirecocn-revival-project", "https://avatar-proxy.magireco.top/?username=CyberNova2123" },
+        { 0xFF8BB87A, "MadeInMagius","旧端APK修改 · 资源打包",     "https://github.com/magirecocn-revival-project", "https://i0.hdslb.com/bfs/face/1bc30c0bd8ee3b2d1e0c291af40a3683c70486a5.jpg" },
+        { 0xFFE667A0, "水银h2oag",   "日服绝大部分剧情汉化",       "https://github.com/magirecocn-revival-project", "https://i1.hdslb.com/bfs/face/d82f2f2225c32036c6568fc0d5cd208fbdd2bff1.jpg" },
+        { 0xFF4FB7E6, "segfault",    "提供国服文件存档",           "https://github.com/magirecocn-revival-project", "https://i1.hdslb.com/bfs/face/7d11ac840148cfc0d282a3f4924f02f68d3631ad.jpg" },
     };
+
+    /** URL → 已解码 Bitmap 的内存缓存；static 保证 Activity 重建后不重复下载。 */
+    private static final ConcurrentHashMap<String, Bitmap> AVATAR_CACHE = new ConcurrentHashMap<>();
 
     // ======================================================================
     // Activity 生命周期
@@ -889,25 +892,89 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     }
 
     /**
-     * 后台线程从 URL 下载图片并回调到主线程设置到 AvatarView。
-     * 加载失败时静默忽略，头像保持首字母圆形兜底。
+     * 后台线程从 URL 下载头像并回调到主线程；命中静态缓存时直接同步设置。
+     * 失败静默忽略，头像保持首字母圆形兜底。
      */
     private void loadAvatarBitmap(AvatarView av, String url) {
+        Bitmap hit = AVATAR_CACHE.get(url);
+        if (hit != null) { av.setBitmap(hit); return; }
+        final int targetPx = dp(36);
         new Thread(() -> {
-            try {
-                java.net.HttpURLConnection conn =
-                        (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
-                conn.setConnectTimeout(10_000);
-                conn.setReadTimeout(10_000);
-                conn.setRequestProperty("User-Agent", "MagirecoCNV/1.0");
-                conn.connect();
-                if (conn.getResponseCode() == 200) {
-                    Bitmap bm = BitmapFactory.decodeStream(conn.getInputStream());
-                    if (bm != null) ui.post(() -> av.setBitmap(bm));
-                }
-                conn.disconnect();
-            } catch (Throwable ignore) {}
+            Bitmap bm = fetchBitmapWithRedirect(url, targetPx);
+            if (bm != null) {
+                AVATAR_CACHE.put(url, bm);
+                ui.post(() -> av.setBitmap(bm));
+            }
         }, "cnv-avatar").start();
+    }
+
+    /**
+     * 下载并解码图片。
+     *
+     * <p>坑点处理：
+     * <ul>
+     *   <li>手动跟踪重定向（最多 5 跳），支持 HTTP↔HTTPS 跨协议跳转；
+     *       Android 默认只跟同协议重定向。</li>
+     *   <li>模拟移动浏览器 UA，规避 Bilibili CDN 等对裸 UA 的过滤。</li>
+     *   <li>先读为字节数组，两遍解码：第一遍只取尺寸，算 inSampleSize；
+     *       第二遍按倍率解码，图片尺寸大时显著节省内存。</li>
+     * </ul>
+     */
+    private static Bitmap fetchBitmapWithRedirect(String startUrl, int targetPx) {
+        String url = startUrl;
+        for (int hop = 0; hop < 5; hop++) {
+            java.net.HttpURLConnection c = null;
+            try {
+                c = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+                c.setInstanceFollowRedirects(false); // 手动跟踪，允许跨协议
+                c.setConnectTimeout(10_000);
+                c.setReadTimeout(15_000);
+                c.setRequestProperty("User-Agent",
+                        "Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 " +
+                        "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36");
+                c.setRequestProperty("Accept", "image/webp,image/apng,image/*,*/*;q=0.8");
+                c.connect();
+                int code = c.getResponseCode();
+                if (code >= 300 && code < 400) {
+                    String loc = c.getHeaderField("Location");
+                    if (loc == null || loc.isEmpty()) return null;
+                    if (loc.startsWith("/")) {      // 相对路径补全为绝对 URL
+                        java.net.URL base = new java.net.URL(url);
+                        loc = base.getProtocol() + "://" + base.getHost() + loc;
+                    }
+                    url = loc;
+                    continue;                       // finally 负责 disconnect
+                }
+                if (code != 200) return null;
+                byte[] raw = streamToBytes(c.getInputStream());
+                BitmapFactory.Options opts = new BitmapFactory.Options();
+                opts.inJustDecodeBounds = true;
+                BitmapFactory.decodeByteArray(raw, 0, raw.length, opts);
+                opts.inSampleSize     = calcSampleSize(opts.outWidth, opts.outHeight, targetPx);
+                opts.inJustDecodeBounds = false;
+                return BitmapFactory.decodeByteArray(raw, 0, raw.length, opts);
+            } catch (Throwable t) {
+                return null;
+            } finally {
+                if (c != null) try { c.disconnect(); } catch (Throwable ignore) {}
+            }
+        }
+        return null;
+    }
+
+    private static byte[] streamToBytes(java.io.InputStream is) throws java.io.IOException {
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        int n;
+        while ((n = is.read(buf)) != -1) out.write(buf, 0, n);
+        return out.toByteArray();
+    }
+
+    private static int calcSampleSize(int w, int h, int targetPx) {
+        int size = 1;
+        int shorter = Math.min(w > 0 ? w : targetPx, h > 0 ? h : targetPx);
+        while (shorter / (size * 2) >= targetPx) size *= 2;
+        return size;
     }
 
     /**
