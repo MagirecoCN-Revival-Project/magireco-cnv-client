@@ -82,18 +82,17 @@
 .method public shouldInterceptRequest(Landroid/webkit/WebView;Landroid/webkit/WebResourceRequest;)Landroid/webkit/WebResourceResponse;
     .locals 1
 
-    invoke-interface {p2}, Landroid/webkit/WebResourceRequest;->getUrl()Landroid/net/Uri;
+    invoke-static {p1, p2}, Lio/kamihama/magianative/WebViewInterceptor;->interceptFull(Landroid/webkit/WebView;Landroid/webkit/WebResourceRequest;)Landroid/webkit/WebResourceResponse;
 
     move-result-object v0
 
-    invoke-virtual {v0}, Landroid/net/Uri;->toString()Ljava/lang/String;
+    if-nez v0, :cond_0
+
+    invoke-super {p0, p1, p2}, Landroid/webkit/WebViewClient;->shouldInterceptRequest(Landroid/webkit/WebView;Landroid/webkit/WebResourceRequest;)Landroid/webkit/WebResourceResponse;
 
     move-result-object v0
 
-    invoke-virtual {p0, p1, v0}, Ljp/f4samurai/web/WebViewImpl$WebViewClientImpl;->shouldInterceptRequest(Landroid/webkit/WebView;Ljava/lang/String;)Landroid/webkit/WebResourceResponse;
-
-    move-result-object v0
-
+    :cond_0
     return-object v0
 .end method
 
