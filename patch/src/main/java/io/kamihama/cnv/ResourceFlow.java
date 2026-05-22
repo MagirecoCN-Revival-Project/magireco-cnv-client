@@ -231,7 +231,7 @@ public final class ResourceFlow {
         // 4. 获取文件清单（从第一个可用镜像）
         reporter.setPhase("download");
         reporter.setStatus("正在获取资源清单…");
-        reporter.log("INFO", "使用线路：" + selectedLine + "，镜像数=" + mirrors.size());
+        reporter.log("INFO", "下载线路已选定，镜像数=" + mirrors.size());
 
         List<S3List.Entry> entries = fetchManifest(mirrors, dlInfo.resourceToken);
         entries = filterHotUpdateFiles(entries);   // js/scenario 由热更新单独处理
@@ -270,13 +270,13 @@ public final class ResourceFlow {
         for (String mirror : mirrors) {
             try {
                 String url = mirror.endsWith("/") ? mirror : mirror + "/";
-                reporter.log("INFO", "拉取清单：" + url);
+                reporter.log("INFO", "正在拉取资源清单…");
                 String xml = Net.getStringWithToken(url, resourceToken, 20_000);
                 List<S3List.Entry> result = S3List.parse(xml);
                 if (!result.isEmpty()) return result;
                 reporter.log("WARN", "清单 XML 解析结果为空，尝试下一个镜像");
             } catch (Exception e) {
-                reporter.log("WARN", "清单拉取失败(" + mirror + "): " + e.getMessage());
+                reporter.log("WARN", "清单拉取失败，尝试下一个镜像：" + e.getMessage());
                 last = e;
             }
         }
@@ -389,8 +389,7 @@ public final class ResourceFlow {
                             if (state.switchPending && !reporter.isCancelled()) {
                                 // 服务端心跳触发换线：清标志，用新镜像重试
                                 state.switchPending = false;
-                                reporter.log("INFO",
-                                        "心跳换线: " + entry.key + " → " + state.currentMirror);
+                                reporter.log("INFO", "心跳换线: " + entry.key);
                                 // 继续 while 循环，用更新后的 currentMirror 重试
                             } else {
                                 // 真实网络错误或用户取消
@@ -569,7 +568,7 @@ public final class ResourceFlow {
             ClientInit.OfflinePackageInfo pkg = ClientInit.fetchOfflinePackage(ctx, sessionToken);
             cloudUrl     = pkg.downloadUrl;
             cloudVersion = pkg.packageVersion;
-            reporter.log("INFO", "云端离线包版本=" + cloudVersion + "，URL=" + cloudUrl);
+            reporter.log("INFO", "云端离线包版本=" + cloudVersion);
         } catch (Throwable t) {
             reporter.log("WARN", "获取云端离线包信息失败（忽略）: " + t.getMessage());
         }
@@ -885,7 +884,7 @@ public final class ResourceFlow {
         while (true) {
             if (zipFile.exists()) zipFile.delete();
             String downloadUrl = state.currentMirror;
-            reporter.log("热更", "INFO", "[" + fileName + "] 开始下载：" + downloadUrl);
+            reporter.log("热更", "INFO", "[" + fileName + "] 开始下载");
 
             Net.ProgressSink sink = new Net.ProgressSink() {
                 @Override public void onProgress(long soFar, long total, long bps) {
@@ -911,8 +910,7 @@ public final class ResourceFlow {
                 if (state.switchPending && !reporter.isCancelled()) {
                     // 心跳触发换线：清标志，用新 URL 重试
                     state.switchPending = false;
-                    reporter.log("热更", "INFO",
-                            "[" + fileName + "] 心跳换线 → " + state.currentMirror);
+                    reporter.log("热更", "INFO", "[" + fileName + "] 心跳换线，重试下载");
                 } else {
                     state.status = DownloadState.Status.FAILED;
                     reporter.log("热更", "WARN", "[" + fileName + "] 下载失败：" + e.getMessage());

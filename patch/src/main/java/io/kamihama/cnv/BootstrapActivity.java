@@ -1356,8 +1356,9 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         }
         ui.post(() -> {
             if (logModal != null && logModal.getVisibility() == View.VISIBLE) {
+                boolean atBottom = isAtLogBottom();
                 renderLogModal();
-                vLogScroll.post(() -> vLogScroll.fullScroll(View.FOCUS_DOWN));
+                if (atBottom) vLogScroll.post(() -> vLogScroll.fullScroll(View.FOCUS_DOWN));
             }
         });
     }
@@ -1506,6 +1507,15 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     }
 
     /**
+     * 检查日志 ScrollView 当前是否已滚动到底部（或距底部在 32dp 以内）。
+     * 在 UI 线程调用；用于决定新日志到来时是否自动追底。
+     */
+    private boolean isAtLogBottom() {
+        if (vLogScroll == null || vLogFull == null) return true;
+        return vLogScroll.getScrollY() + vLogScroll.getHeight() + dp(32) >= vLogFull.getHeight();
+    }
+
+    /**
      * 检查资源就绪 flag 文件是否存在。
      * 同时兼容旧版 flag 路径（迁移期）。
      */
@@ -1585,7 +1595,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         };
 
         try {
-            log("更新", "INFO", "开始下载客户端更新：" + url);
+            log("更新", "INFO", "开始下载客户端更新");
             Net.downloadResume(url, apkFile, -1L, 30_000, sink);
             log("更新", "INFO", "更新 APK 下载完成，大小：" + apkFile.length() + " 字节");
         } catch (Exception e) {
@@ -1692,7 +1702,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
      * 全部检查通过返回 true；任何一项命中时已弹 FATAL 框，返回 false。
      */
     private boolean handleCloudInit() {
-        log("握手", "INFO", "向 " + CloudEndpoint.CLIENT_INIT + " 发起握手请求…");
+        log("握手", "INFO", "向云端握手接口发起请求…");
         ClientInit.Response init;
         try {
             init = ClientInit.fetch(this, ResourceFlow.BUILD_VERSION);
@@ -1700,8 +1710,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             log("握手", "ERROR", "握手请求失败：" + t.getClass().getSimpleName()
                     + (t.getMessage() != null ? "：" + t.getMessage() : ""));
             showFatalAndExit("无法联系服务器",
-                    "客户端启动需要先和云端 init 接口握手，但本次请求失败了。\n\n"
-                  + "API：" + CloudEndpoint.CLIENT_INIT + "\n"
+                    "客户端启动需要先和云端握手，但本次请求失败了。\n\n"
                   + "错误：" + t.getClass().getSimpleName()
                   + (t.getMessage() != null ? (": " + t.getMessage()) : "")
                   + "\n\n请检查网络后重试。");
@@ -2336,8 +2345,9 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         }
         ui.post(() -> {
             if (logModal != null && logModal.getVisibility() == View.VISIBLE) {
+                boolean atBottom = isAtLogBottom();
                 renderLogModal();
-                vLogScroll.post(() -> vLogScroll.fullScroll(View.FOCUS_DOWN));
+                if (atBottom) vLogScroll.post(() -> vLogScroll.fullScroll(View.FOCUS_DOWN));
             }
         });
     }
@@ -2533,7 +2543,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                     try {
                         startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(cloudUrl))
                                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
-                        log("离线包", "INFO", "已打开浏览器下载离线包：" + cloudUrl);
+                        log("离线包", "INFO", "已打开浏览器下载离线包");
                     } catch (Throwable t) {
                         Toast.makeText(BootstrapActivity.this,
                                 "无法打开浏览器：" + t.getMessage(), Toast.LENGTH_SHORT).show();
