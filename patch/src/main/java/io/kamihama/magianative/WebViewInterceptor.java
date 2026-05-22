@@ -1,12 +1,16 @@
 package io.kamihama.magianative;
 
+import android.content.Context;
 import android.util.Log;
+import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.webkit.WebView;
 
+import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 
 /**
  * WebView 补丁集中地，由 smali 补丁 (WebViewImpl$WebViewClientImpl) 调用。
@@ -25,6 +29,65 @@ public class WebViewInterceptor {
 
     private static final String TAG       = "MagiaHook-URL";
     private static final String LOCAL_DIR = "/data/data/io.kamihama.totentanz/files/magica/";
+
+    // ── JS 桥安装 ──────────────────────────────────────────────────────────────
+
+    /**
+     * 在 WebView 初始化完成后调用，注入 CnvBridge JavascriptInterface。
+     * 由 WebViewImpl smali 补丁在 addJavascriptInterface("androidCommand") 之后调用。
+     */
+    public static void installJsBridge(WebView view) {
+        Context ctx = view.getContext().getApplicationContext();
+        String accountId;
+        try {
+            accountId = io.kamihama.cnv.DeviceId.get(ctx);
+        } catch (Throwable t) {
+            accountId = "default";
+        }
+        CnvJsBridge bridge = new CnvJsBridge(PlayerStateCache.get(ctx), accountId);
+        view.addJavascriptInterface(bridge, "CnvBridge");
+    }
+
+    // ── 完整请求拦截（含 GET API 缓存注入）──────────────────────────────────────
+
+    /**
+     * 带 WebResourceRequest 的拦截入口，由 smali 补丁的
+     * shouldInterceptRequest(WebView, WebResourceRequest) 调用。
+     *
+     * 相比 String 版多了一个能力：对 GET /magica/api/user/ 请求，
+     * 优先从 SQLite 返回上次 POST 确认的玩家状态，解决回放时序问题。
+     */
+    public static WebResourceResponse interceptFull(WebView view, WebResourceRequest request) {
+        String url    = request.getUrl().toString();
+        String method = request.getMethod();
+
+        if ("GET".equals(method) && url.contains("/magica/api/user/")) {
+            String endpoint = normalizeEndpoint(url);
+            String accountId;
+            try {
+                accountId = io.kamihama.cnv.DeviceId.get(view.getContext());
+            } catch (Throwable t) {
+                accountId = "default";
+            }
+            String cached = PlayerStateCache.get(view.getContext())
+                                            .loadRespJson(accountId, endpoint);
+            if (cached != null) {
+                Log.i("MagiaHook-Cache", "GET hit: " + endpoint);
+                return new WebResourceResponse(
+                    "application/json", "utf-8",
+                    new ByteArrayInputStream(cached.getBytes(StandardCharsets.UTF_8)));
+            }
+        }
+
+        return intercept(view, url);
+    }
+
+    /** 去掉 scheme+host 和 query string，与 JS 侧规范化逻辑保持一致。 */
+    private static String normalizeEndpoint(String url) {
+        String path = url.replaceAll("\\?.*$", "");
+        int idx = path.indexOf("/magica/");
+        return idx >= 0 ? path.substring(idx) : path;
+    }
 
     /** cnv_shadow.js 注入片段，避免重复加载。 */
     private static final String SHADOW_JS =

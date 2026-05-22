@@ -222,6 +222,8 @@
 
     invoke-virtual {p0, p1, v0}, Ljp/f4samurai/web/WebViewImpl;->addJavascriptInterface(Ljava/lang/Object;Ljava/lang/String;)V
 
+    invoke-static {p0}, Lio/kamihama/magianative/WebViewInterceptor;->installJsBridge(Landroid/webkit/WebView;)V
+
     return-void
 .end method
 
