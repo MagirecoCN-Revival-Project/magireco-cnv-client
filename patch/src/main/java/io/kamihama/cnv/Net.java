@@ -521,7 +521,8 @@ public final class Net {
 
     /**
      * 打开一个统一配置好超时、UA、跟随重定向的 HttpURLConnection。
-     * 若目标为 HTTPS 且主机在 {@link CertPin} 白名单内，自动安装 Pin 验证。
+     * HTTPS 连接由 Android 系统 TLS 栈处理（CA 证书链 + 域名验证），
+     * 与浏览器安全级别一致，无需额外配置。
      */
     private static HttpURLConnection openConnection(String url, int timeoutMs) throws IOException {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
@@ -530,9 +531,6 @@ public final class Net {
         c.setInstanceFollowRedirects(true);
         c.setRequestProperty("User-Agent", UA);
         c.setRequestProperty("Accept", "*/*");
-        if (c instanceof javax.net.ssl.HttpsURLConnection) {
-            CertPin.applyIfNeeded((javax.net.ssl.HttpsURLConnection) c);
-        }
         return c;
     }
 }
