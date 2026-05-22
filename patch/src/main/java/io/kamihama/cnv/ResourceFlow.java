@@ -741,8 +741,28 @@ public final class ResourceFlow {
         android.content.SharedPreferences prefs =
                 ctx.getSharedPreferences(HOT_UPDATE_PREFS, 0);
 
-        applyHotPatch(0, "cn_js_update.zip",      info.js,       prefs, KEY_JS_VER);
-        applyHotPatch(1, "cn_scenario_update.zip", info.scenario, prefs, KEY_SC_VER);
+        // 心跳：热更新无镜像切换，但服务端仍可检测封禁
+        ConcurrentHashMap<String, DownloadState> fileStates = new ConcurrentHashMap<>();
+        fileStates.put("cn_js_update.zip",
+                new DownloadState("cn_js_update.zip", ""));
+        fileStates.put("cn_scenario_update.zip",
+                new DownloadState("cn_scenario_update.zip", ""));
+
+        String deviceId;
+        try { deviceId = DeviceId.get(ctx); } catch (Throwable t) { deviceId = ""; }
+        HeartbeatSender hb = new HeartbeatSender(fileStates, deviceId, sessionToken);
+        Thread hbThread = new Thread(hb, "cnv-hb-hot");
+        hbThread.setDaemon(true);
+        hbThread.start();
+
+        try {
+            applyHotPatch(0, "cn_js_update.zip",      info.js,       prefs, KEY_JS_VER,
+                    fileStates.get("cn_js_update.zip"));
+            applyHotPatch(1, "cn_scenario_update.zip", info.scenario, prefs, KEY_SC_VER,
+                    fileStates.get("cn_scenario_update.zip"));
+        } finally {
+            hb.stop();
+        }
 
         reporter.setStatus("热更新检查完成");
         reporter.log("热更", "INFO", "热更新检查完成");
@@ -750,7 +770,8 @@ public final class ResourceFlow {
 
     private void applyHotPatch(int slot, String fileName,
                                 ClientInit.HotUpdateInfo.Entry entry,
-                                android.content.SharedPreferences prefs, String versionKey) {
+                                android.content.SharedPreferences prefs, String versionKey,
+                                DownloadState state) {
         int localVer  = prefs.getInt(versionKey, 0);
         int serverVer = entry.version;
         reporter.log("热更", "INFO",
@@ -758,17 +779,20 @@ public final class ResourceFlow {
 
         if (serverVer <= localVer) {
             reporter.log("热更", "INFO", "[" + fileName + "] 无需更新");
+            state.status = DownloadState.Status.DONE;
             reporter.setSlotPhase(slot, "done");
             return;
         }
         if (entry.downloadUrl == null || entry.downloadUrl.isEmpty()) {
             reporter.log("热更", "WARN", "[" + fileName + "] 服务端未提供下载地址，跳过");
+            state.status = DownloadState.Status.DONE;
             reporter.setSlotPhase(slot, "done");
             return;
         }
 
         reporter.setSlotPhase(slot, "downloading");
         reporter.log("热更", "INFO", "[" + fileName + "] 开始下载：" + entry.downloadUrl);
+        state.status = DownloadState.Status.DOWNLOADING;
 
         File zipFile = new File(ctx.getCacheDir(), "cnv_hot_" + slot + ".zip");
         if (zipFile.exists()) zipFile.delete();
@@ -776,6 +800,9 @@ public final class ResourceFlow {
         Net.ProgressSink sink = new Net.ProgressSink() {
             @Override
             public void onProgress(long soFar, long total, long bps) {
+                state.soFar = soFar;
+                state.total = total > 0 ? total : -1L;
+                state.bps   = bps;
                 reporter.setSlot(slot, fileName, soFar, total, bps);
             }
             @Override public boolean isCancelled() { return reporter.isCancelled(); }
@@ -785,6 +812,7 @@ public final class ResourceFlow {
             Net.downloadResume(entry.downloadUrl, zipFile, -1L, 30_000, sink);
         } catch (java.io.IOException e) {
             reporter.log("热更", "WARN", "[" + fileName + "] 下载失败：" + e.getMessage());
+            state.status = DownloadState.Status.FAILED;
             reporter.setSlotPhase(slot, "failed");
             zipFile.delete();
             return;
@@ -795,6 +823,7 @@ public final class ResourceFlow {
             if (!entry.md5.equalsIgnoreCase(actual)) {
                 reporter.log("热更", "WARN", "[" + fileName + "] MD5 校验失败"
                         + "（期望=" + entry.md5 + " 实际=" + actual + "），跳过");
+                state.status = DownloadState.Status.FAILED;
                 reporter.setSlotPhase(slot, "failed");
                 zipFile.delete();
                 return;
@@ -809,12 +838,14 @@ public final class ResourceFlow {
             unzipHotPatch(zipFile, ctx.getFilesDir());
         } catch (java.io.IOException e) {
             reporter.log("热更", "WARN", "[" + fileName + "] 解压失败：" + e.getMessage());
+            state.status = DownloadState.Status.FAILED;
             reporter.setSlotPhase(slot, "failed");
             zipFile.delete();
             return;
         }
 
         zipFile.delete();
+        state.status = DownloadState.Status.DONE;
         prefs.edit().putInt(versionKey, serverVer).apply();
         reporter.setSlotPhase(slot, "done");
         reporter.log("热更", "INFO", "[" + fileName + "] 更新完成，版本=" + serverVer);
