@@ -228,7 +228,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
 
     // ---- 贡献者数据 ----
     /**
-     * 贡献者条目：圆形头像颜色 + 名字（将显示为大写粗体）+ 贡献说明 + 主页 URL。
+     * 贡献者条目：圆形头像颜色 + 名字（粗体，保留原始大小写）+ 贡献说明 + 主页 URL。
      * 头像显示名字首字，颜色与设计文档中署名颜色一致。
      */
     private static final Object[][] CONTRIBUTORS = {
@@ -825,9 +825,9 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         avLp.rightMargin = dp(8);
         nameRow.addView(avatar, avLp);
 
-        // 名字（大写 + 粗体）
+        // 名字（粗体，保留原始大小写）
         TextView vName = new TextView(this);
-        vName.setText(name.toUpperCase(Locale.US));
+        vName.setText(name);
         vName.setTextColor(avatarColor);
         vName.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f);
         vName.setTypeface(vName.getTypeface(), Typeface.BOLD);

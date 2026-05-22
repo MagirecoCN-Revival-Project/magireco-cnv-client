@@ -123,7 +123,7 @@ public final class CloudEndpoint {
      *
      * @see <a href="https://github.com/xyTom/cap-worker">cap-worker</a>
      */
-    public static final String CAP_WORKER_URL = "https://captcha.gurl.eu.org";
+    public static final String CAP_WORKER_URL = "https://captcha.magireco.top";
 
     private CloudEndpoint() {}
 }
