@@ -742,20 +742,40 @@ public final class ResourceFlow {
         }
 
         reporter.setStatus("正在下载 " + name + " 热更包…");
+        reporter.setOverallProgress(0, 0);
         reporter.log("热更", "INFO", "[" + name + "] 开始下载：" + entry.downloadUrl);
 
         File zipFile = new File(ctx.getCacheDir(), "cnv_hot_" + name + ".zip");
         if (zipFile.exists()) zipFile.delete();
 
+        Net.ProgressSink sink = new Net.ProgressSink() {
+            @Override
+            public void onProgress(long soFar, long total, long instantSpeedBps) {
+                String dl  = fmtBytes(soFar);
+                String spd = fmtBytes(instantSpeedBps) + "/s";
+                if (total > 0) {
+                    reporter.setStatus("下载 " + name + "：" + dl
+                            + " / " + fmtBytes(total) + "  " + spd);
+                    reporter.setOverallProgress(soFar, total);
+                } else {
+                    reporter.setStatus("下载 " + name + "：" + dl + "  " + spd);
+                }
+            }
+            @Override public boolean isCancelled() { return reporter.isCancelled(); }
+        };
+
         try {
-            Net.downloadResume(entry.downloadUrl, zipFile, -1L, 30_000, null);
+            Net.downloadResume(entry.downloadUrl, zipFile, -1L, 30_000, sink);
         } catch (java.io.IOException e) {
             reporter.log("热更", "WARN", "[" + name + "] 下载失败：" + e.getMessage());
             zipFile.delete();
             return;
         }
 
+        reporter.setOverallProgress(0, 0);
+
         if (entry.md5 != null && !entry.md5.isEmpty()) {
+            reporter.setStatus("校验 " + name + " 完整性…");
             String actual = md5Hex(zipFile);
             if (!entry.md5.equalsIgnoreCase(actual)) {
                 reporter.log("热更", "WARN", "[" + name + "] MD5 校验失败"
@@ -823,6 +843,14 @@ public final class ResourceFlow {
         } catch (Exception e) {
             return "";
         }
+    }
+
+    private static String fmtBytes(long bytes) {
+        if (bytes < 0) return "?";
+        if (bytes < 1024L)             return bytes + " B";
+        if (bytes < 1024L * 1024)      return String.format(Locale.US, "%.1f KB", bytes / 1024.0);
+        if (bytes < 1024L * 1024 * 1024) return String.format(Locale.US, "%.1f MB", bytes / (1024.0 * 1024));
+        return String.format(Locale.US, "%.2f GB", bytes / (1024.0 * 1024 * 1024));
     }
 
     // ── 工具方法 ──────────────────────────────────────────────────────────
