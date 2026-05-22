@@ -414,24 +414,24 @@ jobs:
 
       - name: 🌐 注入 API Host（CNV_API_HOST）
         run: |
-          python3 -c "
-import os, re, sys
-path = 'patch/src/main/java/io/kamihama/cnv/CloudEndpoint.java'
-host = os.environ.get('CNV_API_HOST', '').rstrip('/')
-if not host:
-    print('::error::Secret CNV_API_HOST 未配置，无法构建')
-    sys.exit(1)
-with open(path, 'r', encoding='utf-8') as f:
-    src = f.read()
-src = re.sub(
-    r'(static final String API_HOST\s*=\s*)\"\"',
-    r'\1\"' + host + '\"',
-    src
-)
-with open(path, 'w', encoding='utf-8') as f:
-    f.write(src)
-print('API_HOST 已注入:', host)
-"
+          python3 <<'SCRIPT_END'
+          import os, re, sys
+          path = 'patch/src/main/java/io/kamihama/cnv/CloudEndpoint.java'
+          host = os.environ.get('CNV_API_HOST', '').rstrip('/')
+          if not host:
+              print('::error::Secret CNV_API_HOST 未配置，无法构建')
+              sys.exit(1)
+          with open(path, 'r', encoding='utf-8') as f:
+              src = f.read()
+          src = re.sub(
+              r'(static final String API_HOST\s*=\s*)""',
+              r'\g<1>"' + host + '"',
+              src
+          )
+          with open(path, 'w', encoding='utf-8') as f:
+              f.write(src)
+          print('API_HOST 已注入:', host)
+          SCRIPT_END
         env:
           CNV_API_HOST: ${{ secrets.CNV_API_HOST }}
 
