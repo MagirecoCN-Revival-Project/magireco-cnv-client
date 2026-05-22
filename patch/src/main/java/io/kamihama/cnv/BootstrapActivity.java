@@ -233,7 +233,6 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private static final int           LOG_BUFFER_MAX = 1000;
     private java.io.BufferedWriter     logFileWriter;
     private final Object               logFileLock  = new Object();
-    private Thread                     logcatThread;
     private static final java.text.SimpleDateFormat LOG_TS =
             new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US);
 
@@ -261,7 +260,6 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 .getBoolean(PREF_DARK_MODE, false);
         loadPalette(darkMode);
         openLogFile();
-        startLogcatCapture();
         setContentView(buildLayout());
         initSlots(1);
         log("生命周期", "INFO", "Activity 已创建，主题=" + (darkMode ? "夜间" : "亮色")
@@ -290,7 +288,6 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     protected void onDestroy() {
         super.onDestroy();
         log("生命周期", "INFO", "Activity 销毁，释放所有资源");
-        if (logcatThread != null) logcatThread.interrupt();
         stopBgm();
         stopSfx();
         closeLogFile();
@@ -1373,96 +1370,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         }
     }
 
-    // ── Logcat 捕获 ───────────────────────────────────────────────────────
 
-    /**
-     * 启动后台线程，持续读取本进程的 logcat 输出并注入日志面板。
-     * 使用 {@code --pid} 过滤仅本进程；跳过我们自己 TAG 的条目（已由 log() 写入）。
-     */
-    private void startLogcatCapture() {
-        String pid = String.valueOf(android.os.Process.myPid());
-        logcatThread = new Thread(() -> {
-            try {
-                // -v time 格式：MM-DD HH:MM:SS.mmm Level/Tag(PID): message
-                Process proc = Runtime.getRuntime().exec(
-                        new String[]{"logcat", "--pid=" + pid, "-v", "time"});
-                java.io.BufferedReader br = new java.io.BufferedReader(
-                        new java.io.InputStreamReader(proc.getInputStream(), "UTF-8"));
-                String line;
-                while (!Thread.currentThread().isInterrupted()
-                        && (line = br.readLine()) != null) {
-                    ingestLogcatLine(line);
-                }
-                proc.destroy();
-            } catch (Throwable ignore) {}
-        }, "cnv-logcat");
-        logcatThread.setDaemon(true);
-        logcatThread.start();
-    }
-
-    /**
-     * 解析一行 logcat（-v time 格式）并写入日志缓冲区。
-     * 格式示例：{@code 05-22 14:23:45.123 I/SomeTag(1234): 消息}
-     */
-    private void ingestLogcatLine(String line) {
-        if (line == null || line.length() < 20) return;
-        if (line.startsWith("---------")) return; // 日志分组分隔符
-
-        // 位置 19 是 Level 字符，格式 "MM-DD HH:MM:SS.mmm L/..."
-        char levelChar = line.charAt(19);
-        String lvl;
-        switch (levelChar) {
-            case 'W': lvl = "WARN";  break;
-            case 'E': case 'F': lvl = "ERROR"; break;
-            case 'V': case 'D': lvl = "INFO";  break;
-            default:  lvl = "INFO";
-        }
-
-        // 提取 Tag：Level/Tag(PID): message → TAG 在 '/' 和 '(' 之间
-        String comp = "系统";
-        String msg  = line;
-        try {
-            int slash = line.indexOf('/', 20);
-            int paren = slash > 0 ? line.indexOf('(', slash) : -1;
-            int colon = paren > 0 ? line.indexOf(':', paren) : -1;
-            if (slash > 0 && paren > slash && colon > paren) {
-                comp = line.substring(slash + 1, paren).trim();
-                msg  = colon + 2 < line.length() ? line.substring(colon + 2) : "";
-            }
-        } catch (Throwable ignore) {}
-
-        // 跳过我们自己 TAG（已经由 log() 写入过 buffer）
-        if (TAG.equals(comp)) return;
-
-        // 补全时间戳：logcat 只给 MM-DD，需要加年份
-        String year    = new java.text.SimpleDateFormat("yyyy", Locale.US)
-                .format(new java.util.Date());
-        String mmdd    = line.substring(0, 5);   // "MM-DD"
-        String hhmmss  = line.length() >= 18
-                ? line.substring(6, 14) : "??:??:??"; // "HH:MM:SS"
-        String fullTs  = "［" + year + "-" + mmdd + " " + hhmmss + "］[" + comp + "][" + lvl + "] " + msg;
-
-        synchronized (logBuffer) {
-            logBuffer.addLast(fullTs);
-            while (logBuffer.size() > LOG_BUFFER_MAX) logBuffer.removeFirst();
-        }
-        synchronized (logFileLock) {
-            if (logFileWriter != null) {
-                try {
-                    logFileWriter.write(fullTs);
-                    logFileWriter.write('\n');
-                    logFileWriter.flush();
-                } catch (Throwable ignore) {}
-            }
-        }
-        ui.post(() -> {
-            if (logModal != null && logModal.getVisibility() == View.VISIBLE) {
-                boolean atBottom = isAtLogBottom();
-                renderLogModal();
-                if (atBottom) vLogScroll.post(() -> vLogScroll.fullScroll(View.FOCUS_DOWN));
-            }
-        });
-    }
 
     // ======================================================================
     // 后台工作线程
