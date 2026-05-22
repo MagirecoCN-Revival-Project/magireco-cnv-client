@@ -229,16 +229,18 @@ public class SaveOverlayService extends Service {
             if (fatalShown) return;
             fatalShown    = true;
             heartbeatDone = true;
-            String msg = resp.optString("message", "服务器正在维护，请稍后再试。");
+            String rawMsg = resp.optString("message", "服务器正在维护，请稍后再试。");
             long end = resp.optLong("end_time", 0L);
+            String endSuffix = "";
             if (end > 0L) {
                 try {
                     String ts = new java.text.SimpleDateFormat(
                             "yyyy-MM-dd HH:mm", java.util.Locale.getDefault())
                             .format(new java.util.Date(end * 1000L));
-                    msg += "\n预计完成时间：" + ts;
+                    endSuffix = "\n预计完成时间：" + ts;
                 } catch (Throwable ignore) {}
             }
+            final String msg = rawMsg + endSuffix;
             handler.post(() -> showFatalOverlay("服务器维护中", msg));
         }
         // action=ok / switch_mirrors → irrelevant during game phase, ignore
