@@ -9,19 +9,42 @@ import java.io.FileInputStream;
 import java.io.InputStream;
 
 /**
- * WebView 本地资源拦截器。
+ * WebView 补丁集中地，由 smali 补丁 (WebViewImpl$WebViewClientImpl) 调用。
  *
- * 游戏内嵌 WebView 发出含 "/magica/" 路径的请求时，优先从本地
- * /data/data/io.kamihama.totentanz/files/magica/<相对路径> 目录提供文件。
- * 本地文件不存在时，再尝试从 APK assets/cnv/ 提供（供 cnv/ 路径下的内置脚本使用）。
- * 本地文件不存在且非内置路径，或请求路径以 "api/" 开头时，放行由上层走网络。
+ * <p><b>静态文件拦截（{@link #intercept}）：</b>
+ * WebView 发出含 "/magica/" 路径的请求时，优先从本地
+ * {@code /data/data/io.kamihama.totentanz/files/magica/<相对路径>} 提供文件；
+ * 不存在时尝试 APK assets/cnv/；API 请求（{@code api/} 前缀）直接放行走网络。
  *
- * 由 smali 补丁 (WebViewImpl$WebViewClientImpl.shouldInterceptRequest) 调用。
+ * <p><b>页面加载完成（{@link #onPageFinished}）：</b>
+ * 在所有 /magica/ 页面注入 cnv_shadow.js，用于 WebView 编队/昵称/配置的本地备份
+ * 和会话回放。API 级别的文字汉化由同一脚本内的 jQuery 劫持层在内存中完成，
+ * 不依赖本类的文件替换机制。
  */
 public class WebViewInterceptor {
 
     private static final String TAG       = "MagiaHook-URL";
     private static final String LOCAL_DIR = "/data/data/io.kamihama.totentanz/files/magica/";
+
+    /** cnv_shadow.js 注入片段，避免重复加载。 */
+    private static final String SHADOW_JS =
+            "(function(){" +
+            "if(window.__cnvShadowLoaded)return;" +
+            "var s=document.createElement('script');" +
+            "s.src='/magica/cnv/cnv_shadow.js';" +
+            "document.documentElement.appendChild(s);" +
+            "})()";
+
+    /**
+     * 页面加载完成回调：在 /magica/ 页面注入 cnv_shadow.js。
+     *
+     * <p>由 smali 补丁在 {@code onPageFinished} 里调用，调用原始
+     * {@code _didFinishLoading} 之前执行。
+     */
+    public static void onPageFinished(WebView view, String url) {
+        if (url == null || !url.contains("/magica/")) return;
+        view.evaluateJavascript(SHADOW_JS, null);
+    }
 
     /**
      * 尝试拦截请求并返回本地文件响应。
