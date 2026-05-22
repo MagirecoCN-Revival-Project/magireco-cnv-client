@@ -6,13 +6,15 @@ import android.webkit.WebView;
 
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.InputStream;
 
 /**
  * WebView 本地资源拦截器。
  *
  * 游戏内嵌 WebView 发出含 "/magica/" 路径的请求时，优先从本地
  * /data/data/io.kamihama.totentanz/files/magica/<相对路径> 目录提供文件。
- * 本地文件不存在，或请求路径以 "api/" 开头时，放行由上层走网络。
+ * 本地文件不存在时，再尝试从 APK assets/cnv/ 提供（供 cnv/ 路径下的内置脚本使用）。
+ * 本地文件不存在且非内置路径，或请求路径以 "api/" 开头时，放行由上层走网络。
  *
  * 由 smali 补丁 (WebViewImpl$WebViewClientImpl.shouldInterceptRequest) 调用。
  */
@@ -24,7 +26,7 @@ public class WebViewInterceptor {
     /**
      * 尝试拦截请求并返回本地文件响应。
      *
-     * @return 命中本地文件时返回 WebResourceResponse；否则返回 null（由调用方走原始逻辑）。
+     * @return 命中本地文件或 APK asset 时返回 WebResourceResponse；否则返回 null（由调用方走原始逻辑）。
      */
     public static WebResourceResponse intercept(WebView view, String url) {
         Log.i(TAG, url);
@@ -44,18 +46,32 @@ public class WebViewInterceptor {
         Log.i("MagiaHook-Path", localPath);
 
         File localFile = new File(localPath);
-        if (!localFile.exists()) return null;
-
-        Log.i("MagiaHook-Found", localPath);
-
-        String mimeType = guessMimeType(relPath);
-        try {
-            FileInputStream fis = new FileInputStream(localFile);
-            return new WebResourceResponse(mimeType, "utf-8", fis);
-        } catch (Exception e) {
-            Log.e("MagiaHook-Err", e.toString());
-            return null;
+        if (localFile.exists()) {
+            Log.i("MagiaHook-Found", localPath);
+            String mimeType = guessMimeType(relPath);
+            try {
+                FileInputStream fis = new FileInputStream(localFile);
+                return new WebResourceResponse(mimeType, "utf-8", fis);
+            } catch (Exception e) {
+                Log.e("MagiaHook-Err", e.toString());
+                return null;
+            }
         }
+
+        // 本地文件不存在时，尝试从 APK assets 提供（仅限 cnv/ 路径，即内置 CNV 脚本）
+        if (relPath.startsWith("cnv/")) {
+            try {
+                InputStream is = view.getContext().getAssets().open("cnv/" + relPath.substring("cnv/".length()));
+                String mimeType = guessMimeType(relPath);
+                Log.i("MagiaHook-Asset", relPath);
+                return new WebResourceResponse(mimeType, "utf-8", is);
+            } catch (Exception e) {
+                Log.e("MagiaHook-Err", "asset not found: " + relPath);
+                return null;
+            }
+        }
+
+        return null;
     }
 
     private static String guessMimeType(String path) {

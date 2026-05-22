@@ -41,8 +41,19 @@
 
 # virtual methods
 .method public onPageFinished(Landroid/webkit/WebView;Ljava/lang/String;)V
-    .locals 0
+    .locals 2
 
+    # 仅在 /magica/ 页面注入 CNV shadow 脚本
+    const-string v0, "/magica/"
+    invoke-virtual {p2, v0}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z
+    move-result v0
+    if-eqz v0, :skip_shadow
+
+    const-string v0, "(function(){if(window.__cnvShadowLoaded)return;var s=document.createElement(\"script\");s.src=\"/magica/cnv/cnv_shadow.js\";document.documentElement.appendChild(s);})()"
+    const/4 v1, 0x0
+    invoke-virtual {p1, v0, v1}, Landroid/webkit/WebView;->evaluateJavascript(Ljava/lang/String;Landroid/webkit/ValueCallback;)V
+
+    :skip_shadow
     .line 141
     invoke-static {p2}, Ljp/f4samurai/web/WebViewHelper;->_didFinishLoading(Ljava/lang/String;)V
 
