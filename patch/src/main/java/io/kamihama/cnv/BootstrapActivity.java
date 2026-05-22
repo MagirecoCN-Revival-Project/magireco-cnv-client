@@ -1171,11 +1171,16 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     /** 切换 BGM 开/关状态并更新胶囊按钮外观。 */
     private void toggleBgm() {
         bgmMuted = !bgmMuted;
-        log("音频", "INFO", "BGM 状态切换：" + (bgmMuted ? "静音" : "恢复播放"));
+        log("音频", "INFO", "BGM 状态切换：" + (bgmMuted ? "暂停" : "恢复播放"));
         if (bgmMuted) {
-            stopBgm();   // 静音时停止并重置曲目索引（stopBgm 内完成）
+            pauseBgm();
         } else {
-            startBgm();  // 恢复时从 system01 重新开始
+            // bgmPlayer 不为 null → 从断点续播；为 null（曲目衔接间隙或准备中被丢弃）→ 重新开始
+            if (bgmPlayer != null) {
+                resumeBgm();
+            } else {
+                startBgm();
+            }
         }
         updateBgmPill();
     }
@@ -1184,7 +1189,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private void updateBgmPill() {
         if (vBgmPill == null || bgmPillBg == null) return;
         if (bgmMuted) {
-            vBgmPill.setText("♪  静音");
+            vBgmPill.setText("♪  暂停");
             bgmPillBg.setColor(0xAA888888);
         } else {
             vBgmPill.setText("♪  音乐");
