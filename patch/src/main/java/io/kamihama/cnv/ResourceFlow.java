@@ -691,6 +691,140 @@ public final class ResourceFlow {
         return -1L;
     }
 
+    // ── 热更新 ────────────────────────────────────────────────────────────
+
+    private static final String HOT_UPDATE_PREFS = "cnv_hot_update";
+    private static final String KEY_JS_VER       = "js_version";
+    private static final String KEY_SC_VER       = "scenario_version";
+
+    /**
+     * 检查并应用 js / scenario 热更新包。
+     *
+     * <p>每次进游戏前调用，非致命：任何失败均记录警告后跳过，不影响启动流程。
+     */
+    public void runHotUpdate() {
+        reporter.setPhase("hot-update");
+        reporter.setStatus("正在检查热更新…");
+        reporter.log("热更", "INFO", "开始热更新检查");
+
+        ClientInit.HotUpdateInfo info;
+        try {
+            info = ClientInit.fetchHotUpdate(ctx, sessionToken);
+        } catch (Throwable t) {
+            reporter.log("热更", "WARN", "热更新接口请求失败（跳过）：" + t.getMessage());
+            return;
+        }
+
+        android.content.SharedPreferences prefs =
+                ctx.getSharedPreferences(HOT_UPDATE_PREFS, 0);
+
+        applyHotPatch("js",       info.js,       prefs, KEY_JS_VER);
+        applyHotPatch("scenario", info.scenario, prefs, KEY_SC_VER);
+
+        reporter.setStatus("热更新检查完成");
+        reporter.log("热更", "INFO", "热更新检查完成");
+    }
+
+    private void applyHotPatch(String name, ClientInit.HotUpdateInfo.Entry entry,
+                                android.content.SharedPreferences prefs, String versionKey) {
+        int localVer  = prefs.getInt(versionKey, 0);
+        int serverVer = entry.version;
+        reporter.log("热更", "INFO",
+                "[" + name + "] 本地版本=" + localVer + " 服务端版本=" + serverVer);
+
+        if (serverVer <= localVer) {
+            reporter.log("热更", "INFO", "[" + name + "] 无需更新");
+            return;
+        }
+        if (entry.downloadUrl == null || entry.downloadUrl.isEmpty()) {
+            reporter.log("热更", "WARN", "[" + name + "] 服务端未提供下载地址，跳过");
+            return;
+        }
+
+        reporter.setStatus("正在下载 " + name + " 热更包…");
+        reporter.log("热更", "INFO", "[" + name + "] 开始下载：" + entry.downloadUrl);
+
+        File zipFile = new File(ctx.getCacheDir(), "cnv_hot_" + name + ".zip");
+        if (zipFile.exists()) zipFile.delete();
+
+        try {
+            Net.downloadResume(entry.downloadUrl, zipFile, -1L, 30_000, null);
+        } catch (java.io.IOException e) {
+            reporter.log("热更", "WARN", "[" + name + "] 下载失败：" + e.getMessage());
+            zipFile.delete();
+            return;
+        }
+
+        if (entry.md5 != null && !entry.md5.isEmpty()) {
+            String actual = md5Hex(zipFile);
+            if (!entry.md5.equalsIgnoreCase(actual)) {
+                reporter.log("热更", "WARN", "[" + name + "] MD5 校验失败"
+                        + "（期望=" + entry.md5 + " 实际=" + actual + "），跳过");
+                zipFile.delete();
+                return;
+            }
+            reporter.log("热更", "INFO", "[" + name + "] MD5 校验通过");
+        }
+
+        reporter.setStatus("正在解压 " + name + " 热更包…");
+        reporter.log("热更", "INFO", "[" + name + "] 开始解压");
+
+        try {
+            unzipHotPatch(zipFile, ctx.getFilesDir());
+        } catch (java.io.IOException e) {
+            reporter.log("热更", "WARN", "[" + name + "] 解压失败：" + e.getMessage());
+            zipFile.delete();
+            return;
+        }
+
+        zipFile.delete();
+        prefs.edit().putInt(versionKey, serverVer).apply();
+        reporter.log("热更", "INFO", "[" + name + "] 更新完成，版本=" + serverVer);
+    }
+
+    private static void unzipHotPatch(File zipFile, File destDir) throws java.io.IOException {
+        try (java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(
+                new java.io.BufferedInputStream(new java.io.FileInputStream(zipFile)))) {
+            java.util.zip.ZipEntry entry;
+            byte[] buf = new byte[65536];
+            while ((entry = zis.getNextEntry()) != null) {
+                File target = new File(destDir, entry.getName());
+                if (entry.isDirectory()) {
+                    target.mkdirs();
+                } else {
+                    File parent = target.getParentFile();
+                    if (parent != null) parent.mkdirs();
+                    try (java.io.FileOutputStream fos = new java.io.FileOutputStream(target)) {
+                        int n;
+                        while ((n = zis.read(buf)) != -1) fos.write(buf, 0, n);
+                    }
+                }
+                zis.closeEntry();
+            }
+        }
+    }
+
+    private static String md5Hex(File file) {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("MD5");
+            try (java.io.FileInputStream fis = new java.io.FileInputStream(file)) {
+                byte[] buf = new byte[65536];
+                int n;
+                while ((n = fis.read(buf)) != -1) md.update(buf, 0, n);
+            }
+            byte[] hash = md.digest();
+            StringBuilder sb = new StringBuilder(hash.length * 2);
+            for (byte b : hash) {
+                int v = b & 0xff;
+                if (v < 0x10) sb.append('0');
+                sb.append(Integer.toHexString(v));
+            }
+            return sb.toString();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
     // ── 工具方法 ──────────────────────────────────────────────────────────
 
     private void writeReadyFlag() throws java.io.IOException {

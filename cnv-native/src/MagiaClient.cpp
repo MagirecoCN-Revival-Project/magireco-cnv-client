@@ -10,18 +10,12 @@
 //     在 loadLibrary("madomagi_native") 之后链式 loadLibrary("MagiaClient")。
 //   - flag 来源：io.kamihama.cnv.ResourceFlow 在所有资源准备完成、
 //     交还给 BootstrapActivity.launchGame() 之前 touch 这个文件。
-//
-// startCNDownload 的语义：在我们这套 BootstrapActivity 架构下，
-// flag 缺失意味着用户绕过了引导（或被外部清过数据），fallback 是
-// 拉起一个新 BootstrapActivity Intent 让玩家重新走资源准备流程。
 
 #include <jni.h>
 #include <android/log.h>
 #include <shadowhook.h>
 #include <string>
 #include <mutex>
-#include <thread>
-#include <atomic>
 #include <functional>
 #include <unordered_map>
 #include <sys/stat.h>
@@ -34,7 +28,6 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 JavaVM* gJvm = nullptr;
-jclass gBootstrapClass = nullptr;
 
 namespace cocos2d {
     struct Data { unsigned char* _bytes; ssize_t _size; };
@@ -42,13 +35,9 @@ namespace cocos2d {
 
 // 路径与 cnv-bootstrap 那边写出的 flag 保持一致：
 //   <filesDir>/cnv_inject/cn_resources_ready.flag
-// 见 ResourceFlow.markResourcesReady。
-static const std::string BASE_DIR = "/data/data/io.kamihama.totentanz/files/";
-static const std::string FLAG_PATH = BASE_DIR + "cnv_inject/cn_resources_ready.flag";
-
-// 兜底兼容：早期版本 / 历史装机可能把 magica/cn_base_done.flag 当成
-// 完成标志，存在就照样静默引擎下载流程。任意一个存在即视为就绪。
-static const std::string LEGACY_FLAG_PATH = BASE_DIR + "madomagi/magica/cn_base_done.flag";
+// 见 ResourceFlow.writeReadyFlag。
+static const std::string FLAG_PATH =
+    "/data/data/io.kamihama.totentanz/files/cnv_inject/cn_resources_ready.flag";
 
 // ─── 函数指针 ────────────────────────────────────────────
 bool (*checkParseJsonOld)(void*, const cocos2d::Data&) = nullptr;
@@ -90,9 +79,8 @@ static bool fileExists(const std::string& p) {
     return stat(p.c_str(), &st) == 0;
 }
 
-// 资源是否就绪：当前 flag 或历史 flag 任一存在即视为已装好汉化资源。
 static bool resourcesReady() {
-    return fileExists(FLAG_PATH) || fileExists(LEGACY_FLAG_PATH);
+    return fileExists(FLAG_PATH);
 }
 
 static JNIEnv* attachEnv(bool& attached) {
@@ -105,33 +93,6 @@ static JNIEnv* attachEnv(bool& attached) {
     return env;
 }
 
-// ─── flag 缺失时的 fallback：踢回 BootstrapActivity ───────
-static std::atomic<bool> g_downloadTriggered(false);
-
-static void triggerCNDownload(const char* reason) {
-    bool exp = false;
-    if (!g_downloadTriggered.compare_exchange_strong(exp, true)) return;
-    LOGI("[trigger] flag 缺失，准备拉起 BootstrapActivity reason=%s", reason);
-    std::thread([]() {
-        bool att = false;
-        JNIEnv* env = attachEnv(att);
-        if (!env || !gBootstrapClass) {
-            g_downloadTriggered.store(false);
-            if (att) gJvm->DetachCurrentThread();
-            return;
-        }
-        jmethodID mid = env->GetStaticMethodID(gBootstrapClass, "startCNDownload", "()V");
-        if (env->ExceptionCheck()) env->ExceptionClear();
-        if (mid) {
-            env->CallStaticVoidMethod(gBootstrapClass, mid);
-            if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
-        } else {
-            LOGE("[trigger] BootstrapActivity.startCNDownload 不存在，无法回退");
-            g_downloadTriggered.store(false);
-        }
-        if (att) gJvm->DetachCurrentThread();
-    }).detach();
-}
 
 // ════════════════════════════════════════════════════════
 // DownloadSceneLayerInfo::ctor — 截获 std::function<void()> 副本
@@ -233,7 +194,7 @@ static cocos2d::Data g_emptyData{ (unsigned char*)"[]", 2 };
 
 bool checkParseJsonNew(void* _this, const cocos2d::Data& data) {
     if (!resourcesReady()) {
-        if (!g_downloadTriggered.load()) triggerCNDownload("checkParseJson");
+        LOGE("[checkParseJson] flag 缺失，返回空列表");
         return checkParseJsonOld(_this, g_emptyData);
     }
     if (data._bytes && data._size > 0) {
@@ -293,7 +254,7 @@ void mainSceneOnRespNew(void* _this, void* session, void* resp) {
 void mainSceneOnErrNew(void* _this, void* session, int code) {
     LOGI("[MainScene::onErr] code=%d ready=%d", code, (int)resourcesReady());
     if (!resourcesReady()) {
-        if (!g_downloadTriggered.load()) triggerCNDownload("mainSceneErr");
+        LOGE("[MainScene::onErr] flag 缺失，静默丢弃错误 code=%d", code);
         return;
     }
     mainSceneOnErrOld(_this, session, code);
@@ -337,22 +298,6 @@ extern "C" jint JNI_OnLoad(JavaVM* vm, void* reserved) {
 
     JNIEnv* env = nullptr;
     if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) return JNI_ERR;
-
-    // 拉到 BootstrapActivity 用于 fallback：flag 缺失时静态调用
-    // io.kamihama.cnv.BootstrapActivity.startCNDownload() 来重启引导流程。
-    jclass bs = env->FindClass("io/kamihama/cnv/BootstrapActivity");
-    if (env->ExceptionCheck()) { env->ExceptionClear(); bs = nullptr; }
-    if (bs) {
-        gBootstrapClass = (jclass)env->NewGlobalRef(bs);
-        env->DeleteLocalRef(bs);
-        LOGI("[JNI] ✓ BootstrapActivity 找到");
-        jmethodID mid = env->GetStaticMethodID(gBootstrapClass, "startCNDownload", "()V");
-        if (env->ExceptionCheck()) env->ExceptionClear();
-        if (mid) LOGI("[JNI] ✓ startCNDownload mid=%p", mid);
-        else     LOGE("[JNI] ✗ startCNDownload 不存在");
-    } else {
-        LOGE("[JNI] ✗ BootstrapActivity 找不到（仅影响 fallback 路径）");
-    }
 
     const char* LIB = "libmadomagi_native.so";
 
@@ -449,10 +394,6 @@ extern "C" jint JNI_OnLoad(JavaVM* vm, void* reserved) {
         }
     }
 
-    // 与原版不同：我们这套架构下，引擎 .so 是在 BootstrapActivity
-    // finish + AppActivity onCreate 之后才被加载的，那时资源早已
-    // 装好 + flag 已经写好。所以这里不主动调 startCNDownload，仅
-    // 由各 hook 在「flag 缺失」分支里按需触发兜底（极少触发）。
     LOGI("[JNI] hooks 安装完成，等待引擎调用");
     return JNI_VERSION_1_6;
 }

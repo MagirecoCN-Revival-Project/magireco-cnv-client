@@ -80,5 +80,21 @@ public final class CloudEndpoint {
      */
     public static final String CLIENT_HEARTBEAT = "https://api.magi-reco.top/client/heartbeat";
 
+    /**
+     * 热更新版本检查接口。每次进游戏前调用，检查 js / scenario 包是否有新版本。
+     *
+     * <p>请求：POST，{@code application/json}。Body：auth triple。
+     *
+     * <p>响应 schema：
+     * <pre>
+     * {
+     *   "js":       { "version": 3, "md5": "abc...", "download_url": "https://..." },
+     *   "scenario": { "version": 5, "md5": "def...", "download_url": "https://..." }
+     * }
+     * </pre>
+     * version 为服务端整数版本号，客户端本地版本存于 SharedPreferences cnv_hot_update。
+     */
+    public static final String CLIENT_HOT_UPDATE = "https://api.magi-reco.top/client/hot-update";
+
     private CloudEndpoint() {}
 }

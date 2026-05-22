@@ -63,29 +63,6 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     public static final String TAG = "CNVBoot";
     public static final String GAME_ACTIVITY = "jp.f4samurai.AppActivity";
 
-    /**
-     * Native 兜底入口：{@code libMagiaClient.so} 在 flag 缺失时通过 JNI 反向调用。
-     * 用 ActivityThread 反射取 Application context，避免持有静态 Activity 引用。
-     */
-    public static void startCNDownload() {
-        try {
-            Class<?> at = Class.forName("android.app.ActivityThread");
-            Object app = at.getMethod("currentApplication").invoke(null);
-            if (app == null) {
-                android.util.Log.e(TAG, "startCNDownload: 无法取到 Application");
-                return;
-            }
-            Context ctx = (Context) app;
-            Intent it = new Intent(ctx, BootstrapActivity.class);
-            it.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
-            ctx.startActivity(it);
-            android.util.Log.i(TAG, "startCNDownload: 已拉起 BootstrapActivity，杀掉引擎进程");
-            android.os.Process.killProcess(android.os.Process.myPid());
-        } catch (Throwable t) {
-            android.util.Log.e(TAG, "startCNDownload fallback 失败: " + t.getMessage(), t);
-        }
-    }
-
     // ---- 常量 ----
     private static final int    REQ_FILE_PICK     = 0x4D47;
     private static final String PREFS_NAME        = "cnv_bootstrap_ui";
@@ -1433,9 +1410,11 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         log("启动", "INFO", "开始与云端握手…");
         if (!handleCloudInit()) return;
 
-        // 第 0e 步：资源已齐则直接启动游戏
+        // 第 0e 步：资源已齐则跳过下载，直接检查热更新
         if (alreadyReady) {
-            log("启动", "INFO", "资源已就绪，直接启动游戏");
+            log("启动", "INFO", "资源已就绪，跳过下载，检查热更新");
+            new ResourceFlow(this, this, ResourceFlow.MODE_ONLINE, sessionToken).runHotUpdate();
+            log("启动", "INFO", "热更新检查完成，启动游戏");
             ui.post(this::launchGame);
             return;
         }
@@ -1453,7 +1432,11 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             ui.post(() -> showFatal(t));
             return;
         }
-        log("启动", "INFO", "资源流程完成，即将启动游戏");
+
+        // 第 0g 步：首次下载完成后同样检查热更新（包可能刚发布就有更新）
+        log("启动", "INFO", "资源流程完成，检查热更新");
+        new ResourceFlow(this, this, ResourceFlow.MODE_ONLINE, sessionToken).runHotUpdate();
+        log("启动", "INFO", "热更新检查完成，即将启动游戏");
         ui.post(this::launchGame);
     }
 

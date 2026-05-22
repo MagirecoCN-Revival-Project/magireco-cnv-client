@@ -52,6 +52,18 @@ public final class ClientInit {
         public String md5;
     }
 
+    /** /client/hot-update 响应：js 包和 scenario 包各自的版本 / MD5 / 下载地址。 */
+    public static final class HotUpdateInfo {
+        public static final class Entry {
+            /** 服务端版本号（整数递增）；0 表示服务端未返回。 */
+            public int    version;
+            public String md5;
+            public String downloadUrl;
+        }
+        public Entry js       = new Entry();
+        public Entry scenario = new Entry();
+    }
+
     /**
      * 同步发送握手请求，返回解析后的 {@link Response}。
      *
@@ -159,6 +171,36 @@ public final class ClientInit {
         info.downloadUrl    = obj.optString("download_url",    null);
         info.packageVersion = obj.optString("package_version", null);
         info.md5            = obj.optString("md5",             null);
+        return info;
+    }
+
+    /**
+     * 获取热更新版本信息（js + scenario 两个包）。
+     *
+     * <p>失败时抛异常；调用方应视为非致命错误，记录日志后跳过热更。
+     *
+     * @param sessionToken 握手阶段获取的会话令牌
+     * @throws Exception   网络错误 / HTTP &ge; 400
+     */
+    public static HotUpdateInfo fetchHotUpdate(Context ctx, String sessionToken) throws Exception {
+        String raw = Net.postJson(CloudEndpoint.CLIENT_HOT_UPDATE,
+                authTriple(ctx, sessionToken).toString(), 15_000);
+        HotUpdateInfo info = new HotUpdateInfo();
+        if (raw == null || raw.isEmpty()) return info;
+        JSONObject obj = new JSONObject(raw);
+
+        JSONObject js = obj.optJSONObject("js");
+        if (js != null) {
+            info.js.version     = js.optInt("version",      0);
+            info.js.md5         = js.optString("md5",         null);
+            info.js.downloadUrl = js.optString("download_url", null);
+        }
+        JSONObject sc = obj.optJSONObject("scenario");
+        if (sc != null) {
+            info.scenario.version     = sc.optInt("version",      0);
+            info.scenario.md5         = sc.optString("md5",         null);
+            info.scenario.downloadUrl = sc.optString("download_url", null);
+        }
         return info;
     }
 
