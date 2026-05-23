@@ -943,6 +943,9 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                         java.net.URL base = new java.net.URL(url);
                         loc = base.getProtocol() + "://" + base.getHost() + loc;
                     }
+                    // C-H2: 只允许 HTTPS 重定向，拒绝降级到 http:// 或其他协议
+                    java.net.URL nextUrl = new java.net.URL(loc);
+                    if (!"https".equals(nextUrl.getProtocol())) return null;
                     url = loc;
                     continue;                       // finally 负责 disconnect
                 }
@@ -1681,11 +1684,35 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         }
     }
 
+    /** 计算文件 SHA-256，返回 64 位小写十六进制字符串；失败抛 IOException。 */
+    private static String sha256HexOfFile(java.io.File file) throws java.io.IOException {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            try (java.io.FileInputStream fis = new java.io.FileInputStream(file)) {
+                byte[] buf = new byte[65536];
+                int n;
+                while ((n = fis.read(buf)) != -1) md.update(buf, 0, n);
+            }
+            byte[] hash = md.digest();
+            StringBuilder sb = new StringBuilder(hash.length * 2);
+            for (byte b : hash) {
+                int v = b & 0xff;
+                if (v < 0x10) sb.append('0');
+                sb.append(Integer.toHexString(v));
+            }
+            return sb.toString();
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new java.io.IOException("SHA-256 算法不可用", e);
+        }
+    }
+
     /**
      * 下载新版客户端 APK 并启动系统安装器。在工作线程调用。
      * 下载成功后通过 UpdateProvider 把文件 URI 传给安装器，然后退出 Activity。
+     *
+     * @param expectedSha256 服务端下发的 APK SHA-256（64 位小写十六进制）；null 表示未提供（仅告警）
      */
-    private void downloadAndInstallClientUpdate(String url) {
+    private void downloadAndInstallClientUpdate(String url, String expectedSha256) {
         setPhase("client-update");
         setStatus("准备下载更新…");
         ui.post(() -> {
@@ -1718,6 +1745,30 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         }
 
         setSlotPhase(0, "done");
+
+        // C-C1: 安装前校验 SHA-256，防止服务端被接管后推送恶意 APK
+        if (expectedSha256 != null && expectedSha256.matches("[0-9a-fA-F]{64}")) {
+            setStatus("正在校验 APK 完整性…");
+            try {
+                String actual = sha256HexOfFile(apkFile);
+                if (!actual.equalsIgnoreCase(expectedSha256)) {
+                    apkFile.delete();
+                    log("更新", "ERROR", "APK SHA-256 不匹配：期望=" + expectedSha256 + " 实际=" + actual);
+                    showFatalAndExit("更新校验失败",
+                            "下载到的客户端 APK 哈希与服务端不符，已拒绝安装。\n\n请稍后重试或联系管理员。");
+                    return;
+                }
+                log("更新", "INFO", "APK SHA-256 校验通过：" + actual);
+            } catch (Exception e) {
+                apkFile.delete();
+                log("更新", "ERROR", "APK SHA-256 计算失败：" + e.getMessage());
+                showFatalAndExit("更新校验失败", "无法计算更新文件哈希值：" + e.getMessage());
+                return;
+            }
+        } else {
+            log("更新", "WARN", "服务端未提供可验证的 SHA-256，跳过完整性校验");
+        }
+
         setStatus("正在启动安装器…");
         log("更新", "INFO", "正在启动系统安装器");
 
@@ -1880,7 +1931,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                     + " 已不在服务端允许的版本列表内。\n\n请下载最新"
                     + channelName + " APK 后再启动。";
                 if (askUserWantsInAppUpdate("客户端需要更新", msg)) {
-                    downloadAndInstallClientUpdate(url);
+                    downloadAndInstallClientUpdate(url, init.updateApkSha256);
                 } else {
                     ui.post(() -> {
                         try { finishAndRemoveTask(); } catch (Throwable ignore) {}
@@ -2140,7 +2191,15 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             it.setClassName(getPackageName(), GAME_ACTIVITY);
             it.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
             Intent orig = getIntent();
-            if (orig != null && orig.getData() != null) it.setData(orig.getData());
+            if (orig != null && orig.getData() != null) {
+                // C-M1: 只转发白名单 scheme 的 deep-link，拒绝 http/file/content 等
+                String scheme = orig.getData().getScheme();
+                if ("magireco.com".equals(scheme) || "magireco.reward".equals(scheme)) {
+                    it.setData(orig.getData());
+                } else if (scheme != null) {
+                    log("启动", "WARN", "拒绝非白名单 deep-link scheme: " + scheme);
+                }
+            }
             startActivity(it);
             log("启动", "INFO", "游戏 Activity 已启动，BootstrapActivity 退出");
             finish();

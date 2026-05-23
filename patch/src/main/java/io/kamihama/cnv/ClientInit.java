@@ -29,6 +29,8 @@ public final class ClientInit {
         public List<String> allowedVersions       = new ArrayList<>();
         public String       updateUrlNormal;
         public String       updateUrlInternalTest;
+        /** 更新 APK 的 SHA-256（64 位小写十六进制）；null 表示服务端未提供。 */
+        public String       updateApkSha256;
         /** 向游戏 native 层伪造的版本号；null 表示服务端未配置，退化为真实版本。 */
         public String       fakeVersion;
         /** 向游戏 native 层伪造的应用名；null 表示服务端未配置。 */
@@ -155,6 +157,7 @@ public final class ClientInit {
             if (av != null) for (int i = 0; i < av.length(); i++) r.allowedVersions.add(av.getString(i));
             r.updateUrlNormal       = client.optString("update_url_normal",        null);
             r.updateUrlInternalTest = client.optString("update_url_internal_test", null);
+            r.updateApkSha256       = client.optString("update_apk_sha256",        null);
         }
 
         JSONObject spoof = obj.optJSONObject("spoof");

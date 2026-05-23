@@ -198,19 +198,21 @@ bool checkParseJsonNew(void* _this, const cocos2d::Data& data) {
         return checkParseJsonOld(_this, g_emptyData);
     }
     if (data._bytes && data._size > 0) {
-        const char* p = (const char*)data._bytes;
-        if (strstr(p, "asset_optimize")) {
+        // C-M2: 使用 string_view 进行有界搜索（strstr 对无 NUL 终止的缓冲区不安全）
+        std::string_view sv(reinterpret_cast<const char*>(data._bytes),
+                            static_cast<size_t>(data._size));
+        if (sv.find("asset_optimize") != std::string_view::npos) {
             LOGI("[checkParseJson] 修正 asset_optimize");
-            static std::string fixed;
-            fixed.assign(p, data._size);
+            // C-M2: 使用栈上局部 std::string，消除静态存储的多线程竞态
+            std::string patched(sv);
             size_t pos = 0;
-            while ((pos = fixed.find(":1", pos)) != std::string::npos) {
-                fixed.replace(pos, 2, ":0");
+            while ((pos = patched.find(":1", pos)) != std::string::npos) {
+                patched.replace(pos, 2, ":0");
                 pos += 2;
             }
             cocos2d::Data d;
-            d._bytes = (unsigned char*)fixed.c_str();
-            d._size = (ssize_t)fixed.size();
+            d._bytes = reinterpret_cast<unsigned char*>(patched.data());
+            d._size  = static_cast<ssize_t>(patched.size());
             return checkParseJsonOld(_this, d);
         }
     }

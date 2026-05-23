@@ -33,9 +33,19 @@ public final class Spoof {
      * @param version 伪造的版本号
      */
     public static void set(String name, String version) {
-        // 空串等价于"未配置"
-        fakeName    = (name    != null && !name.isEmpty())    ? name    : null;
-        fakeVersion = (version != null && !version.isEmpty()) ? version : null;
+        fakeName = (name != null && !name.isEmpty()) ? name : null;
+        // C-L9: 验证版本号格式，拒绝非 \d+\.\d+\.\d+ 的异常值
+        if (version != null && !version.isEmpty()) {
+            if (version.matches("\\d+\\.\\d+\\.\\d+")) {
+                fakeVersion = version;
+            } else {
+                android.util.Log.w("CNVSpoof",
+                        "[身份伪造] 拒绝非法版本号格式: " + version);
+                fakeVersion = null;
+            }
+        } else {
+            fakeVersion = null;
+        }
         android.util.Log.i("CNVSpoof",
                 "[身份伪造] 已写入 fakeName=" + fakeName + " fakeVersion=" + fakeVersion);
     }

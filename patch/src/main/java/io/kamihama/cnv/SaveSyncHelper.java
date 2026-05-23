@@ -47,8 +47,11 @@ public final class SaveSyncHelper {
     /** 将本地 SQLite 存档上传到云端。 */
     public static void upload(Context ctx, String accountId, String accountToken) throws Exception {
         String data = io.kamihama.magianative.PlayerStateCache.get(ctx).loadAll(accountId);
-        String body = "{\"token\":" + esc(accountToken) + ",\"data\":" + data + "}";
-        Net.postJson(CloudEndpoint.ACCOUNT_SAVE_PUT, body, 15_000);
+        // C-M5: 使用 JSONObject 构造请求体，避免直接拼接 untrusted JSON 字符串
+        JSONObject body = new JSONObject();
+        body.put("token", accountToken);
+        body.put("data",  new JSONObject(data != null ? data : "{}"));
+        Net.postJson(CloudEndpoint.ACCOUNT_SAVE_PUT, body.toString(), 15_000);
     }
 
     /**

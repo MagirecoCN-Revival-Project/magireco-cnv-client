@@ -42,6 +42,7 @@ name: 🏗️ 构建并发布 APK
 
 on:
   push:
+    branches: [main, internal-test]   # C-H4: 只响应核心分支推送，防止 fork / 测试分支误触发
   workflow_dispatch:
     inputs:
       bump_major:
@@ -64,10 +65,7 @@ jobs:
     env:
       PYTHONUNBUFFERED: "1"
       GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
-      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-      KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
-      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+      # C-H5: 签名密钥只在签名步骤的 step-level env 中暴露，不放 job-level
       REPO: ${{ github.repository }}
 
     steps:
@@ -909,10 +907,11 @@ jobs:
               with open(os.environ["GITHUB_OUTPUT"], "a") as f:
                   f.write(f"{key}={value}\n")
 
-          def run(cmd, **kw):
-              r = subprocess.run(cmd, shell=True, capture_output=True, text=True, **kw)
+          def run_list(cmd_list, **kw):
+              """C-H3/H5: shell=False，密码通过 args 列表传递，避免 shell 注入"""
+              r = subprocess.run(cmd_list, shell=False, capture_output=True, text=True, **kw)
               if r.returncode != 0:
-                  err(f"命令失败: {cmd}")
+                  err("命令失败")
                   err(r.stderr.strip())
                   sys.exit(1)
               return r.stdout.strip()
@@ -940,15 +939,16 @@ jobs:
 
           section("运行 apksigner")
           signed_apk = f"build/{apk_name}"
-          run(
-              f'"{bt_dir}/apksigner" sign '
-              f'--ks "{ks_path}" '
-              f'--ks-pass "pass:{ks_pass}" '
-              f'--ks-key-alias "{k_alias}" '
-              f'--key-pass "pass:{k_pass}" '
-              f'--out "{signed_apk}" '
-              f'build/aligned.apk'
-          )
+          # C-H5: shell=False，密码作为独立参数传递
+          run_list([
+              f"{bt_dir}/apksigner", "sign",
+              "--ks",           ks_path,
+              "--ks-pass",      f"pass:{ks_pass}",
+              "--ks-key-alias", k_alias,
+              "--key-pass",     f"pass:{k_pass}",
+              "--out",          signed_apk,
+              "build/aligned.apk",
+          ])
 
           ok(f"签名完成: {signed_apk}（{os.path.getsize(signed_apk):,} bytes）")
           set_output("signed_apk", signed_apk)

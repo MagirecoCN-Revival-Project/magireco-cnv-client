@@ -206,11 +206,11 @@ jobs:
               with open(os.environ["GITHUB_OUTPUT"], "a") as f:
                   f.write(f"{key}={value}\n")
 
-          def run(cmd, **kw):
-              r = subprocess.run(cmd, shell=True, capture_output=True, text=True, **kw)
+          def run_list(cmd_list, **kw):
+              """C-H3: shell=False，密码通过 args 列表传递，避免 shell 注入"""
+              r = subprocess.run(cmd_list, shell=False, capture_output=True, text=True, **kw)
               if r.returncode != 0:
                   err("命令执行失败")
-                  print(r.stdout)
                   print(r.stderr)
                   sys.exit(1)
               return r.stdout.strip()
@@ -248,20 +248,20 @@ jobs:
           info(f"DN:       {dn}")
           info(f"算法:     RSA 2048")
 
-          run(
-              f'keytool -genkeypair '
-              f'-v '
-              f'-keystore "{ks_path}" '
-              f'-alias "{alias}" '
-              f'-keyalg RSA '
-              f'-keysize 2048 '
-              f'-validity {validity_d} '
-              f'-storepass "{ks_pass}" '
-              f'-keypass "{key_pass}" '
-              f'-dname "{dn}" '
-              f'-storetype JKS '
-              f'-noprompt'
-          )
+          # C-H3: 使用列表形式（shell=False），密码作为独立参数传递，不经 shell 解释
+          run_list([
+              "keytool", "-genkeypair", "-v",
+              "-keystore", ks_path,
+              "-alias",    alias,
+              "-keyalg",   "RSA",
+              "-keysize",  "2048",
+              "-validity", str(validity_d),
+              "-storepass", ks_pass,
+              "-keypass",   key_pass,
+              "-dname",     dn,
+              "-storetype", "JKS",
+              "-noprompt",
+          ])
 
           ks_size = os.path.getsize(ks_path)
           ok(f"Keystore 生成完成: {ks_path}（{ks_size} bytes）")

@@ -370,7 +370,18 @@ public final class ResourceFlow {
                     if (firstErr.get() != null || reporter.isCancelled()) return;
 
                     DownloadState state = fileStates.get(entry.key);
+                    // C-H6: 拒绝路径遍历（server-controlled entry.key）
+                    if (entry.key.startsWith("/") || entry.key.contains("\0")
+                            || entry.key.contains("\n")) {
+                        throw new java.io.IOException("非法 key（非法字符）：" + entry.key);
+                    }
                     File target = new File(destDir, entry.key);
+                    String tCanon = target.getCanonicalPath();
+                    String dCanon = destDir.getCanonicalPath();
+                    if (!tCanon.equals(dCanon)
+                            && !tCanon.startsWith(dCanon + File.separator)) {
+                        throw new java.io.IOException("拒绝路径遍历 key：" + entry.key);
+                    }
                     File parent = target.getParentFile();
                     if (parent != null && !parent.exists()) parent.mkdirs();
 
@@ -627,31 +638,39 @@ public final class ResourceFlow {
         }
 
         reporter.setPhase("offline-verify");
-        reporter.setStatus("正在校验 zip 格式…");
+        reporter.setStatus("正在缓存离线包到私有临时目录…");
         reporter.log("INFO", "离线包 URI: " + zipUri);
-        verifyZip(zipUri);
 
-        // SHA-256 校验：仅在服务端下发了哈希值时执行
+        // C-C3: TOCTOU 防护——将 content:// URI 一次性拷到私有临时文件，
+        // 后续所有操作（验证、SHA-256、解压）均读此临时文件，
+        // 避免恶意 ContentProvider 在两次 openInputStream 之间返回不同字节。
+        File importedZip = new File(ctx.getCacheDir(), "cnv_import_" + System.currentTimeMillis() + ".zip");
+        try (InputStream src = ctx.getContentResolver().openInputStream(zipUri);
+             FileOutputStream dst = new FileOutputStream(importedZip)) {
+            if (src == null) throw new java.io.IOException("无法打开离线包文件流");
+            byte[] cpBuf = new byte[65536];
+            int cpN;
+            while ((cpN = src.read(cpBuf)) != -1) dst.write(cpBuf, 0, cpN);
+        }
+        reporter.log("INFO", "离线包已缓存到临时文件: " + importedZip.length() + " 字节");
+
+        reporter.setStatus("正在校验 zip 格式…");
+        verifyZipFile(importedZip);
+
+        // SHA-256 校验：C-L1/C-L2: 必须硬失败，不允许跳过或用户覆盖
         if (cloudSha256 != null && !cloudSha256.isEmpty()) {
             reporter.setStatus("正在计算文件 SHA-256…");
             reporter.log("INFO", "开始计算离线包 SHA-256，期望值=" + cloudSha256);
-            String actualSha256;
-            try {
-                actualSha256 = sha256HexFromUri(zipUri);
-            } catch (Exception e) {
-                reporter.log("WARN", "SHA-256 计算失败：" + e.getMessage() + "，跳过校验");
-                actualSha256 = null;
+            // C-L2: 异常不再捕获——SHA-256 计算失败视为致命错误
+            String actualSha256 = sha256HexFromFile(importedZip);
+            if (!cloudSha256.equalsIgnoreCase(actualSha256)) {
+                // C-L1: 校验不通过时硬失败，不向用户提供继续选项
+                importedZip.delete();
+                reporter.log("ERROR", "SHA-256 校验失败：期望=" + cloudSha256 + "，实际=" + actualSha256);
+                throw new FatalConfigException(
+                        "离线包 SHA-256 校验失败，已拒绝注入。期望=" + cloudSha256 + " 实际=" + actualSha256);
             }
-            if (actualSha256 != null && !cloudSha256.equalsIgnoreCase(actualSha256)) {
-                reporter.log("WARN", "SHA-256 校验不通过：期望=" + cloudSha256 + "，实际=" + actualSha256);
-                boolean proceed = reporter.confirmSha256Mismatch(cloudSha256, actualSha256);
-                if (!proceed) {
-                    throw new FatalConfigException("SHA-256 校验不通过，用户取消注入");
-                }
-                reporter.log("WARN", "用户选择忽略 SHA-256 校验不通过，继续注入");
-            } else if (actualSha256 != null) {
-                reporter.log("INFO", "SHA-256 校验通过：" + cloudSha256);
-            }
+            reporter.log("INFO", "SHA-256 校验通过：" + cloudSha256);
         }
 
         // ── 第一阶段：解压外层 zip 到暂存目录（避免直接覆盖 filesDir）──────────
@@ -666,9 +685,8 @@ public final class ResourceFlow {
             reporter.setPhase("offline-stage1");
             reporter.setStatus("正在解压外层 zip 到暂存目录…");
 
-            long totalBytes = queryStreamLength(zipUri);
-            try (InputStream is = ctx.getContentResolver().openInputStream(zipUri)) {
-                if (is == null) throw new java.io.IOException("无法打开文件流");
+            long totalBytes = importedZip.length();
+            try (InputStream is = new java.io.FileInputStream(importedZip)) {
                 // 不剥离前缀，保留外层 zip 的原始目录结构，便于找到内层 zip
                 Unzip.extractFromStream(is, stagingDir, totalBytes, "", new Unzip.ProgressSink() {
                     @Override public void onEntry(String name, long idx, long est) {
@@ -730,9 +748,10 @@ public final class ResourceFlow {
                 }
             }
         } finally {
-            // 无论成功或失败，始终清理暂存目录，避免占用存储空间
+            // 无论成功或失败，始终清理暂存目录和临时导入文件，避免占用存储空间
             deleteRecursive(stagingDir);
-            reporter.log("INFO", "暂存目录已清理");
+            importedZip.delete();
+            reporter.log("INFO", "暂存目录及临时文件已清理");
         }
         // writeReadyFlag 仅在 try 块全部正常完成后执行（finally 无法阻止 throw）
         reporter.setPhase("done");
@@ -806,10 +825,9 @@ public final class ResourceFlow {
         return names;
     }
 
-    private void verifyZip(Uri uri) throws java.io.IOException {
-        try (InputStream is = ctx.getContentResolver().openInputStream(uri)) {
-            if (is == null) throw new java.io.IOException("无法读取所选文件");
-            java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(is);
+    private static void verifyZipFile(File f) throws java.io.IOException {
+        try (java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(
+                new java.io.BufferedInputStream(new java.io.FileInputStream(f)))) {
             java.util.zip.ZipEntry ze = zis.getNextEntry();
             if (ze == null) throw new java.io.IOException("zip 文件为空或格式不正确");
             zis.closeEntry();
@@ -1017,53 +1035,16 @@ public final class ResourceFlow {
     }
 
     private static void unzipHotPatch(File zipFile, File destDir) throws java.io.IOException {
-        try (java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(
-                new java.io.BufferedInputStream(new java.io.FileInputStream(zipFile)))) {
-            java.util.zip.ZipEntry entry;
-            byte[] buf = new byte[65536];
-            while ((entry = zis.getNextEntry()) != null) {
-                File target = new File(destDir, entry.getName());
-                if (entry.isDirectory()) {
-                    target.mkdirs();
-                } else {
-                    File parent = target.getParentFile();
-                    if (parent != null) parent.mkdirs();
-                    try (java.io.FileOutputStream fos = new java.io.FileOutputStream(target)) {
-                        int n;
-                        while ((n = zis.read(buf)) != -1) fos.write(buf, 0, n);
-                    }
-                }
-                zis.closeEntry();
-            }
-        }
+        // C-H1: 委托给 Unzip.extract()，内置 zip-slip（canonical-path）防护
+        Unzip.extract(zipFile, destDir, Unzip.DEFAULT_STRIP_PREFIX, new Unzip.ProgressSink() {
+            @Override public void onEntry(String n, long idx, long est) {}
+            @Override public void onBytes(long p, long t) {}
+            @Override public boolean isCancelled() { return false; }
+        });
     }
 
-    /** 从 content URI 读取文件字节并计算 SHA-256，同时通过 reporter 汇报进度。 */
-    private String sha256HexFromUri(Uri uri) throws Exception {
-        long total = queryStreamLength(uri);
-        java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
-        try (InputStream is = ctx.getContentResolver().openInputStream(uri)) {
-            if (is == null) throw new java.io.IOException("无法打开文件流");
-            byte[] buf = new byte[65536];
-            long processed = 0L;
-            int n;
-            while ((n = is.read(buf)) != -1) {
-                md.update(buf, 0, n);
-                processed += n;
-                if (total > 0) reporter.setOverallProgress(processed, total);
-            }
-        }
-        byte[] hash = md.digest();
-        StringBuilder sb = new StringBuilder(hash.length * 2);
-        for (byte b : hash) {
-            int v = b & 0xff;
-            if (v < 0x10) sb.append('0');
-            sb.append(Integer.toHexString(v));
-        }
-        return sb.toString();
-    }
-
-    private static String sha256Hex(File file) {
+    /** 计算文件的 SHA-256，失败时抛出 IOException（C-L2: 不再静默跳过）。 */
+    private static String sha256HexFromFile(File file) throws java.io.IOException {
         try {
             java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
             try (java.io.FileInputStream fis = new java.io.FileInputStream(file)) {
@@ -1079,6 +1060,15 @@ public final class ResourceFlow {
                 sb.append(Integer.toHexString(v));
             }
             return sb.toString();
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new java.io.IOException("SHA-256 算法不可用", e);
+        }
+    }
+
+    /** 计算文件的 SHA-256，失败时返回空字符串（用于热更新等非致命校验场景）。 */
+    private static String sha256Hex(File file) {
+        try {
+            return sha256HexFromFile(file);
         } catch (Exception e) {
             return "";
         }
