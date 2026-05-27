@@ -645,119 +645,123 @@ public final class ResourceFlow {
         // 后续所有操作（验证、SHA-256、解压）均读此临时文件，
         // 避免恶意 ContentProvider 在两次 openInputStream 之间返回不同字节。
         File importedZip = new File(ctx.getCacheDir(), "cnv_import_" + System.currentTimeMillis() + ".zip");
-        try (InputStream src = ctx.getContentResolver().openInputStream(zipUri);
-             FileOutputStream dst = new FileOutputStream(importedZip)) {
-            if (src == null) throw new java.io.IOException("无法打开离线包文件流");
-            byte[] cpBuf = new byte[65536];
-            int cpN;
-            while ((cpN = src.read(cpBuf)) != -1) dst.write(cpBuf, 0, cpN);
-        }
-        reporter.log("INFO", "离线包已缓存到临时文件: " + importedZip.length() + " 字节");
-
-        reporter.setStatus("正在校验 zip 格式…");
-        verifyZipFile(importedZip);
-
-        // SHA-256 校验：C-L1/C-L2: 必须硬失败，不允许跳过或用户覆盖
-        if (cloudSha256 != null && !cloudSha256.isEmpty()) {
-            reporter.setStatus("正在计算文件 SHA-256…");
-            reporter.log("INFO", "开始计算离线包 SHA-256，期望值=" + cloudSha256);
-            // C-L2: 异常不再捕获——SHA-256 计算失败视为致命错误
-            String actualSha256 = sha256HexFromFile(importedZip);
-            if (!cloudSha256.equalsIgnoreCase(actualSha256)) {
-                // C-L1: 校验不通过时硬失败，不向用户提供继续选项
-                importedZip.delete();
-                reporter.log("ERROR", "SHA-256 校验失败：期望=" + cloudSha256 + "，实际=" + actualSha256);
-                throw new FatalConfigException(
-                        "离线包 SHA-256 校验失败，已拒绝注入。期望=" + cloudSha256 + " 实际=" + actualSha256);
-            }
-            reporter.log("INFO", "SHA-256 校验通过：" + cloudSha256);
-        }
-
-        // ── 第一阶段：解压外层 zip 到暂存目录（避免直接覆盖 filesDir）──────────
-        File stagingDir = new File(ctx.getFilesDir(), "cnv_staging");
-        deleteRecursive(stagingDir);  // 清理可能残留的旧暂存
-        stagingDir.mkdirs();
-
         try {
-            reporter.initSlots(1);
-            reporter.setSlot(0, "外层 zip（暂存解压）", 0, -1, 0);
-            reporter.setSlotPhase(0, "extracting");
-            reporter.setPhase("offline-stage1");
-            reporter.setStatus("正在解压外层 zip 到暂存目录…");
-
-            long totalBytes = importedZip.length();
-            try (InputStream is = new java.io.FileInputStream(importedZip)) {
-                // 不剥离前缀，保留外层 zip 的原始目录结构，便于找到内层 zip
-                Unzip.extractFromStream(is, stagingDir, totalBytes, "", new Unzip.ProgressSink() {
-                    @Override public void onEntry(String name, long idx, long est) {
-                        reporter.setStatus("暂存: " + name);
-                    }
-                    @Override public void onEntryBytes(long written, long uncompressedSize) {
-                        reporter.setSlot(0, null, written, uncompressedSize, 0);
-                    }
-                    @Override public void onEntryDone(String name) {}
-                    @Override public void onBytes(long bytesProcessed, long bytesTotal) {
-                        reporter.setOverallProgress(bytesProcessed,
-                                bytesTotal > 0 ? bytesTotal : totalBytes);
-                    }
-                    @Override public boolean isCancelled() { return reporter.isCancelled(); }
-                });
+            // ── 拷贝 ─────────────────────────────────────────────────────────────
+            try (InputStream src = ctx.getContentResolver().openInputStream(zipUri);
+                 FileOutputStream dst = new FileOutputStream(importedZip)) {
+                if (src == null) throw new java.io.IOException("无法打开离线包文件流");
+                byte[] cpBuf = new byte[65536];
+                int cpN;
+                while ((cpN = src.read(cpBuf)) != -1) dst.write(cpBuf, 0, cpN);
             }
-            reporter.setSlotPhase(0, "done");
-            reporter.log("INFO", "第一阶段完成，扫描暂存目录中的内层 zip…");
+            reporter.log("INFO", "离线包已缓存到临时文件: " + importedZip.length() + " 字节");
 
-            // ── 第二阶段：找到所有内层 zip，逐一解压到 filesDir ─────────────────────
-            List<File> innerZips = findInnerZipsRecursive(stagingDir);
-            reporter.log("INFO", "发现内层 zip 数量=" + innerZips.size());
+            reporter.setStatus("正在校验 zip 格式…");
+            verifyZipFile(importedZip);
 
-            File destDir = ctx.getFilesDir();
-            if (innerZips.isEmpty()) {
-                // 外层 zip 内无嵌套 zip，将暂存内容复制到目标目录
-                reporter.log("INFO", "未发现内层 zip，直接复制暂存内容到目标目录");
-                reporter.setPhase("offline-stage2");
-                reporter.setStatus("正在复制资源到目标目录…");
-                copyDirectoryRecursive(stagingDir, destDir);
-            } else {
-                reporter.initSlots(innerZips.size());
-                reporter.setPhase("offline-stage2");
-                reporter.setStatus("正在解压内层 zip…");
+            // SHA-256 校验：C-L1/C-L2: 必须硬失败，不允许跳过或用户覆盖
+            if (cloudSha256 != null && !cloudSha256.isEmpty()) {
+                reporter.setStatus("正在计算文件 SHA-256…");
+                reporter.log("INFO", "开始计算离线包 SHA-256，期望值=" + cloudSha256);
+                // C-L2: 异常不再捕获——SHA-256 计算失败视为致命错误
+                String actualSha256 = sha256HexFromFile(importedZip);
+                if (!cloudSha256.equalsIgnoreCase(actualSha256)) {
+                    // C-L1: 校验不通过时硬失败，不向用户提供继续选项
+                    reporter.log("ERROR", "SHA-256 校验失败：期望=" + cloudSha256 + "，实际=" + actualSha256);
+                    throw new FatalConfigException(
+                            "离线包 SHA-256 校验失败，已拒绝注入。期望=" + cloudSha256 + " 实际=" + actualSha256);
+                }
+                reporter.log("INFO", "SHA-256 校验通过：" + cloudSha256);
+            }
 
-                for (int i = 0; i < innerZips.size(); i++) {
-                    File innerZip = innerZips.get(i);
-                    String name   = innerZip.getName();
-                    reporter.setSlot(i, name, 0, innerZip.length(), 0);
-                    reporter.setSlotPhase(i, "extracting");
-                    reporter.log("INFO", "第二阶段[" + i + "]: 解压 " + name);
-                    final int slot = i;
-                    Unzip.extract(innerZip, destDir, new Unzip.ProgressSink() {
-                        @Override public void onEntry(String n, long idx, long est) {
-                            reporter.setStatus("解压: " + n);
+            // ── 第一阶段：解压外层 zip 到暂存目录（避免直接覆盖 filesDir）──────────
+            File stagingDir = new File(ctx.getFilesDir(), "cnv_staging");
+            deleteRecursive(stagingDir);  // 清理可能残留的旧暂存
+            stagingDir.mkdirs();
+
+            try {
+                reporter.initSlots(1);
+                reporter.setSlot(0, "外层 zip（暂存解压）", 0, -1, 0);
+                reporter.setSlotPhase(0, "extracting");
+                reporter.setPhase("offline-stage1");
+                reporter.setStatus("正在解压外层 zip 到暂存目录…");
+
+                long totalBytes = importedZip.length();
+                try (InputStream is = new java.io.FileInputStream(importedZip)) {
+                    // 不剥离前缀，保留外层 zip 的原始目录结构，便于找到内层 zip
+                    Unzip.extractFromStream(is, stagingDir, totalBytes, "", new Unzip.ProgressSink() {
+                        @Override public void onEntry(String name, long idx, long est) {
+                            reporter.setStatus("暂存: " + name);
                         }
                         @Override public void onEntryBytes(long written, long uncompressedSize) {
-                            reporter.setSlot(slot, null, written, uncompressedSize, 0);
+                            reporter.setSlot(0, null, written, uncompressedSize, 0);
                         }
-                        @Override public void onEntryDone(String n) {}
+                        @Override public void onEntryDone(String name) {}
                         @Override public void onBytes(long bytesProcessed, long bytesTotal) {
                             reporter.setOverallProgress(bytesProcessed,
-                                    bytesTotal > 0 ? bytesTotal : innerZip.length());
+                                    bytesTotal > 0 ? bytesTotal : totalBytes);
                         }
                         @Override public boolean isCancelled() { return reporter.isCancelled(); }
                     });
-                    reporter.setSlotPhase(slot, "done");
-                    reporter.log("INFO", "第二阶段[" + i + "]: " + name + " 解压完成");
                 }
+                reporter.setSlotPhase(0, "done");
+                reporter.log("INFO", "第一阶段完成，扫描暂存目录中的内层 zip…");
+
+                // ── 第二阶段：找到所有内层 zip，逐一解压到 filesDir ─────────────────────
+                List<File> innerZips = findInnerZipsRecursive(stagingDir);
+                reporter.log("INFO", "发现内层 zip 数量=" + innerZips.size());
+
+                File destDir = ctx.getFilesDir();
+                if (innerZips.isEmpty()) {
+                    // 外层 zip 内无嵌套 zip，将暂存内容复制到目标目录
+                    reporter.log("INFO", "未发现内层 zip，直接复制暂存内容到目标目录");
+                    reporter.setPhase("offline-stage2");
+                    reporter.setStatus("正在复制资源到目标目录…");
+                    copyDirectoryRecursive(stagingDir, destDir);
+                } else {
+                    reporter.initSlots(innerZips.size());
+                    reporter.setPhase("offline-stage2");
+                    reporter.setStatus("正在解压内层 zip…");
+
+                    for (int i = 0; i < innerZips.size(); i++) {
+                        File innerZip = innerZips.get(i);
+                        String name   = innerZip.getName();
+                        reporter.setSlot(i, name, 0, innerZip.length(), 0);
+                        reporter.setSlotPhase(i, "extracting");
+                        reporter.log("INFO", "第二阶段[" + i + "]: 解压 " + name);
+                        final int slot = i;
+                        Unzip.extract(innerZip, destDir, new Unzip.ProgressSink() {
+                            @Override public void onEntry(String n, long idx, long est) {
+                                reporter.setStatus("解压: " + n);
+                            }
+                            @Override public void onEntryBytes(long written, long uncompressedSize) {
+                                reporter.setSlot(slot, null, written, uncompressedSize, 0);
+                            }
+                            @Override public void onEntryDone(String n) {}
+                            @Override public void onBytes(long bytesProcessed, long bytesTotal) {
+                                reporter.setOverallProgress(bytesProcessed,
+                                        bytesTotal > 0 ? bytesTotal : innerZip.length());
+                            }
+                            @Override public boolean isCancelled() { return reporter.isCancelled(); }
+                        });
+                        reporter.setSlotPhase(slot, "done");
+                        reporter.log("INFO", "第二阶段[" + i + "]: " + name + " 解压完成");
+                    }
+                }
+            } finally {
+                // 无论成功失败，始终清理暂存目录，避免占用存储空间
+                deleteRecursive(stagingDir);
+                reporter.log("INFO", "暂存目录已清理");
             }
+            // writeReadyFlag 仅在 try 块全部正常完成后执行（finally 无法阻止 throw）
+            reporter.setPhase("done");
+            reporter.setStatus("离线资源注入完成");
+            reporter.log("INFO", "两阶段离线资源解压完成，写入 ready flag");
+            writeReadyFlag();
         } finally {
-            // 无论成功或失败，始终清理暂存目录和临时导入文件，避免占用存储空间
-            deleteRecursive(stagingDir);
+            // 外层 finally：无论何种失败路径（拷贝/校验/解压），都清理临时导入文件
             importedZip.delete();
-            reporter.log("INFO", "暂存目录及临时文件已清理");
         }
-        // writeReadyFlag 仅在 try 块全部正常完成后执行（finally 无法阻止 throw）
-        reporter.setPhase("done");
-        reporter.setStatus("离线资源注入完成");
-        reporter.log("INFO", "两阶段离线资源解压完成，写入 ready flag");
-        writeReadyFlag();
     }
 
     /** 递归查找目录中所有 .zip 文件。 */
@@ -1035,8 +1039,11 @@ public final class ResourceFlow {
     }
 
     private static void unzipHotPatch(File zipFile, File destDir) throws java.io.IOException {
-        // C-H1: 委托给 Unzip.extract()，内置 zip-slip（canonical-path）防护
-        Unzip.extract(zipFile, destDir, Unzip.DEFAULT_STRIP_PREFIX, new Unzip.ProgressSink() {
+        // C-H1: 委托给 Unzip.extract()，内置 zip-slip（canonical-path）防护。
+        // 热更新 zip 条目形如 magica/js/libs/foo.json，需保留 magica/ 前缀落到
+        // filesDir/magica/js/libs/foo.json，供 WebViewInterceptor 在该路径服务。
+        // 因此 stripPrefix 传 "" 不剥离（区别于主资源包用 DEFAULT_STRIP_PREFIX）。
+        Unzip.extract(zipFile, destDir, "", new Unzip.ProgressSink() {
             @Override public void onEntry(String n, long idx, long est) {}
             @Override public void onBytes(long p, long t) {}
             @Override public boolean isCancelled() { return false; }
