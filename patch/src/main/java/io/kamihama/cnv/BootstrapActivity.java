@@ -2111,6 +2111,15 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
 
             String capUrl = (serverCapWorkerUrl != null && !serverCapWorkerUrl.isEmpty())
                     ? serverCapWorkerUrl : CloudEndpoint.CAP_WORKER_URL;
+            // cap-worker 地址缺失（服务端未下发且 CI 未注入）时直接报错，
+            // 避免 CapWorkerSolver 用空 URL 静默挂起、按钮卡在"验证中…"。
+            if (capUrl == null || capUrl.isEmpty()) {
+                tvError.setText("人机验证服务未配置，无法登录");
+                tvError.setVisibility(View.VISIBLE);
+                btnLogin.setEnabled(true);
+                btnLogin.setText("登录");
+                return;
+            }
             CapWorkerSolver.solve(this, vRoot, capUrl,
                 new CapWorkerSolver.Callback() {
                     @Override public void onToken(String capToken) {
