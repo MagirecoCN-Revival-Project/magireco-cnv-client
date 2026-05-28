@@ -122,11 +122,10 @@ public final class CloudEndpoint {
     public static final String ACCOUNT_FORGOT = API_HOST + "/account/forgot";
 
     /**
-     * cap-worker 部署 URL（不含末尾斜杠），用于人机验证。
-     *
-     * @see <a href="https://github.com/xyTom/cap-worker">cap-worker</a>
+     * cap-worker 部署 URL（含协议，不含末尾斜杠），用于人机验证；由 CI 从 Secret CNV_CAP_WORKER_URL 注入。
+     * 运行时优先使用 /client/init 响应中的 services.cap_worker_url 字段。
      */
-    public static final String CAP_WORKER_URL = "https://captcha.magireco.top";
+    public static final String CAP_WORKER_URL = "";
 
     // ── 云端存档 ──────────────────────────────────────────────────────────────
 
@@ -138,7 +137,7 @@ public final class CloudEndpoint {
      *
      * <p>响应：{@code application/json}，{@code { "success": true }}。
      */
-    public static final String ACCOUNT_SAVE_PUT = "https://api.magi-reco.top/account/save/put";
+    public static final String ACCOUNT_SAVE_PUT = API_HOST + "/account/save/put";
 
     /**
      * 云端存档下载接口。
@@ -148,7 +147,7 @@ public final class CloudEndpoint {
      * <p>响应：{@code { "success": true, "data": { ... } }}，data 格式同上传 body 的 data 字段。
      * 无存档时 data 为 {@code {}}。
      */
-    public static final String ACCOUNT_SAVE_GET = "https://api.magi-reco.top/account/save/get";
+    public static final String ACCOUNT_SAVE_GET = API_HOST + "/account/save/get";
 
     private CloudEndpoint() {}
 }

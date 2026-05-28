@@ -18,6 +18,8 @@
 #include <mutex>
 #include <functional>
 #include <unordered_map>
+#include <vector>
+#include <atomic>
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -72,6 +74,15 @@ static std::mutex g_infoCallbackMutex;
 // ─── layer → info 映射 ───────────────────────────────────
 static std::unordered_map<void*, void*> g_layerInfoMap;
 static std::mutex g_layerInfoMutex;
+
+// ─── 游戏代理后端 ─────────────────────────────────────────
+// 由 Java 侧 ProxyBackends.set() 在握手成功后写入。
+// setURINew 首次触发时通过 JNI 加载，之后静态使用（不热更新）。
+static std::vector<std::string> g_proxyBackends;   // 代理后端 URL 列表（含协议，不含末尾斜杠）
+static std::string              g_gameServerHost;   // 要被代理的原版游戏 host（服务端下发）
+static std::atomic<size_t>      g_proxyIdx{0};      // 当前使用的后端索引；>= size() 时回退原版
+static std::mutex               g_proxyMutex;
+static std::once_flag           g_proxyLoadOnce;
 
 // ─── 辅助 ─────────────────────────────────────────────────
 static bool fileExists(const std::string& p) {
@@ -259,6 +270,8 @@ void mainSceneOnErrNew(void* _this, void* session, int code) {
         LOGE("[MainScene::onErr] flag 缺失，静默丢弃错误 code=%d", code);
         return;
     }
+    // 游戏正常运行时的 API 错误：推进代理索引，让后续请求尝试下一条代理
+    advanceProxy("MainScene::onErr", code);
     mainSceneOnErrOld(_this, session, code);
 }
 
@@ -275,10 +288,113 @@ void questDataOnRespNew(void* _this, void* session, void* resp) {
 }
 
 // ════════════════════════════════════════════════════════
+// 代理后端辅助函数
+// ════════════════════════════════════════════════════════
+
+// 从 Java 侧 ProxyBackends 类加载代理配置（仅调用一次）。
+static void loadProxyConfig(JNIEnv* env) {
+    jclass cls = env->FindClass("io/kamihama/cnv/ProxyBackends");
+    if (!cls) { LOGE("[Proxy] 找不到 ProxyBackends 类"); return; }
+
+    // 读取代理后端列表
+    jmethodID getArr = env->GetStaticMethodID(cls, "get", "()[Ljava/lang/String;");
+    if (getArr) {
+        auto arr = (jobjectArray)env->CallStaticObjectMethod(cls, getArr);
+        if (arr) {
+            std::lock_guard<std::mutex> lk(g_proxyMutex);
+            g_proxyBackends.clear();
+            g_proxyIdx.store(0);
+            int n = env->GetArrayLength(arr);
+            for (int i = 0; i < n; i++) {
+                auto js = (jstring)env->GetObjectArrayElement(arr, i);
+                if (!js) continue;
+                const char* cs = env->GetStringUTFChars(js, nullptr);
+                if (cs && cs[0]) g_proxyBackends.emplace_back(cs);
+                if (cs) env->ReleaseStringUTFChars(js, cs);
+                env->DeleteLocalRef(js);
+            }
+            env->DeleteLocalRef(arr);
+            LOGI("[Proxy] 加载代理后端 %d 条", (int)g_proxyBackends.size());
+        }
+    }
+
+    // 读取原版游戏 server host（可选，用于精确匹配）
+    jmethodID getHost = env->GetStaticMethodID(cls, "getGameServerHost", "()Ljava/lang/String;");
+    if (getHost) {
+        auto js = (jstring)env->CallStaticObjectMethod(cls, getHost);
+        if (js) {
+            const char* cs = env->GetStringUTFChars(js, nullptr);
+            if (cs && cs[0]) {
+                std::lock_guard<std::mutex> lk(g_proxyMutex);
+                g_gameServerHost = cs;
+                LOGI("[Proxy] game-server host: %s", cs);
+            }
+            if (cs) env->ReleaseStringUTFChars(js, cs);
+            env->DeleteLocalRef(js);
+        }
+    }
+
+    env->DeleteLocalRef(cls);
+}
+
+// 推进代理索引（因错误切换到下一条；耗尽时回退原版）。
+static void advanceProxy(const char* ctx, int code) {
+    std::lock_guard<std::mutex> lk(g_proxyMutex);
+    if (g_proxyBackends.empty()) return;
+    size_t prev = g_proxyIdx.fetch_add(1);
+    size_t next  = prev + 1;
+    if (next < g_proxyBackends.size()) {
+        LOGI("[Proxy] %s code=%d → 切换代理[%zu]: %s", ctx, code, next, g_proxyBackends[next].c_str());
+    } else {
+        LOGI("[Proxy] %s code=%d → 所有代理均失败，回退原版后端", ctx, code);
+    }
+}
+
+// ════════════════════════════════════════════════════════
 // setURI / Http2::onResp — HTTP 请求拦截
 // ════════════════════════════════════════════════════════
 void setURINew(void* _this, const std::string& uri) {
-    setURIOld(_this, uri);
+    // 首次触发时从 Java 加载代理配置（std::call_once 保证线程安全且只执行一次）
+    std::call_once(g_proxyLoadOnce, [&]() {
+        bool att;
+        JNIEnv* env = attachEnv(att);
+        if (env) {
+            loadProxyConfig(env);
+            if (att) gJvm->DetachCurrentThread();
+        }
+    });
+
+    std::string targetUri = uri;
+    {
+        std::lock_guard<std::mutex> lk(g_proxyMutex);
+        if (!g_proxyBackends.empty() && !uri.empty()) {
+            size_t idx = g_proxyIdx.load();
+            if (idx < g_proxyBackends.size()) {
+                // 判断是否为需要代理的游戏 API 请求：
+                //   1. 若服务端下发了 game_server_host，做精确 host 匹配；
+                //   2. 否则退化为路径前缀匹配（含 /magica/api/ 的请求）。
+                bool shouldProxy = false;
+                if (!g_gameServerHost.empty()) {
+                    shouldProxy = (uri.find(g_gameServerHost) == 0);
+                } else {
+                    shouldProxy = (uri.find("/magica/api/") != std::string::npos);
+                }
+
+                if (shouldProxy) {
+                    // 提取路径部分（scheme+host 之后），拼到代理后端前
+                    size_t p = uri.find("://");
+                    if (p != std::string::npos) {
+                        size_t pathStart = uri.find('/', p + 3);
+                        if (pathStart == std::string::npos) pathStart = uri.size();
+                        targetUri = g_proxyBackends[idx] + uri.substr(pathStart);
+                        LOGI("[setURI] proxy[%zu] %s", idx, targetUri.c_str());
+                    }
+                }
+            }
+        }
+    }
+
+    setURIOld(_this, targetUri);
 }
 void http2OnRespNew(void* _this, void* resp) {
     if (getDataOld && getDataSizeOld) {

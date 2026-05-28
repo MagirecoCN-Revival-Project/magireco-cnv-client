@@ -54,6 +54,23 @@ public final class ClientInit {
          * null 时展示默认维护提示。
          */
         public String       featureDisabledMessage;
+
+        // ── 服务端地址（services 字段组）─────────────────────────────────
+        /**
+         * cap-worker 验证码服务端点（含协议，不含末尾斜杠）；
+         * null 时回退 {@link io.kamihama.cnv.CloudEndpoint#CAP_WORKER_URL}。
+         */
+        public String       capWorkerUrl;
+        /**
+         * 游戏代理后端地址列表（每条均含协议，不含末尾斜杠）；
+         * 从上到下依次尝试，全部失败时回退原版游戏后端。
+         */
+        public List<String> proxyBackends = new ArrayList<>();
+        /**
+         * 游戏原版服务器的 scheme+host（如 {@code https://api.magi-reco.com}）；
+         * 供 native 层精确匹配需要被代理的请求；null 时 native 退化为路径前缀匹配。
+         */
+        public String       gameServerHost;
     }
 
     /** /client/online-download 响应：镜像组列表 + S3 资源令牌。 */
@@ -171,6 +188,14 @@ public final class ClientInit {
             r.onlineDownloadEnabled  = features.optBoolean("online_download",  true);
             r.offlinePackageEnabled  = features.optBoolean("offline_package",  true);
             r.featureDisabledMessage = features.optString("disabled_message",  null);
+        }
+
+        JSONObject services = obj.optJSONObject("services");
+        if (services != null) {
+            r.capWorkerUrl    = services.optString("cap_worker_url",  null);
+            r.gameServerHost  = services.optString("game_server_host", null);
+            JSONArray pb = services.optJSONArray("proxy_backends");
+            if (pb != null) for (int i = 0; i < pb.length(); i++) r.proxyBackends.add(pb.getString(i));
         }
 
         return r;

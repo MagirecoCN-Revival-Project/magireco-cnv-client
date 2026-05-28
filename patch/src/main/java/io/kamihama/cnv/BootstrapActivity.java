@@ -219,6 +219,8 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private volatile boolean serverOfflineEnabled     = true;
     /** 两个功能均关闭时服务端下发的提示文本；null 时展示默认文案。 */
     private volatile String  serverFeatureDisabledMsg = null;
+    /** 服务端下发的 cap-worker 端点；空时回退 {@link CloudEndpoint#CAP_WORKER_URL}。 */
+    private volatile String  serverCapWorkerUrl       = null;
 
     /** 覆盖层权限申请完成后待执行的回调（onActivityResult 中触发）。 */
     private Runnable pendingAfterPermission;
@@ -237,16 +239,33 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private static final java.text.SimpleDateFormat LOG_TS =
             new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US);
 
+    // ---- 外链 URL（占位 ""，由 .github/workflows/build-apk.yml 在构建期注入）----
+    // 不在源码里硬编码任何 URL；CI 用正则把下面的 "" 替换为对应配置值。
+    /** 标题栏「主页」按钮指向的站点。 */
+    static final String URL_HOME   = "";
+    /** 标题栏「GitHub」按钮指向的组织主页。 */
+    static final String URL_GITHUB = "";
+    /** 贡献者主页链接。 */
+    static final String URL_BILI_CYBERNOVA    = "";
+    static final String URL_BILI_MADEINMAGIUS = "";
+    static final String URL_BILI_SHUIYIN      = "";
+    static final String URL_BILI_SEGFAULT     = "";
+    /** 贡献者头像图片地址。 */
+    static final String URL_AVATAR_CYBERNOVA    = "";
+    static final String URL_AVATAR_MADEINMAGIUS = "";
+    static final String URL_AVATAR_SHUIYIN      = "";
+    static final String URL_AVATAR_SEGFAULT     = "";
+
     // ---- 贡献者数据 ----
     /**
-     * 贡献者条目：圆形头像色 + 名字 + 贡献说明 + 主页 URL + 头像图片 URL（null = 显示首字母）。
+     * 贡献者条目：圆形头像色 + 名字 + 贡献说明 + 主页 URL + 头像图片 URL（空串 = 显示首字母）。
      */
     private static final Object[][] CONTRIBUTORS = {
         // { 头像色, 名字, 贡献说明, 主页 URL, 头像图片 URL }
-        { 0xFF3D7BFF, "CyberNova",   "新端APK修改 · 云端提供",     "https://b23.tv/OVR55Qe", "https://avatar-proxy.magireco.top/?username=CyberNova2123" },
-        { 0xFF8BB87A, "MadeInMagius","旧端APK修改 · 资源打包",     "https://b23.tv/7qGBY6d", "https://i0.hdslb.com/bfs/face/1bc30c0bd8ee3b2d1e0c291af40a3683c70486a5.jpg" },
-        { 0xFFE667A0, "水银h2oag",   "日服绝大部分剧情汉化",       "https://b23.tv/1QH0KSR", "https://i1.hdslb.com/bfs/face/d82f2f2225c32036c6568fc0d5cd208fbdd2bff1.jpg" },
-        { 0xFF4FB7E6, "segfault",    "提供国服文件存档",           "https://b23.tv/ioKLd25", "https://i1.hdslb.com/bfs/face/7d11ac840148cfc0d282a3f4924f02f68d3631ad.jpg" },
+        { 0xFF3D7BFF, "CyberNova",   "新端APK修改 · 云端提供",     URL_BILI_CYBERNOVA,    URL_AVATAR_CYBERNOVA },
+        { 0xFF8BB87A, "MadeInMagius","旧端APK修改 · 资源打包",     URL_BILI_MADEINMAGIUS, URL_AVATAR_MADEINMAGIUS },
+        { 0xFFE667A0, "水银h2oag",   "日服绝大部分剧情汉化",       URL_BILI_SHUIYIN,      URL_AVATAR_SHUIYIN },
+        { 0xFF4FB7E6, "segfault",    "提供国服文件存档",           URL_BILI_SEGFAULT,     URL_AVATAR_SEGFAULT },
     };
 
     /** URL → 已解码 Bitmap 的内存缓存；static 保证 Activity 重建后不重复下载。 */
@@ -546,7 +565,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
 
         homeChipBg = new GradientDrawable();
         homeChipBg.setCornerRadius(dp(20));
-        vHomeChip = makeChip("⌂  主页", "https://www.magireco.top", homeChipBg);
+        vHomeChip = makeChip("⌂  主页", URL_HOME, homeChipBg);
         LinearLayout.LayoutParams homeLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -555,8 +574,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
 
         githubChipBg = new GradientDrawable();
         githubChipBg.setCornerRadius(dp(20));
-        vGitHubChip = makeChip("</>  GitHub",
-                "https://github.com/MagirecoCN-Revival-Project", githubChipBg);
+        vGitHubChip = makeChip("</>  GitHub", URL_GITHUB, githubChipBg);
         LinearLayout.LayoutParams ghLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -1077,6 +1095,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         t.setPadding(dp(12), dp(6), dp(12), dp(6));
         t.setBackground(bg);
         t.setOnClickListener(v -> {
+            if (openUrl == null || openUrl.isEmpty()) return;  // 未注入 URL（如本地构建）：点击无动作
             try {
                 Intent it = new Intent(Intent.ACTION_VIEW, Uri.parse(openUrl));
                 it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
@@ -1955,6 +1974,20 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                     + "，fakeVersion=" + init.fakeVersion);
         }
 
+        // 服务端地址下发：cap-worker 端点 + 游戏代理后端列表
+        serverCapWorkerUrl = (init.capWorkerUrl != null && !init.capWorkerUrl.isEmpty())
+                ? init.capWorkerUrl : null;
+        // 代理后端列表 & 原版 host 交给 native 层；
+        // libMagiaClient.so 的 setURI 钩子按序尝试，全失败回退原版后端。
+        ProxyBackends.set(init.proxyBackends);
+        if (init.gameServerHost != null && !init.gameServerHost.isEmpty()) {
+            ProxyBackends.setGameServerHost(init.gameServerHost);
+        }
+        log("握手", "INFO", "服务端地址：cap-worker="
+                + (serverCapWorkerUrl != null ? serverCapWorkerUrl : "（回退内置）")
+                + "，代理后端 " + init.proxyBackends.size() + " 条"
+                + (init.gameServerHost != null ? "，game-host=" + init.gameServerHost : ""));
+
         // 功能开关：写入实例字段，供 runWork() 决策下载模式
         serverOnlineEnabled      = init.onlineDownloadEnabled;
         serverOfflineEnabled     = init.offlinePackageEnabled;
@@ -2076,7 +2109,9 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             btnLogin.setEnabled(false);
             btnLogin.setText("验证中…");
 
-            CapWorkerSolver.solve(this, vRoot, CloudEndpoint.CAP_WORKER_URL,
+            String capUrl = (serverCapWorkerUrl != null && !serverCapWorkerUrl.isEmpty())
+                    ? serverCapWorkerUrl : CloudEndpoint.CAP_WORKER_URL;
+            CapWorkerSolver.solve(this, vRoot, capUrl,
                 new CapWorkerSolver.Callback() {
                     @Override public void onToken(String capToken) {
                         btnLogin.setText("登录中…");
