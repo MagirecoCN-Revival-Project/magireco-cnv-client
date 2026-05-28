@@ -1,0 +1,140 @@
+name: 🌱 种子仓库 URL 变量（一次性，执行后自动删除）
+
+# 此 Workflow 只需执行一次。它会：
+#   1. 把所有 URL 类仓库变量（vars.*）写入仓库，供 build-apk.yml 读取。
+#   2. 执行完毕后通过 GitHub API 删除本文件自身（自毁）。
+#
+# 敏感信息（API_HOST 等）仍存于 Secrets，不在此处配置。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 写入 Commit（自毁步骤）
+  actions:  write   # 读写 Actions Variables
+
+jobs:
+  seed-and-destroy:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
+      REPO:     ${{ github.repository }}
+
+    steps:
+      - name: 🌱 写入 URL 仓库变量
+        run: |
+          python3 <<'SCRIPT_END'
+          import json, urllib.request, urllib.error, os, sys
+
+          sys.stdout.reconfigure(line_buffering=True)
+
+          token = os.environ['GH_TOKEN']
+          repo  = os.environ['REPO']
+
+          headers = {
+              'Authorization':        f'Bearer {token}',
+              'Accept':               'application/vnd.github+json',
+              'X-GitHub-Api-Version': '2022-11-28',
+              'Content-Type':         'application/json',
+          }
+
+          # ── 要写入的变量表 ──────────────────────────────────────────────
+          # 均为非敏感 URL，适合存储为 Actions Variables（明文可见）而非 Secrets。
+          VARS = {
+              'CNV_CAP_WORKER_URL':      'https://captcha.magireco.top',
+              'CNV_HOME_URL':            'https://www.magireco.top',
+              'CNV_GITHUB_URL':          'https://github.com/MagirecoCN-Revival-Project',
+              'CNV_BILI_CYBERNOVA':      'https://b23.tv/OVR55Qe',
+              'CNV_BILI_MADEINMAGIUS':   'https://b23.tv/7qGBY6d',
+              'CNV_BILI_SHUIYIN':        'https://b23.tv/1QH0KSR',
+              'CNV_BILI_SEGFAULT':       'https://b23.tv/ioKLd25',
+              'CNV_AVATAR_CYBERNOVA':    'https://avatar-proxy.magireco.top/?username=CyberNova2123',
+              'CNV_AVATAR_MADEINMAGIUS': 'https://i0.hdslb.com/bfs/face/1bc30c0bd8ee3b2d1e0c291af40a3683c70486a5.jpg',
+              'CNV_AVATAR_SHUIYIN':      'https://i1.hdslb.com/bfs/face/d82f2f2225c32036c6568fc0d5cd208fbdd2bff1.jpg',
+              'CNV_AVATAR_SEGFAULT':     'https://i1.hdslb.com/bfs/face/7d11ac840148cfc0d282a3f4924f02f68d3631ad.jpg',
+          }
+
+          def upsert(name, value):
+              """PATCH（更新）失败 404 时改为 POST（创建）。"""
+              body = json.dumps({'name': name, 'value': value}).encode()
+              # 尝试更新
+              url_var = f'https://api.github.com/repos/{repo}/actions/variables/{name}'
+              req = urllib.request.Request(url_var, data=body, headers=headers, method='PATCH')
+              try:
+                  urllib.request.urlopen(req)
+                  return 'updated'
+              except urllib.error.HTTPError as e:
+                  if e.code != 404:
+                      raise RuntimeError(f'PATCH {name} 失败 HTTP {e.code}: {e.read().decode()}')
+              # 变量不存在，创建
+              url_all = f'https://api.github.com/repos/{repo}/actions/variables'
+              req = urllib.request.Request(url_all, data=body, headers=headers, method='POST')
+              try:
+                  urllib.request.urlopen(req)
+                  return 'created'
+              except urllib.error.HTTPError as e:
+                  raise RuntimeError(f'POST {name} 失败 HTTP {e.code}: {e.read().decode()}')
+
+          failed = False
+          for name, value in VARS.items():
+              try:
+                  action = upsert(name, value)
+                  print(f'  ✔ {name} ({action})')
+              except RuntimeError as e:
+                  print(f'  ✘ {e}', file=sys.stderr)
+                  failed = True
+
+          if failed:
+              print('::error::部分变量写入失败，请检查 GH_TOKEN 权限（需要 actions:write）')
+              sys.exit(1)
+
+          print('所有 URL 变量写入成功。')
+          SCRIPT_END
+
+      - name: 💣 自毁（删除本 Workflow 文件）
+        # 通过 GitHub Contents API 直接提交删除，无需 checkout
+        run: |
+          python3 <<'SCRIPT_END'
+          import json, urllib.request, urllib.error, os, sys
+
+          sys.stdout.reconfigure(line_buffering=True)
+
+          token  = os.environ['GH_TOKEN']
+          repo   = os.environ['REPO']
+          branch = os.environ.get('GITHUB_REF_NAME', '')
+          path   = '.github/workflows/seed-url-vars.yml'
+
+          headers = {
+              'Authorization':        f'Bearer {token}',
+              'Accept':               'application/vnd.github+json',
+              'X-GitHub-Api-Version': '2022-11-28',
+          }
+
+          # 获取文件当前 SHA（删除 API 需要）
+          url_file = f'https://api.github.com/repos/{repo}/contents/{path}?ref={branch}'
+          req = urllib.request.Request(url_file, headers=headers)
+          try:
+              with urllib.request.urlopen(req) as resp:
+                  sha = json.loads(resp.read())['sha']
+          except urllib.error.HTTPError as e:
+              print(f'::warning::获取文件 SHA 失败（{e.code}），跳过自毁步骤', file=sys.stderr)
+              sys.exit(0)
+
+          # 删除文件
+          body = json.dumps({
+              'message': 'ci: seed-url-vars 执行完毕，自动删除',
+              'sha':     sha,
+              'branch':  branch,
+          }).encode()
+          req = urllib.request.Request(
+              f'https://api.github.com/repos/{repo}/contents/{path}',
+              data=body,
+              headers={**headers, 'Content-Type': 'application/json'},
+              method='DELETE',
+          )
+          try:
+              urllib.request.urlopen(req)
+              print(f'✔ {path} 已从 {branch} 删除（自毁完成）')
+          except urllib.error.HTTPError as e:
+              print(f'::warning::自毁失败（{e.code}），请手动删除 {path}', file=sys.stderr)
+          SCRIPT_END

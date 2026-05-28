@@ -24,25 +24,22 @@ name: 🏗️ 构建并发布 APK
 # ║   8. 创建 GitHub Release，上传签名 APK                              ║
 # ║   9. 将新版本号保存回 GitHub Variables                              ║
 # ║                                                                    ║
-# ║ 所需 Secrets                                                        ║
+# ║ 所需 Secrets（敏感信息）                                            ║
 # ║ ──────────                                                         ║
-# ║   GH_TOKEN              — contents:write + variables:write PAT    ║
-# ║   KEYSTORE_BASE64        — base64 编码的签名 keystore              ║
-# ║   KEY_STORE_PASSWORD     — keystore 密码                           ║
-# ║   KEY_ALIAS              — key 别名                                ║
-# ║   KEY_PASSWORD           — key 密码                                ║
-# ║   CNV_API_HOST           — 主 API 域名（必填）                     ║
-# ║   CNV_CAP_WORKER_URL     — cap-worker 地址（选填，有内置默认值）   ║
-# ║   CNV_HOME_URL           — 主页按钮 URL（选填，有内置默认值）      ║
-# ║   CNV_GITHUB_URL         — GitHub 按钮 URL（选填，有内置默认值）   ║
-# ║   CNV_BILI_CYBERNOVA     — 贡献者主页 URL（选填，有内置默认值）    ║
-# ║   CNV_BILI_MADEINMAGIUS  —   同上                                  ║
-# ║   CNV_BILI_SHUIYIN       —   同上                                  ║
-# ║   CNV_BILI_SEGFAULT      —   同上                                  ║
-# ║   CNV_AVATAR_CYBERNOVA   — 贡献者头像 URL（选填，有内置默认值）    ║
-# ║   CNV_AVATAR_MADEINMAGIUS —  同上                                  ║
-# ║   CNV_AVATAR_SHUIYIN     —   同上                                  ║
-# ║   CNV_AVATAR_SEGFAULT    —   同上                                  ║
+# ║   GH_TOKEN           — contents:write + variables:write PAT       ║
+# ║   KEYSTORE_BASE64    — base64 编码的签名 keystore                  ║
+# ║   KEY_STORE_PASSWORD — keystore 密码                               ║
+# ║   KEY_ALIAS          — key 别名                                    ║
+# ║   KEY_PASSWORD       — key 密码                                    ║
+# ║   CNV_API_HOST       — 主 API 域名（必填）                         ║
+# ║                                                                    ║
+# ║ 所需 Variables（非敏感，由 seed-url-vars.yml 一次性写入）           ║
+# ║ ──────────────────────────────────────────────────────            ║
+# ║   CNV_CAP_WORKER_URL      CNV_HOME_URL       CNV_GITHUB_URL       ║
+# ║   CNV_BILI_CYBERNOVA      CNV_BILI_MADEINMAGIUS                   ║
+# ║   CNV_BILI_SHUIYIN        CNV_BILI_SEGFAULT                       ║
+# ║   CNV_AVATAR_CYBERNOVA    CNV_AVATAR_MADEINMAGIUS                 ║
+# ║   CNV_AVATAR_SHUIYIN      CNV_AVATAR_SEGFAULT                     ║
 # ║                                                                    ║
 # ║ 所需 Variables（首次运行会自动从 4.0.0 / VersionCode=1 开始）        ║
 # ║   APK_VERSION       — 当前版本号，如 "4.0.0"                       ║
@@ -428,7 +425,7 @@ jobs:
           # ── CloudEndpoint.java ──────────────────────────────────────
           ce_path = 'patch/src/main/java/io/kamihama/cnv/CloudEndpoint.java'
           api_host = os.environ.get('CNV_API_HOST', '').rstrip('/')
-          cap_url  = os.environ.get('CNV_CAP_WORKER_URL', 'https://captcha.magireco.top').rstrip('/')
+          cap_url  = os.environ.get('CNV_CAP_WORKER_URL', '').rstrip('/')
           if not api_host:
               print('::error::Secret CNV_API_HOST 未配置，无法构建')
               sys.exit(1)
@@ -436,62 +433,58 @@ jobs:
               src = f.read()
           src = re.sub(r'(static final String API_HOST\s*=\s*)""',
                        r'\g<1>"' + api_host + '"', src)
-          src = re.sub(r'(static final String CAP_WORKER_URL\s*=\s*)""',
-                       r'\g<1>"' + cap_url + '"', src)
+          if cap_url:
+              src = re.sub(r'(static final String CAP_WORKER_URL\s*=\s*)""',
+                           r'\g<1>"' + cap_url + '"', src)
+          else:
+              print('::warning::CNV_CAP_WORKER_URL 未设置，CAP_WORKER_URL 保持空串（人机验证不可用）')
           with open(ce_path, 'w', encoding='utf-8') as f:
               f.write(src)
           print('CloudEndpoint: API_HOST =', api_host)
-          print('CloudEndpoint: CAP_WORKER_URL =', cap_url)
 
           # ── BootstrapActivity.java ──────────────────────────────────
           ba_path = 'patch/src/main/java/io/kamihama/cnv/BootstrapActivity.java'
           urls = {
-              'URL_HOME':             os.environ.get('CNV_HOME_URL',
-                                                     'https://www.magireco.top'),
-              'URL_GITHUB':           os.environ.get('CNV_GITHUB_URL',
-                                                     'https://github.com/MagirecoCN-Revival-Project'),
-              'URL_BILI_CYBERNOVA':   os.environ.get('CNV_BILI_CYBERNOVA',
-                                                     'https://b23.tv/OVR55Qe'),
-              'URL_BILI_MADEINMAGIUS':os.environ.get('CNV_BILI_MADEINMAGIUS',
-                                                     'https://b23.tv/7qGBY6d'),
-              'URL_BILI_SHUIYIN':     os.environ.get('CNV_BILI_SHUIYIN',
-                                                     'https://b23.tv/1QH0KSR'),
-              'URL_BILI_SEGFAULT':    os.environ.get('CNV_BILI_SEGFAULT',
-                                                     'https://b23.tv/ioKLd25'),
-              'URL_AVATAR_CYBERNOVA': os.environ.get('CNV_AVATAR_CYBERNOVA',
-                                                     'https://avatar-proxy.magireco.top/?username=CyberNova2123'),
-              'URL_AVATAR_MADEINMAGIUS': os.environ.get('CNV_AVATAR_MADEINMAGIUS',
-                                                     'https://i0.hdslb.com/bfs/face/1bc30c0bd8ee3b2d1e0c291af40a3683c70486a5.jpg'),
-              'URL_AVATAR_SHUIYIN':   os.environ.get('CNV_AVATAR_SHUIYIN',
-                                                     'https://i1.hdslb.com/bfs/face/d82f2f2225c32036c6568fc0d5cd208fbdd2bff1.jpg'),
-              'URL_AVATAR_SEGFAULT':  os.environ.get('CNV_AVATAR_SEGFAULT',
-                                                     'https://i1.hdslb.com/bfs/face/7d11ac840148cfc0d282a3f4924f02f68d3631ad.jpg'),
+              'URL_HOME':                os.environ.get('CNV_HOME_URL',            ''),
+              'URL_GITHUB':              os.environ.get('CNV_GITHUB_URL',          ''),
+              'URL_BILI_CYBERNOVA':      os.environ.get('CNV_BILI_CYBERNOVA',      ''),
+              'URL_BILI_MADEINMAGIUS':   os.environ.get('CNV_BILI_MADEINMAGIUS',   ''),
+              'URL_BILI_SHUIYIN':        os.environ.get('CNV_BILI_SHUIYIN',        ''),
+              'URL_BILI_SEGFAULT':       os.environ.get('CNV_BILI_SEGFAULT',       ''),
+              'URL_AVATAR_CYBERNOVA':    os.environ.get('CNV_AVATAR_CYBERNOVA',    ''),
+              'URL_AVATAR_MADEINMAGIUS': os.environ.get('CNV_AVATAR_MADEINMAGIUS', ''),
+              'URL_AVATAR_SHUIYIN':      os.environ.get('CNV_AVATAR_SHUIYIN',      ''),
+              'URL_AVATAR_SEGFAULT':     os.environ.get('CNV_AVATAR_SEGFAULT',     ''),
           }
+          missing = [k for k, v in urls.items() if not v]
+          if missing:
+              print('::warning::以下 URL 变量未设置，对应功能将显示空白: ' + ', '.join(missing))
           with open(ba_path, 'r', encoding='utf-8') as f:
               src = f.read()
           for key, val in urls.items():
-              src = re.sub(
-                  r'(static final String ' + key + r'\s*=\s*)""',
-                  r'\g<1>"' + val.replace('\\', '\\\\').replace('"', '\\"') + '"',
-                  src
-              )
-              print(f'BootstrapActivity: {key} = {val}')
+              if val:
+                  src = re.sub(
+                      r'(static final String ' + key + r'\s*=\s*)""',
+                      r'\g<1>"' + val.replace('\\', '\\\\').replace('"', '\\"') + '"',
+                      src
+                  )
+                  print(f'BootstrapActivity: {key} = {val}')
           with open(ba_path, 'w', encoding='utf-8') as f:
               f.write(src)
           SCRIPT_END
         env:
           CNV_API_HOST:            ${{ secrets.CNV_API_HOST }}
-          CNV_CAP_WORKER_URL:      ${{ secrets.CNV_CAP_WORKER_URL }}
-          CNV_HOME_URL:            ${{ secrets.CNV_HOME_URL }}
-          CNV_GITHUB_URL:          ${{ secrets.CNV_GITHUB_URL }}
-          CNV_BILI_CYBERNOVA:      ${{ secrets.CNV_BILI_CYBERNOVA }}
-          CNV_BILI_MADEINMAGIUS:   ${{ secrets.CNV_BILI_MADEINMAGIUS }}
-          CNV_BILI_SHUIYIN:        ${{ secrets.CNV_BILI_SHUIYIN }}
-          CNV_BILI_SEGFAULT:       ${{ secrets.CNV_BILI_SEGFAULT }}
-          CNV_AVATAR_CYBERNOVA:    ${{ secrets.CNV_AVATAR_CYBERNOVA }}
-          CNV_AVATAR_MADEINMAGIUS: ${{ secrets.CNV_AVATAR_MADEINMAGIUS }}
-          CNV_AVATAR_SHUIYIN:      ${{ secrets.CNV_AVATAR_SHUIYIN }}
-          CNV_AVATAR_SEGFAULT:     ${{ secrets.CNV_AVATAR_SEGFAULT }}
+          CNV_CAP_WORKER_URL:      ${{ vars.CNV_CAP_WORKER_URL }}
+          CNV_HOME_URL:            ${{ vars.CNV_HOME_URL }}
+          CNV_GITHUB_URL:          ${{ vars.CNV_GITHUB_URL }}
+          CNV_BILI_CYBERNOVA:      ${{ vars.CNV_BILI_CYBERNOVA }}
+          CNV_BILI_MADEINMAGIUS:   ${{ vars.CNV_BILI_MADEINMAGIUS }}
+          CNV_BILI_SHUIYIN:        ${{ vars.CNV_BILI_SHUIYIN }}
+          CNV_BILI_SEGFAULT:       ${{ vars.CNV_BILI_SEGFAULT }}
+          CNV_AVATAR_CYBERNOVA:    ${{ vars.CNV_AVATAR_CYBERNOVA }}
+          CNV_AVATAR_MADEINMAGIUS: ${{ vars.CNV_AVATAR_MADEINMAGIUS }}
+          CNV_AVATAR_SHUIYIN:      ${{ vars.CNV_AVATAR_SHUIYIN }}
+          CNV_AVATAR_SEGFAULT:     ${{ vars.CNV_AVATAR_SEGFAULT }}
 
       - name: ☕ 编译 Java 补丁源码
         run: |
