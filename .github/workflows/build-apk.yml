@@ -33,13 +33,11 @@ name: 🏗️ 构建并发布 APK
 # ║   KEY_PASSWORD       — key 密码                                    ║
 # ║   CNV_API_HOST       — 主 API 域名（必填）                         ║
 # ║                                                                    ║
-# ║ 所需 Variables（非敏感，由 seed-url-vars.yml 一次性写入）           ║
+# ║ 所需 Variables（非敏感）                                           ║
 # ║ ──────────────────────────────────────────────────────            ║
-# ║   CNV_CAP_WORKER_URL      CNV_HOME_URL       CNV_GITHUB_URL       ║
-# ║   CNV_BILI_CYBERNOVA      CNV_BILI_MADEINMAGIUS                   ║
-# ║   CNV_BILI_SHUIYIN        CNV_BILI_SEGFAULT                       ║
-# ║   CNV_AVATAR_CYBERNOVA    CNV_AVATAR_MADEINMAGIUS                 ║
-# ║   CNV_AVATAR_SHUIYIN      CNV_AVATAR_SEGFAULT                     ║
+# ║   CNV_CAP_WORKER_URL   CNV_HOME_URL   CNV_GITHUB_URL              ║
+# ║   （贡献者 URL 已改为 /client/init 下发，相关变量可删除，           ║
+# ║     见 cleanup-contributor-vars.yml）                              ║
 # ║                                                                    ║
 # ║ 所需 Variables（首次运行会自动从 4.0.0 / VersionCode=1 开始）        ║
 # ║   APK_VERSION       — 当前版本号，如 "4.0.0"                       ║
@@ -443,22 +441,15 @@ jobs:
           print('CloudEndpoint: API_HOST =', api_host)
 
           # ── BootstrapActivity.java ──────────────────────────────────
+          # 仅注入标题栏的主页 / GitHub 链接；贡献者名单已改为 /client/init 下发。
           ba_path = 'patch/src/main/java/io/kamihama/cnv/BootstrapActivity.java'
           urls = {
-              'URL_HOME':                os.environ.get('CNV_HOME_URL',            ''),
-              'URL_GITHUB':              os.environ.get('CNV_GITHUB_URL',          ''),
-              'URL_BILI_CYBERNOVA':      os.environ.get('CNV_BILI_CYBERNOVA',      ''),
-              'URL_BILI_MADEINMAGIUS':   os.environ.get('CNV_BILI_MADEINMAGIUS',   ''),
-              'URL_BILI_SHUIYIN':        os.environ.get('CNV_BILI_SHUIYIN',        ''),
-              'URL_BILI_SEGFAULT':       os.environ.get('CNV_BILI_SEGFAULT',       ''),
-              'URL_AVATAR_CYBERNOVA':    os.environ.get('CNV_AVATAR_CYBERNOVA',    ''),
-              'URL_AVATAR_MADEINMAGIUS': os.environ.get('CNV_AVATAR_MADEINMAGIUS', ''),
-              'URL_AVATAR_SHUIYIN':      os.environ.get('CNV_AVATAR_SHUIYIN',      ''),
-              'URL_AVATAR_SEGFAULT':     os.environ.get('CNV_AVATAR_SEGFAULT',     ''),
+              'URL_HOME':   os.environ.get('CNV_HOME_URL',   ''),
+              'URL_GITHUB': os.environ.get('CNV_GITHUB_URL', ''),
           }
           missing = [k for k, v in urls.items() if not v]
           if missing:
-              print('::warning::以下 URL 变量未设置，对应功能将显示空白: ' + ', '.join(missing))
+              print('::warning::以下 URL 变量未设置，对应按钮将不可点击: ' + ', '.join(missing))
           with open(ba_path, 'r', encoding='utf-8') as f:
               src = f.read()
           for key, val in urls.items():
@@ -473,18 +464,10 @@ jobs:
               f.write(src)
           SCRIPT_END
         env:
-          CNV_API_HOST:            ${{ secrets.CNV_API_HOST }}
-          CNV_CAP_WORKER_URL:      ${{ vars.CNV_CAP_WORKER_URL }}
-          CNV_HOME_URL:            ${{ vars.CNV_HOME_URL }}
-          CNV_GITHUB_URL:          ${{ vars.CNV_GITHUB_URL }}
-          CNV_BILI_CYBERNOVA:      ${{ vars.CNV_BILI_CYBERNOVA }}
-          CNV_BILI_MADEINMAGIUS:   ${{ vars.CNV_BILI_MADEINMAGIUS }}
-          CNV_BILI_SHUIYIN:        ${{ vars.CNV_BILI_SHUIYIN }}
-          CNV_BILI_SEGFAULT:       ${{ vars.CNV_BILI_SEGFAULT }}
-          CNV_AVATAR_CYBERNOVA:    ${{ vars.CNV_AVATAR_CYBERNOVA }}
-          CNV_AVATAR_MADEINMAGIUS: ${{ vars.CNV_AVATAR_MADEINMAGIUS }}
-          CNV_AVATAR_SHUIYIN:      ${{ vars.CNV_AVATAR_SHUIYIN }}
-          CNV_AVATAR_SEGFAULT:     ${{ vars.CNV_AVATAR_SEGFAULT }}
+          CNV_API_HOST:       ${{ secrets.CNV_API_HOST }}
+          CNV_CAP_WORKER_URL: ${{ vars.CNV_CAP_WORKER_URL }}
+          CNV_HOME_URL:       ${{ vars.CNV_HOME_URL }}
+          CNV_GITHUB_URL:     ${{ vars.CNV_GITHUB_URL }}
 
       - name: ☕ 编译 Java 补丁源码
         run: |

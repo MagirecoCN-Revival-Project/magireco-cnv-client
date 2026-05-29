@@ -183,6 +183,8 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private GlassPanelView vGlassPanel;
     private LinearLayout   vHeadRight;
     private LinearLayout   vMainRow;
+    /** 贡献者署名列表容器；握手后由 populateContributors() 动态填充。 */
+    private LinearLayout   vContribList;
 
     // ---- 右上角胶囊按钮背景（主题切换时统一重置颜色） ----
     private TextView       vThemeChip;
@@ -245,27 +247,16 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     static final String URL_HOME   = "";
     /** 标题栏「GitHub」按钮指向的组织主页。 */
     static final String URL_GITHUB = "";
-    /** 贡献者主页链接。 */
-    static final String URL_BILI_CYBERNOVA    = "";
-    static final String URL_BILI_MADEINMAGIUS = "";
-    static final String URL_BILI_SHUIYIN      = "";
-    static final String URL_BILI_SEGFAULT     = "";
-    /** 贡献者头像图片地址。 */
-    static final String URL_AVATAR_CYBERNOVA    = "";
-    static final String URL_AVATAR_MADEINMAGIUS = "";
-    static final String URL_AVATAR_SHUIYIN      = "";
-    static final String URL_AVATAR_SEGFAULT     = "";
 
     // ---- 贡献者数据 ----
-    /**
-     * 贡献者条目：圆形头像色 + 名字 + 贡献说明 + 主页 URL + 头像图片 URL（空串 = 显示首字母）。
-     */
-    private static final Object[][] CONTRIBUTORS = {
-        // { 头像色, 名字, 贡献说明, 主页 URL, 头像图片 URL }
-        { 0xFF3D7BFF, "CyberNova",   "新端APK修改 · 云端提供",     URL_BILI_CYBERNOVA,    URL_AVATAR_CYBERNOVA },
-        { 0xFF8BB87A, "MadeInMagius","旧端APK修改 · 资源打包",     URL_BILI_MADEINMAGIUS, URL_AVATAR_MADEINMAGIUS },
-        { 0xFFE667A0, "水银h2oag",   "日服绝大部分剧情汉化",       URL_BILI_SHUIYIN,      URL_AVATAR_SHUIYIN },
-        { 0xFF4FB7E6, "segfault",    "提供国服文件存档",           URL_BILI_SEGFAULT,     URL_AVATAR_SEGFAULT },
+    // 贡献者名单不再硬编码，改由 /client/init 响应在握手阶段下发
+    // （见 ClientInit.Response.contributors），数量不固定（可多可少可为 0）。
+    // 握手成功后由 populateContributors() 动态填充 vContribList。
+
+    /** 未指定颜色时按索引取色的备用调色板（ARGB）。 */
+    private static final int[] CONTRIB_PALETTE = {
+        0xFF3D7BFF, 0xFF8BB87A, 0xFFE667A0, 0xFF4FB7E6,
+        0xFFF2A65A, 0xFF9B8CFF, 0xFF52C7B8, 0xFFE57373,
     };
 
     /** URL → 已解码 Bitmap 的内存缓存；static 保证 Activity 重建后不重复下载。 */
@@ -393,7 +384,8 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         divLp.bottomMargin = dp(10);
         leftCol.addView(divider, divLp);
 
-        // 贡献者署名区（可滚动）
+        // 贡献者署名区（可滚动）。名单由 /client/init 握手后动态填充，
+        // 此处仅创建空容器并保存引用。
         ScrollView contribScroll = new ScrollView(this);
         contribScroll.setFillViewport(true);
         LinearLayout contribList = new LinearLayout(this);
@@ -401,10 +393,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         contribScroll.addView(contribList, new ScrollView.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
-        for (Object[] c : CONTRIBUTORS) {
-            contribList.addView(buildContributorRow(
-                    (int) c[0], (String) c[1], (String) c[2], (String) c[3], (String) c[4]));
-        }
+        vContribList = contribList;
         leftCol.addView(contribScroll, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
@@ -822,6 +811,39 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     }
 
     // ── 贡献者条目构建 ───────────────────────────────────────────────────
+
+    /**
+     * 用服务端下发的贡献者名单填充署名区（UI 线程调用）。
+     *
+     * <p>清空旧内容后按顺序渲染；列表为空时显示占位文本。
+     * 颜色缺省（color==0）时按索引取调色板色。
+     */
+    private void populateContributors(java.util.List<ClientInit.Contributor> list) {
+        if (vContribList == null) return;
+        vContribList.removeAllViews();
+
+        if (list == null || list.isEmpty()) {
+            TextView empty = new TextView(this);
+            empty.setText("—");
+            empty.setTextColor(COLOR_SUB);
+            empty.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f);
+            vContribList.addView(empty);
+            return;
+        }
+
+        for (int i = 0; i < list.size(); i++) {
+            ClientInit.Contributor c = list.get(i);
+            int color = (c.color != 0)
+                    ? c.color
+                    : CONTRIB_PALETTE[i % CONTRIB_PALETTE.length];
+            vContribList.addView(buildContributorRow(
+                    color,
+                    c.name != null ? c.name : "",
+                    c.contribution != null ? c.contribution : "",
+                    c.url,
+                    c.avatarUrl));
+        }
+    }
 
     /**
      * 构建单条贡献者条目视图。
@@ -1987,6 +2009,11 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 + (serverCapWorkerUrl != null ? serverCapWorkerUrl : "（回退内置）")
                 + "，代理后端 " + init.proxyBackends.size() + " 条"
                 + (init.gameServerHost != null ? "，game-host=" + init.gameServerHost : ""));
+
+        // 贡献者名单：服务端下发，数量不固定。在 UI 线程动态填充署名区。
+        final java.util.List<ClientInit.Contributor> contribs = init.contributors;
+        log("握手", "INFO", "贡献者名单：" + contribs.size() + " 人");
+        ui.post(() -> populateContributors(contribs));
 
         // 功能开关：写入实例字段，供 runWork() 决策下载模式
         serverOnlineEnabled      = init.onlineDownloadEnabled;

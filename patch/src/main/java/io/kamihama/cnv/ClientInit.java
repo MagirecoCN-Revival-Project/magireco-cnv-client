@@ -71,6 +71,26 @@ public final class ClientInit {
          * 供 native 层精确匹配需要被代理的请求；null 时 native 退化为路径前缀匹配。
          */
         public String       gameServerHost;
+
+        /**
+         * 贡献者名单；由服务端在握手阶段下发，数量不固定（可为空）。
+         * 客户端启动画面据此动态渲染署名区。
+         */
+        public List<Contributor> contributors = new ArrayList<>();
+    }
+
+    /** 单个贡献者条目（来自 /client/init 响应的 contributors 数组）。 */
+    public static final class Contributor {
+        /** 头像底色 / 名字文字色（ARGB）；0 = 服务端未指定，客户端按顺序取调色板。 */
+        public int    color;
+        /** 显示名（必填）。 */
+        public String name;
+        /** 贡献说明（单行短文本）。 */
+        public String contribution;
+        /** 主页链接；空 = 不可点击跳转。 */
+        public String url;
+        /** 头像图片地址；空 = 显示名字首字母彩色圆。 */
+        public String avatarUrl;
     }
 
     /** /client/online-download 响应：镜像组列表 + S3 资源令牌。 */
@@ -198,7 +218,39 @@ public final class ClientInit {
             if (pb != null) for (int i = 0; i < pb.length(); i++) r.proxyBackends.add(pb.getString(i));
         }
 
+        JSONArray contribs = obj.optJSONArray("contributors");
+        if (contribs != null) {
+            for (int i = 0; i < contribs.length(); i++) {
+                JSONObject co = contribs.optJSONObject(i);
+                if (co == null) continue;
+                Contributor c = new Contributor();
+                c.name         = co.optString("name",         null);
+                c.contribution = co.optString("contribution", null);
+                c.url          = co.optString("url",          null);
+                c.avatarUrl    = co.optString("avatar_url",   null);
+                c.color        = parseColor(co.optString("color", null));
+                if (c.name != null && !c.name.isEmpty()) r.contributors.add(c);
+            }
+        }
+
         return r;
+    }
+
+    /**
+     * 解析 {@code "#RRGGBB"} / {@code "#AARRGGBB"} 颜色字符串为 ARGB int。
+     * 缺失 / 非法返回 0（调用方据此回退到客户端调色板）。{@code #RRGGBB} 自动补全不透明 alpha。
+     */
+    private static int parseColor(String s) {
+        if (s == null || s.isEmpty()) return 0;
+        try {
+            String hex = s.startsWith("#") ? s.substring(1) : s;
+            if (hex.length() == 6) {
+                return 0xFF000000 | Integer.parseInt(hex, 16);
+            } else if (hex.length() == 8) {
+                return (int) Long.parseLong(hex, 16);
+            }
+        } catch (NumberFormatException ignore) {}
+        return 0;
     }
 
     /**
