@@ -40,7 +40,26 @@ public final class IntegrityGuard {
     /**
      * 本 APK 合法声明的全部 ContentProvider authority。
      * 运行时若发现白名单之外的 authority，视为被注入（篡改）。
-     * 如未来确需新增 provider，必须同步更新此白名单。
+     *
+     * <p><b>⚠ 白名单维护规约（改这里前必读）：</b>
+     * <ol>
+     *   <li><b>唯一真相源是 AndroidManifest.xml。</b> 本集合必须与 manifest 中
+     *       全部 {@code <provider android:authorities="…">} 逐一对应、不多不少。
+     *       校验命令：
+     *       {@code grep -o '<provider[^>]*android:authorities="[^"]*"' AndroidManifest.xml}</li>
+     *   <li><b>少了会误锁正版</b>：manifest 有、白名单无 → 正版启动即被判篡改、
+     *       无法进入。新增任何依赖（尤其引入 androidx/Firebase 等会自动塞
+     *       InitializationProvider 的库）后，务必回来补全对应 authority。</li>
+     *   <li><b>多了会放过攻击</b>：白名单写了 manifest 里没有的 authority，
+     *       等于给攻击者留了一个可注入而不报警的 authority 名。只加确实存在的。</li>
+     *   <li><b>authority 用包名前缀</b>（manifest 里 {@code package="io.kamihama.totentanz"}）。
+     *       新条目按 {@code io.kamihama.totentanz.xxx} 的实际声明值原样抄，不要臆造。</li>
+     *   <li>本应用所有 provider 都应保持 {@code exported=false}；
+     *       {@link #checkProviders} 还会把"被改成 exported"也判为篡改，
+     *       因此白名单内的条目无需、也不应被声明为 exported。</li>
+     *   <li>改完务必在真机/模拟器跑一次冷启动，确认 "完整性门禁通过" 日志出现，
+     *       再发版——避免白名单回归导致全量用户被锁在门外。</li>
+     * </ol>
      */
     private static final Set<String> ALLOWED_PROVIDER_AUTHORITIES = new HashSet<>(Arrays.asList(
             "io.kamihama.totentanz.cnvupdate",          // io.kamihama.cnv.UpdateProvider（exported=false）
