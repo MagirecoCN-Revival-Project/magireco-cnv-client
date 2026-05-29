@@ -352,7 +352,7 @@ static void advanceProxy(const char* ctx, int code) {
     if (next < g_proxyBackends.size()) {
         LOGI("[Proxy] %s code=%d → 切换代理[%zu]: %s", ctx, code, next, g_proxyBackends[next].c_str());
     } else {
-        LOGI("[Proxy] %s code=%d → 所有代理均失败，回退原版后端", ctx, code);
+        LOGI("[Proxy] %s code=%d → 所有代理均失败，后续请求将回退私服后端", ctx, code);
     }
 }
 
@@ -378,28 +378,35 @@ void setURINew(void* _this, const std::string& uri) {
     std::string targetUri = uri;
     {
         std::lock_guard<std::mutex> lk(g_proxyMutex);
-        if (!g_proxyBackends.empty() && !uri.empty()) {
-            size_t idx = g_proxyIdx.load();
-            if (idx < g_proxyBackends.size()) {
-                // 判断是否为需要代理的游戏 API 请求：
-                //   1. 若服务端下发了 game_server_host，做精确 host 匹配；
-                //   2. 否则退化为路径前缀匹配（含 /magica/api/ 的请求）。
-                bool shouldProxy = false;
-                if (!g_gameServerHost.empty()) {
-                    shouldProxy = (uri.find(g_gameServerHost) == 0);
-                } else {
-                    shouldProxy = (uri.find("/magica/api/") != std::string::npos);
+        if (!uri.empty()) {
+            // 判断是否为需要代理的游戏 API 请求：
+            //   精确 host 匹配（game_server_host 命中）|| 路径前缀兜底（/magica/api/）。
+            // libmadomagi_native.so 里硬编码的是已停服的官方 f4samurai 域名；
+            // game_server_host 应设为私服 host（如 totentanz-9b.magica-us.com），
+            // 精确匹配不会命中 f4samurai URI，因此路径兜底始终生效。
+            bool shouldProxy = (!g_gameServerHost.empty() && uri.find(g_gameServerHost) == 0)
+                            || (uri.find("/magica/api/") != std::string::npos);
+
+            if (shouldProxy) {
+                size_t p = uri.find("://");
+                size_t pathStart = (p != std::string::npos)
+                    ? uri.find('/', p + 3) : std::string::npos;
+                if (pathStart == std::string::npos) pathStart = uri.size();
+
+                size_t idx = g_proxyIdx.load();
+                std::string backend;
+                if (!g_proxyBackends.empty() && idx < g_proxyBackends.size()) {
+                    backend = g_proxyBackends[idx];
+                } else if (!g_gameServerHost.empty()) {
+                    // 所有代理已耗尽（或未配置代理），回退私服后端
+                    std::string scheme = (p != std::string::npos) ? uri.substr(0, p) : "https";
+                    backend = scheme + "://" + g_gameServerHost;
+                    LOGI("[setURI] 代理耗尽，回退 %s", g_gameServerHost.c_str());
                 }
 
-                if (shouldProxy) {
-                    // 提取路径部分（scheme+host 之后），拼到代理后端前
-                    size_t p = uri.find("://");
-                    if (p != std::string::npos) {
-                        size_t pathStart = uri.find('/', p + 3);
-                        if (pathStart == std::string::npos) pathStart = uri.size();
-                        targetUri = g_proxyBackends[idx] + uri.substr(pathStart);
-                        LOGI("[setURI] proxy[%zu] %s", idx, targetUri.c_str());
-                    }
+                if (!backend.empty()) {
+                    targetUri = backend + uri.substr(pathStart);
+                    LOGI("[setURI] → %s", targetUri.c_str());
                 }
             }
         }
