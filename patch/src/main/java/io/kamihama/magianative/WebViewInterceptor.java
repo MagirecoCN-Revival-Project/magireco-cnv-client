@@ -140,6 +140,13 @@ public class WebViewInterceptor {
         Log.i("MagiaHook-Path", localPath);
 
         File localFile = new File(localPath);
+        // 路径穿越防御：规范化后必须仍在 LOCAL_DIR 之内。
+        // 否则恶意服务端页面可请求 /magica/../../shared_prefs/cnv_account.xml
+        // 之类路径，把账号 token 等私有文件读出来回传给（同源）WebView。
+        if (!isWithinLocalDir(localFile)) {
+            Log.w(TAG, "拒绝越界路径: " + localPath);
+            return null;
+        }
         if (localFile.exists()) {
             Log.i("MagiaHook-Found", localPath);
             String mimeType = guessMimeType(relPath);
@@ -166,6 +173,17 @@ public class WebViewInterceptor {
         }
 
         return null;
+    }
+
+    /** 校验文件规范化路径仍位于 LOCAL_DIR 之内（zip-slip 同款防御）。 */
+    private static boolean isWithinLocalDir(File f) {
+        try {
+            String base   = new File(LOCAL_DIR).getCanonicalPath();
+            String target = f.getCanonicalPath();
+            return target.equals(base) || target.startsWith(base + File.separator);
+        } catch (Exception e) {
+            return false; // 规范化失败一律拒绝
+        }
     }
 
     private static String guessMimeType(String path) {

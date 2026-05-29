@@ -114,9 +114,12 @@ public final class CapWorkerSolver {
     // ── 内嵌 HTML ──────────────────────────────────────────────────────────────
 
     private static String buildHtml(String capUrl) {
+        // capUrl 来自服务端 /client/init 下发，用 JSONObject.quote 做完整 JS 字符串
+        // 转义（处理引号 / 反斜杠 / 控制字符），避免手工 replace("'") 被 \ 或换行绕过。
+        String capLiteral = org.json.JSONObject.quote(capUrl);
         // language=HTML
         return "<!DOCTYPE html><html><head><meta charset='utf-8'></head><body><script>\n" +
-            "const CAP = '" + capUrl.replace("'", "\\'") + "';\n" +
+            "const CAP = " + capLiteral + ";\n" +
             "\n" +
             "async function sha256hex(str) {\n" +
             "    const buf = await crypto.subtle.digest(\n" +

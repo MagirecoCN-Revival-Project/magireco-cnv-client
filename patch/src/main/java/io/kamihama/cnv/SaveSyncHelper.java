@@ -36,8 +36,10 @@ public final class SaveSyncHelper {
      * 可能抛出 IOException（调用方负责捕获并降级处理）。
      */
     public static SaveData fetchCloud(Context ctx, String accountToken) throws Exception {
-        String body = "{\"token\":" + esc(accountToken) + "}";
-        String resp = Net.postJson(CloudEndpoint.ACCOUNT_SAVE_GET, body, 15_000);
+        // C-M5: 用 JSONObject 构造请求体，避免手工拼接 untrusted token 字符串
+        JSONObject reqBody = new JSONObject();
+        reqBody.put("token", accountToken);
+        String resp = Net.postJson(CloudEndpoint.ACCOUNT_SAVE_GET, reqBody.toString(), 15_000);
         JSONObject json = new JSONObject(resp);
         if (!json.optBoolean("success", false)) return new SaveData("{}", true);
         String data = json.optString("data", "{}");
@@ -81,10 +83,6 @@ public final class SaveSyncHelper {
         if (cloud.empty)                     return SyncState.LOCAL_ONLY;
         if (local.json.equals(cloud.json))   return SyncState.IN_SYNC;
         return SyncState.CONFLICT;
-    }
-
-    private static String esc(String s) {
-        return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
     }
 
     private SaveSyncHelper() {}

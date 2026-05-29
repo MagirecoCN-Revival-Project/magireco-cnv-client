@@ -41,6 +41,29 @@ public final class Net {
     /** 当 expectedTotal 已知且文件大小恰好等于它时，认为下载已完成。 */
     private static final double EQUAL_TOLERANCE = 0.0; // bytes 必须严格相等
 
+    /**
+     * getString / postJson / getStringWithToken 读入内存的响应体上限（64 MB）。
+     * 这些接口只用于控制面 JSON / S3 清单，正常体量在 KB~MB 级；
+     * 设上限防止被攻陷的服务端用超大响应耗尽内存（OOM crash）。
+     */
+    private static final long MAX_IN_MEMORY_RESPONSE = 64L * 1024 * 1024;
+
+    /** 把 InputStream 读成 UTF-8 字符串，超过 {@link #MAX_IN_MEMORY_RESPONSE} 抛 IOException。 */
+    private static String readCapped(InputStream is) throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        int n;
+        long total = 0;
+        while ((n = is.read(buf)) > 0) {
+            total += n;
+            if (total > MAX_IN_MEMORY_RESPONSE) {
+                throw new IOException("响应体超过上限 " + MAX_IN_MEMORY_RESPONSE + " 字节");
+            }
+            baos.write(buf, 0, n);
+        }
+        return baos.toString("UTF-8");
+    }
+
     private Net() {}
 
     /**
@@ -69,11 +92,7 @@ public final class Net {
             throw new IOException("HTTP " + code + " for " + url);
         }
         try (InputStream is = c.getInputStream()) {
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            byte[] buf = new byte[8192];
-            int n;
-            while ((n = is.read(buf)) > 0) baos.write(buf, 0, n);
-            return baos.toString("UTF-8");
+            return readCapped(is);
         } finally {
             try { c.disconnect(); } catch (Throwable ignore) {}
         }
@@ -102,11 +121,7 @@ public final class Net {
             String body = "";
             if (is != null) {
                 try {
-                    ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                    byte[] buf = new byte[8192];
-                    int n;
-                    while ((n = is.read(buf)) > 0) baos.write(buf, 0, n);
-                    body = baos.toString("UTF-8");
+                    body = readCapped(is);
                 } finally {
                     try { is.close(); } catch (Throwable ignore) {}
                 }
@@ -509,11 +524,7 @@ public final class Net {
             throw new IOException("HTTP " + code + " for " + url);
         }
         try (InputStream is = c.getInputStream()) {
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            byte[] buf = new byte[8192];
-            int n;
-            while ((n = is.read(buf)) > 0) baos.write(buf, 0, n);
-            return baos.toString("UTF-8");
+            return readCapped(is);
         } finally {
             try { c.disconnect(); } catch (Throwable ignore) {}
         }
