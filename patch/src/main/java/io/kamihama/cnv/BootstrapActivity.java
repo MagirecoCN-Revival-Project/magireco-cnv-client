@@ -72,6 +72,10 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     // ---- 常量 ----
     private static final int    REQ_FILE_PICK          = 0x4D47;
     private static final int    REQ_OVERLAY_PERMISSION = 0x4F56;
+
+    private static final int OFFLINE_CHOICE_RETRY   = 0;
+    private static final int OFFLINE_CHOICE_OFFLINE = 1;
+    private static final int OFFLINE_CHOICE_EXIT    = 2;
     private static final String PREFS_NAME        = "cnv_bootstrap_ui";
     private static final String PREF_DARK_MODE    = "dark_mode";
     private static final String PREFS_ACCOUNT     = "cnv_account";
@@ -1557,21 +1561,41 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
 
         // 第 0c 步：与云端 /client/init 握手（封禁 / 维护 / 版本闸门 / 功能开关）
         if (!isDebugFlag("skip_cloud_init")) {
-            log("启动", "INFO", "开始与云端握手…");
-            if (!handleCloudInit()) {
-                if (OfflineModeManager.isActive()) {
-                    if (alreadyReady) {
-                        log("启动", "WARN", "服务器不可达，资源已就绪，进入离线模式");
-                        enterOfflineMode();
-                    } else {
-                        log("启动", "ERROR", "服务器不可达且资源未下载，无法进入离线模式");
-                        showFatalAndExit("无法进入离线模式",
-                                "服务器暂时不可达，无法完成首次连接。\n\n"
-                              + "离线模式需要先完成一次完整的游戏资源下载。\n\n"
-                              + "请检查网络连接后重试。");
+            cloudInitLoop:
+            while (true) {
+                log("启动", "INFO", "开始与云端握手…");
+                if (!handleCloudInit()) {
+                    if (OfflineModeManager.isActive()) {
+                        if (alreadyReady) {
+                            // 资源已就绪——让用户选择：重试 / 离线模式 / 退出
+                            log("启动", "WARN", "服务器不可达，资源已就绪，询问用户");
+                            int choice = askOfflineModeChoice();
+                            if (choice == OFFLINE_CHOICE_RETRY) {
+                                OfflineModeManager.reset();
+                                log("启动", "INFO", "用户选择重试握手");
+                                continue cloudInitLoop;
+                            } else if (choice == OFFLINE_CHOICE_OFFLINE) {
+                                log("启动", "INFO", "用户选择进入离线模式");
+                                enterOfflineMode();
+                            } else {
+                                log("启动", "INFO", "用户选择退出");
+                                ui.post(() -> {
+                                    try { finishAndRemoveTask(); }
+                                    catch (Throwable ignore) {}
+                                    android.os.Process.killProcess(android.os.Process.myPid());
+                                });
+                            }
+                        } else {
+                            log("启动", "ERROR", "服务器不可达且资源未下载，无法进入离线模式");
+                            showFatalAndExit("无法进入离线模式",
+                                    "服务器暂时不可达，无法完成首次连接。\n\n"
+                                  + "离线模式需要先完成一次完整的游戏资源下载。\n\n"
+                                  + "请检查网络连接后重试。");
+                        }
                     }
+                    return;
                 }
-                return;
+                break;
             }
         } else {
             log("启动", "WARN", "调试：skip_cloud_init=true，已跳过云端握手（使用默认功能开关）");
@@ -2455,6 +2479,57 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
      * 启动悬浮存档服务（若已获得悬浮窗权限），然后启动游戏。
      * 在主线程调用。
      */
+    /**
+     * 服务器不可达、资源已就绪时弹出选择框，返回用户决定。
+     * 在工作线程调用，阻塞直到用户点击按钮。
+     * 返回值：{@link #OFFLINE_CHOICE_RETRY}、{@link #OFFLINE_CHOICE_OFFLINE}
+     *         或 {@link #OFFLINE_CHOICE_EXIT}。
+     */
+    private int askOfflineModeChoice() {
+        final Object lock    = new Object();
+        final int[]  result  = { OFFLINE_CHOICE_EXIT };
+        final boolean[] done = { false };
+        ui.post(() -> {
+            View[] frame = inflateDialogFrame();
+            FrameLayout overlay = (FrameLayout) frame[0];
+            LinearLayout card   = (LinearLayout) frame[1];
+            addDialogTitle(card, "服务器不可达");
+            addDialogMessage(card,
+                    "已连续尝试 3 次，均无法联系服务器。\n\n"
+                  + "游戏资源已就绪，可以进入离线模式直连私服后端运行游戏，"
+                  + "但账号登录和存档同步将不可用。");
+            LinearLayout row = addDialogButtonRow(card);
+            Button exitBtn    = addDialogButton(row, "退出",     false);
+            Button retryBtn   = addDialogButton(row, "重试",     false);
+            Button offlineBtn = addDialogButton(row, "离线模式", true);
+            exitBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { result[0] = OFFLINE_CHOICE_EXIT; done[0] = true; lock.notifyAll(); }
+            });
+            retryBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { result[0] = OFFLINE_CHOICE_RETRY; done[0] = true; lock.notifyAll(); }
+            });
+            offlineBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { result[0] = OFFLINE_CHOICE_OFFLINE; done[0] = true; lock.notifyAll(); }
+            });
+            overlay.setVisibility(View.VISIBLE);
+        });
+        synchronized (lock) {
+            while (!done[0]) {
+                try { lock.wait(500); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return OFFLINE_CHOICE_EXIT;
+                }
+            }
+            return result[0];
+        }
+    }
+
     /**
      * 服务器不可达时的离线模式入口：跳过热更新、账号登录、存档同步，
      * 直连 Totentanz 后端启动游戏，并显示离线状态悬浮标签。

@@ -5,5 +5,6 @@ public final class OfflineModeManager {
     private static volatile boolean sActive = false;
     private OfflineModeManager() {}
     public static void activate()        { sActive = true;  }
+    public static void reset()           { sActive = false; }
     public static boolean isActive()     { return sActive;  }
 }
