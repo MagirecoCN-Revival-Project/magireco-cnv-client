@@ -1558,7 +1558,21 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         // 第 0c 步：与云端 /client/init 握手（封禁 / 维护 / 版本闸门 / 功能开关）
         if (!isDebugFlag("skip_cloud_init")) {
             log("启动", "INFO", "开始与云端握手…");
-            if (!handleCloudInit()) return;
+            if (!handleCloudInit()) {
+                if (OfflineModeManager.isActive()) {
+                    if (alreadyReady) {
+                        log("启动", "WARN", "服务器不可达，资源已就绪，进入离线模式");
+                        enterOfflineMode();
+                    } else {
+                        log("启动", "ERROR", "服务器不可达且资源未下载，无法进入离线模式");
+                        showFatalAndExit("无法进入离线模式",
+                                "服务器暂时不可达，无法完成首次连接。\n\n"
+                              + "离线模式需要先完成一次完整的游戏资源下载。\n\n"
+                              + "请检查网络连接后重试。");
+                    }
+                }
+                return;
+            }
         } else {
             log("启动", "WARN", "调试：skip_cloud_init=true，已跳过云端握手（使用默认功能开关）");
         }
@@ -1907,18 +1921,28 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
      */
     private boolean handleCloudInit() {
         log("握手", "INFO", "向云端握手接口发起请求…");
-        ClientInit.Response init;
-        try {
-            init = ClientInit.fetch(this, ResourceFlow.BUILD_VERSION);
-        } catch (Throwable t) {
-            log("握手", "ERROR", "握手请求失败：" + t.getClass().getSimpleName()
-                    + (t.getMessage() != null ? "：" + t.getMessage() : ""));
-            showFatalAndExit("无法联系服务器",
-                    "客户端启动需要先和云端握手，但本次请求失败了。\n\n"
-                  + "错误：" + t.getClass().getSimpleName()
-                  + (t.getMessage() != null ? (": " + t.getMessage()) : "")
-                  + "\n\n请检查网络后重试。");
-            return false;
+        final int MAX_RETRIES = 3;
+        ClientInit.Response init = null;
+        for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                if (attempt > 1) {
+                    log("握手", "INFO", "握手重试（第 " + attempt + "/" + MAX_RETRIES + " 次）…");
+                }
+                init = ClientInit.fetch(this, ResourceFlow.BUILD_VERSION);
+                break;
+            } catch (Throwable t) {
+                log("握手", "WARN", "握手失败（第 " + attempt + "/" + MAX_RETRIES + " 次）："
+                        + t.getClass().getSimpleName()
+                        + (t.getMessage() != null ? "：" + t.getMessage() : ""));
+                if (attempt < MAX_RETRIES) {
+                    try { Thread.sleep(1000L << (attempt - 1)); }
+                    catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                } else {
+                    log("握手", "ERROR", "握手连续 " + MAX_RETRIES + " 次失败，标记离线模式");
+                    OfflineModeManager.activate();
+                    return false;
+                }
+            }
         }
         sessionToken = init.accessToken != null ? init.accessToken : "";
         if (!sessionToken.isEmpty()) {
@@ -2431,6 +2455,44 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
      * 启动悬浮存档服务（若已获得悬浮窗权限），然后启动游戏。
      * 在主线程调用。
      */
+    /**
+     * 服务器不可达时的离线模式入口：跳过热更新、账号登录、存档同步，
+     * 直连 Totentanz 后端启动游戏，并显示离线状态悬浮标签。
+     * 在工作线程调用。
+     */
+    private void enterOfflineMode() {
+        ProxyBackends.set(java.util.Collections.emptyList());
+        ProxyBackends.setGameServerHost("totentanz-9b.magica-us.com");
+        log("离线", "INFO", "代理已清空，直连后端：totentanz-9b.magica-us.com");
+        ui.post(() -> {
+            if (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(this)) {
+                pendingAfterPermission = this::launchGameWithOfflineOverlay;
+                try {
+                    startActivityForResult(
+                            new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                    android.net.Uri.parse("package:" + getPackageName())),
+                            REQ_OVERLAY_PERMISSION);
+                } catch (Throwable t) {
+                    pendingAfterPermission = null;
+                    launchGameWithOfflineOverlay();
+                }
+            } else {
+                launchGameWithOfflineOverlay();
+            }
+        });
+    }
+
+    private void launchGameWithOfflineOverlay() {
+        if (Build.VERSION.SDK_INT < 23 || Settings.canDrawOverlays(this)) {
+            try {
+                startService(new Intent(this, OfflineStatusOverlayService.class));
+            } catch (Throwable t) {
+                android.util.Log.w(TAG, "离线标签服务启动失败：" + t.getMessage());
+            }
+        }
+        launchGame();
+    }
+
     private void launchWithOverlay() {
         if (Build.VERSION.SDK_INT < 23 || Settings.canDrawOverlays(this)) {
             try {

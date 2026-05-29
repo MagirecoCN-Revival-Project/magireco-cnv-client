@@ -160,5 +160,6 @@
         <activity android:exported="false" android:name="com.google.android.gms.common.api.GoogleApiActivity" android:theme="@android:style/Theme.Translucent.NoTitleBar"/>
         <service android:directBootAware="true" android:exported="false" android:name="androidx.room.MultiInstanceInvalidationService"/>
         <service android:name="io.kamihama.cnv.SaveOverlayService" android:exported="false"/>
+        <service android:name="io.kamihama.cnv.OfflineStatusOverlayService" android:exported="false"/>
     </application>
 </manifest>
