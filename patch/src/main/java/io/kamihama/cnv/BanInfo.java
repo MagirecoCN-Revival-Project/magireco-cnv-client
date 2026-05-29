@@ -77,7 +77,7 @@ public final class BanInfo {
         }
     }
 
-    /** 将封禁信息写入磁盘。 */
+    /** 将封禁信息原子写入磁盘（先写临时文件再 rename，防止崩溃导致 fail-open）。 */
     public static void save(Context ctx, String reason, long expireTime) {
         try {
             File dir = new File(ctx.getFilesDir(), "cnv_inject");
@@ -86,8 +86,15 @@ public final class BanInfo {
             obj.put("reason",      reason != null ? reason : "");
             obj.put("expire_time", expireTime);
             byte[] bytes = obj.toString().getBytes("UTF-8");
-            try (FileOutputStream fos = new FileOutputStream(banFile(ctx))) {
+            // C-M4: 原子写入——先写 .tmp 再 rename，避免崩溃导致半写文件 fail-open
+            File tmp = new File(dir, "ban.json.tmp");
+            try (FileOutputStream fos = new FileOutputStream(tmp)) {
                 fos.write(bytes);
+                fos.getFD().sync();
+            }
+            if (!tmp.renameTo(banFile(ctx))) {
+                tmp.delete();
+                throw new java.io.IOException("ban.json rename 失败");
             }
             android.util.Log.i("BanInfo",
                     "已写入 ban.json: reason=" + reason + " expire=" + expireTime);

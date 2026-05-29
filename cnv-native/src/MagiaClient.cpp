@@ -18,6 +18,8 @@
 #include <mutex>
 #include <functional>
 #include <unordered_map>
+#include <vector>
+#include <atomic>
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -72,6 +74,19 @@ static std::mutex g_infoCallbackMutex;
 // ─── layer → info 映射 ───────────────────────────────────
 static std::unordered_map<void*, void*> g_layerInfoMap;
 static std::mutex g_layerInfoMutex;
+
+// ─── 游戏代理后端 ─────────────────────────────────────────
+// 由 Java 侧 ProxyBackends.set() 在握手成功后写入。
+// setURINew 首次触发时通过 JNI 加载，之后静态使用（不热更新）。
+static std::vector<std::string> g_proxyBackends;   // 代理后端 URL 列表（含协议，不含末尾斜杠）
+static std::string              g_gameServerHost;   // 要被代理的原版游戏 host（服务端下发）
+static std::atomic<size_t>      g_proxyIdx{0};      // 当前使用的后端索引；>= size() 时回退原版
+static std::mutex               g_proxyMutex;
+static std::once_flag           g_proxyLoadOnce;
+// ProxyBackends 类的全局引用，必须在 JNI_OnLoad（持有 App ClassLoader 的线程）
+// 阶段缓存。setURI 钩子运行在引擎网络线程上，该线程经 AttachCurrentThread 附加，
+// 其 FindClass 走系统 ClassLoader，看不到 App 类——直接 FindClass 必返回 null。
+static jclass                   g_proxyBackendsClass = nullptr;
 
 // ─── 辅助 ─────────────────────────────────────────────────
 static bool fileExists(const std::string& p) {
@@ -198,19 +213,21 @@ bool checkParseJsonNew(void* _this, const cocos2d::Data& data) {
         return checkParseJsonOld(_this, g_emptyData);
     }
     if (data._bytes && data._size > 0) {
-        const char* p = (const char*)data._bytes;
-        if (strstr(p, "asset_optimize")) {
+        // C-M2: 使用 string_view 进行有界搜索（strstr 对无 NUL 终止的缓冲区不安全）
+        std::string_view sv(reinterpret_cast<const char*>(data._bytes),
+                            static_cast<size_t>(data._size));
+        if (sv.find("asset_optimize") != std::string_view::npos) {
             LOGI("[checkParseJson] 修正 asset_optimize");
-            static std::string fixed;
-            fixed.assign(p, data._size);
+            // C-M2: 使用栈上局部 std::string，消除静态存储的多线程竞态
+            std::string patched(sv);
             size_t pos = 0;
-            while ((pos = fixed.find(":1", pos)) != std::string::npos) {
-                fixed.replace(pos, 2, ":0");
+            while ((pos = patched.find(":1", pos)) != std::string::npos) {
+                patched.replace(pos, 2, ":0");
                 pos += 2;
             }
             cocos2d::Data d;
-            d._bytes = (unsigned char*)fixed.c_str();
-            d._size = (ssize_t)fixed.size();
+            d._bytes = reinterpret_cast<unsigned char*>(patched.data());
+            d._size  = static_cast<ssize_t>(patched.size());
             return checkParseJsonOld(_this, d);
         }
     }
@@ -257,6 +274,8 @@ void mainSceneOnErrNew(void* _this, void* session, int code) {
         LOGE("[MainScene::onErr] flag 缺失，静默丢弃错误 code=%d", code);
         return;
     }
+    // 游戏正常运行时的 API 错误：推进代理索引，让后续请求尝试下一条代理
+    advanceProxy("MainScene::onErr", code);
     mainSceneOnErrOld(_this, session, code);
 }
 
@@ -273,10 +292,127 @@ void questDataOnRespNew(void* _this, void* session, void* resp) {
 }
 
 // ════════════════════════════════════════════════════════
+// 代理后端辅助函数
+// ════════════════════════════════════════════════════════
+
+// 从 Java 侧 ProxyBackends 类加载代理配置（仅调用一次）。
+// 使用 JNI_OnLoad 阶段缓存的全局类引用，不在工作线程上 FindClass。
+static void loadProxyConfig(JNIEnv* env) {
+    jclass cls = g_proxyBackendsClass;
+    if (!cls) { LOGE("[Proxy] ProxyBackends 类未缓存，跳过代理加载"); return; }
+
+    // 读取代理后端列表
+    jmethodID getArr = env->GetStaticMethodID(cls, "get", "()[Ljava/lang/String;");
+    if (getArr) {
+        auto arr = (jobjectArray)env->CallStaticObjectMethod(cls, getArr);
+        if (arr) {
+            std::lock_guard<std::mutex> lk(g_proxyMutex);
+            g_proxyBackends.clear();
+            g_proxyIdx.store(0);
+            int n = env->GetArrayLength(arr);
+            for (int i = 0; i < n; i++) {
+                auto js = (jstring)env->GetObjectArrayElement(arr, i);
+                if (!js) continue;
+                const char* cs = env->GetStringUTFChars(js, nullptr);
+                if (cs && cs[0]) g_proxyBackends.emplace_back(cs);
+                if (cs) env->ReleaseStringUTFChars(js, cs);
+                env->DeleteLocalRef(js);
+            }
+            env->DeleteLocalRef(arr);
+            LOGI("[Proxy] 加载代理后端 %d 条", (int)g_proxyBackends.size());
+        }
+    }
+
+    // 读取原版游戏 server host（可选，用于精确匹配）
+    jmethodID getHost = env->GetStaticMethodID(cls, "getGameServerHost", "()Ljava/lang/String;");
+    if (getHost) {
+        auto js = (jstring)env->CallStaticObjectMethod(cls, getHost);
+        if (js) {
+            const char* cs = env->GetStringUTFChars(js, nullptr);
+            if (cs && cs[0]) {
+                std::lock_guard<std::mutex> lk(g_proxyMutex);
+                g_gameServerHost = cs;
+                LOGI("[Proxy] game-server host: %s", cs);
+            }
+            if (cs) env->ReleaseStringUTFChars(js, cs);
+            env->DeleteLocalRef(js);
+        }
+    }
+    // 任何遗留的 JNI 异常都清掉，避免污染后续引擎自身的 JNI 调用。
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    // cls 为全局引用，进程内长期持有，不在此释放。
+}
+
+// 推进代理索引（因错误切换到下一条；耗尽时回退原版）。
+static void advanceProxy(const char* ctx, int code) {
+    std::lock_guard<std::mutex> lk(g_proxyMutex);
+    if (g_proxyBackends.empty()) return;
+    size_t prev = g_proxyIdx.fetch_add(1);
+    size_t next  = prev + 1;
+    if (next < g_proxyBackends.size()) {
+        LOGI("[Proxy] %s code=%d → 切换代理[%zu]: %s", ctx, code, next, g_proxyBackends[next].c_str());
+    } else {
+        LOGI("[Proxy] %s code=%d → 所有代理均失败，后续请求将回退私服后端", ctx, code);
+    }
+}
+
+// ════════════════════════════════════════════════════════
 // setURI / Http2::onResp — HTTP 请求拦截
 // ════════════════════════════════════════════════════════
 void setURINew(void* _this, const std::string& uri) {
-    setURIOld(_this, uri);
+    // 首次触发时从 Java 加载代理配置（std::call_once 保证线程安全且只执行一次）。
+    //
+    // 顺序保证（load-bearing）：BootstrapActivity.runWork() 先调
+    // handleCloudInit()→ProxyBackends.set()，之后才 launchGame() 启动
+    // jp.f4samurai.AppActivity 加载引擎 .so 并发起首个网络请求。因此
+    // setURI 首次触发时代理列表必已写入，call_once 锁存的不会是空表。
+    std::call_once(g_proxyLoadOnce, [&]() {
+        bool att;
+        JNIEnv* env = attachEnv(att);
+        if (env) {
+            loadProxyConfig(env);
+            if (att) gJvm->DetachCurrentThread();
+        }
+    });
+
+    std::string targetUri = uri;
+    {
+        std::lock_guard<std::mutex> lk(g_proxyMutex);
+        if (!uri.empty()) {
+            // 判断是否为需要代理的游戏 API 请求：
+            //   精确 host 匹配（game_server_host 命中）|| 路径前缀兜底（/magica/api/）。
+            // libmadomagi_native.so 里硬编码的是已停服的官方 f4samurai 域名；
+            // game_server_host 应设为私服 host（如 totentanz-9b.magica-us.com），
+            // 精确匹配不会命中 f4samurai URI，因此路径兜底始终生效。
+            bool shouldProxy = (!g_gameServerHost.empty() && uri.find(g_gameServerHost) == 0)
+                            || (uri.find("/magica/api/") != std::string::npos);
+
+            if (shouldProxy) {
+                size_t p = uri.find("://");
+                size_t pathStart = (p != std::string::npos)
+                    ? uri.find('/', p + 3) : std::string::npos;
+                if (pathStart == std::string::npos) pathStart = uri.size();
+
+                size_t idx = g_proxyIdx.load();
+                std::string backend;
+                if (!g_proxyBackends.empty() && idx < g_proxyBackends.size()) {
+                    backend = g_proxyBackends[idx];
+                } else if (!g_gameServerHost.empty()) {
+                    // 所有代理已耗尽（或未配置代理），回退私服后端
+                    std::string scheme = (p != std::string::npos) ? uri.substr(0, p) : "https";
+                    backend = scheme + "://" + g_gameServerHost;
+                    LOGI("[setURI] 代理耗尽，回退 %s", g_gameServerHost.c_str());
+                }
+
+                if (!backend.empty()) {
+                    targetUri = backend + uri.substr(pathStart);
+                    LOGI("[setURI] → %s", targetUri.c_str());
+                }
+            }
+        }
+    }
+
+    setURIOld(_this, targetUri);
 }
 void http2OnRespNew(void* _this, void* resp) {
     if (getDataOld && getDataSizeOld) {
@@ -391,6 +527,21 @@ extern "C" jint JNI_OnLoad(JavaVM* vm, void* reserved) {
             if (p1) getDataOld     = reinterpret_cast<const unsigned char*(*)(void*)>(p1);
             if (p2) getDataSizeOld = reinterpret_cast<size_t(*)(void*)>(p2);
             shadowhook_dlclose(handle);
+        }
+    }
+
+    // ── 缓存 ProxyBackends 类的全局引用 ───────────────────
+    // 本线程（System.loadLibrary 调用线程）持有 App ClassLoader，
+    // 能正确解析 io.kamihama.cnv.ProxyBackends；网络线程则不能。
+    {
+        jclass localCls = env->FindClass("io/kamihama/cnv/ProxyBackends");
+        if (localCls) {
+            g_proxyBackendsClass = (jclass)env->NewGlobalRef(localCls);
+            env->DeleteLocalRef(localCls);
+            LOGI("[Proxy] 已缓存 ProxyBackends 类全局引用");
+        } else {
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            LOGE("[Proxy] JNI_OnLoad 阶段找不到 ProxyBackends 类，代理功能将不可用");
         }
     }
 

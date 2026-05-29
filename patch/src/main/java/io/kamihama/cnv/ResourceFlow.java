@@ -202,7 +202,7 @@ public final class ResourceFlow {
             reporter.log("WARN", "method-select 上报失败（忽略）: " + t.getMessage());
         }
 
-        // 2. 获取镜像列表和 S3 资源令牌
+        // 2. 获取镜像组列表和 S3 资源令牌
         reporter.setStatus("正在获取镜像列表…");
         ClientInit.OnlineDownloadInfo dlInfo;
         try {
@@ -214,33 +214,37 @@ public final class ResourceFlow {
             throw new FatalConfigException("fetchOnlineDownload failed");
         }
 
-        if (dlInfo.mirrors == null || dlInfo.mirrors.isEmpty()
+        if (dlInfo.groups == null || dlInfo.groups.isEmpty()
                 || dlInfo.resourceToken == null || dlInfo.resourceToken.isEmpty()) {
             reporter.showFatalAndExit("资源配置缺失",
                     "服务端未返回资源下载地址或令牌，无法在线下载。\n\n请联系管理员。");
             throw new FatalConfigException("no mirrors");
         }
 
-        // 3. 构建线路表（当前只有一条"默认线路"）
+        // 3. 构建线路表（每个 MirrorGroup 对应一条线路）
         LinkedHashMap<String, List<String>> lines = new LinkedHashMap<>();
-        lines.put("默认线路", new ArrayList<>(dlInfo.mirrors));
+        Map<String, ClientInit.OnlineDownloadInfo.MirrorGroup> groupByName = new LinkedHashMap<>();
+        for (ClientInit.OnlineDownloadInfo.MirrorGroup g : dlInfo.groups) {
+            lines.put(g.name, g.urls());
+            groupByName.put(g.name, g);
+        }
 
         String selectedLine = lines.size() > 1
                 ? reporter.requestLineChoice(lines)
                 : lines.keySet().iterator().next();
 
-        List<String> mirrors = lines.get(selectedLine);
-        if (mirrors == null || mirrors.isEmpty()) {
+        ClientInit.OnlineDownloadInfo.MirrorGroup selectedGroup = groupByName.get(selectedLine);
+        if (selectedGroup == null || selectedGroup.entries.isEmpty()) {
             throw new FatalConfigException("empty mirrors for line: " + selectedLine);
         }
 
-        // 4. 获取文件清单（从第一个可用镜像）
+        // 4. 获取文件清单
         reporter.setPhase("download");
         reporter.setStatus("正在获取资源清单…");
-        reporter.log("INFO", "下载线路已选定，镜像数=" + mirrors.size());
+        reporter.log("INFO", "下载线路已选定，镜像数=" + selectedGroup.entries.size());
 
-        List<S3List.Entry> entries = fetchManifest(mirrors, dlInfo.resourceToken);
-        entries = filterHotUpdateFiles(entries);   // js/scenario 由热更新单独处理
+        List<FileEntry> entries = fetchManifestForGroup(selectedGroup, dlInfo.resourceToken);
+        entries = filterHotUpdateFiles(entries);
         if (entries.isEmpty()) {
             reporter.showFatalAndExit("资源清单为空",
                     "从服务端拿到的资源清单是空的，无法继续下载。\n\n请联系管理员。");
@@ -248,19 +252,19 @@ public final class ResourceFlow {
         }
         reporter.log("INFO", "清单条目数=" + entries.size());
 
-        // 4. 预建所有文件槽位（每文件固定一个，灰色待命状态）
+        // 5. 预建所有文件槽位（每文件固定一个，灰色待命状态）
         reporter.initSlots(entries.size());
         for (int pi = 0; pi < entries.size(); pi++) {
-            reporter.setSlot(pi, entries.get(pi).key, 0, entries.get(pi).size, 0);
+            reporter.setSlot(pi, entries.get(pi).entry.key, 0, entries.get(pi).entry.size, 0);
         }
 
-        // 5. 并发数
-        int concurrency = reporter.requestConcurrency(Math.min(4, mirrors.size()));
+        // 6. 并发数
+        int concurrency = reporter.requestConcurrency(Math.min(4, selectedGroup.entries.size()));
 
-        // 6. 下载所有文件
-        downloadAll(entries, mirrors, dlInfo.resourceToken, concurrency);
+        // 7. 下载所有文件
+        downloadAll(entries, dlInfo.resourceToken, concurrency);
 
-        // 7. 完成
+        // 8. 完成
         reporter.setPhase("done");
         reporter.setStatus("下载完成");
         reporter.log("INFO", "所有资源下载完成");
@@ -268,35 +272,54 @@ public final class ResourceFlow {
     }
 
     /**
-     * 从镜像列表中轮询获取 S3 XML 清单，返回 Entry 列表。
-     * 每个镜像最多尝试一次；全部失败时抛 IOException。
+     * 获取镜像组的文件清单，返回 FileEntry 列表。
+     *
+     * <p>若该组镜像提供了文件列表，则直接合并各镜像的文件列表（同一 key 首次出现者胜）；
+     * 否则对每个镜像 URL 根目录请求 S3 XML 并合并结果。
      */
-    private List<S3List.Entry> fetchManifest(List<String> mirrors, String resourceToken) throws Exception {
-        Exception last = null;
-        for (String mirror : mirrors) {
-            try {
-                String url = mirror.endsWith("/") ? mirror : mirror + "/";
-                reporter.log("INFO", "正在拉取资源清单…");
-                String xml = Net.getStringWithToken(url, resourceToken, 20_000);
-                List<S3List.Entry> result = S3List.parse(xml);
-                if (!result.isEmpty()) return result;
-                reporter.log("WARN", "清单 XML 解析结果为空，尝试下一个镜像");
-            } catch (Exception e) {
-                reporter.log("WARN", "清单拉取失败，尝试下一个镜像：" + e.getMessage());
-                last = e;
+    private List<FileEntry> fetchManifestForGroup(
+            ClientInit.OnlineDownloadInfo.MirrorGroup group, String resourceToken) throws Exception {
+        Map<String, FileEntry> byKey = new LinkedHashMap<>();
+        if (group.hasFileLists()) {
+            for (ClientInit.OnlineDownloadInfo.MirrorEntry me : group.entries) {
+                if (me.files == null) continue;
+                for (S3List.Entry e : me.files)
+                    if (!byKey.containsKey(e.key))
+                        byKey.put(e.key, new FileEntry(e, me.url));
             }
+        } else {
+            Exception last = null;
+            for (ClientInit.OnlineDownloadInfo.MirrorEntry me : group.entries) {
+                try {
+                    String url = me.url.endsWith("/") ? me.url : me.url + "/";
+                    reporter.log("INFO", "正在拉取资源清单…");
+                    String xml = Net.getStringWithToken(url, resourceToken, 20_000);
+                    List<S3List.Entry> result = S3List.parse(xml);
+                    if (result.isEmpty()) {
+                        reporter.log("WARN", "清单 XML 解析结果为空，尝试下一个镜像");
+                        continue;
+                    }
+                    for (S3List.Entry e : result)
+                        if (!byKey.containsKey(e.key))
+                            byKey.put(e.key, new FileEntry(e, me.url));
+                } catch (Exception e) {
+                    reporter.log("WARN", "清单拉取失败，尝试下一个镜像：" + e.getMessage());
+                    last = e;
+                }
+            }
+            if (byKey.isEmpty())
+                throw last != null ? last : new java.io.IOException("所有镜像均无法拉取清单");
         }
-        throw last != null ? last : new java.io.IOException("所有镜像均无法拉取清单");
+        return new ArrayList<>(byKey.values());
     }
 
     /** 多线程并发下载所有条目，同时启动心跳线程向服务端汇报进度。 */
-    private void downloadAll(List<S3List.Entry> entries,
-                             List<String> mirrors,
+    private void downloadAll(List<FileEntry> entries,
                              String resourceToken,
                              int concurrency) throws Exception {
         File destDir = ctx.getFilesDir();
         long totalBytes = 0L;
-        for (S3List.Entry e : entries) totalBytes += Math.max(0, e.size);
+        for (FileEntry fe : entries) totalBytes += Math.max(0, fe.entry.size);
         final long totalBytesF = totalBytes;
         final int  total       = entries.size();
 
@@ -307,9 +330,8 @@ public final class ResourceFlow {
 
         // 每个文件的下载状态（心跳读取；download worker 写入）
         ConcurrentHashMap<String, DownloadState> fileStates = new ConcurrentHashMap<>();
-        String defaultMirror = mirrors.get(0);
-        for (S3List.Entry e : entries) {
-            fileStates.put(e.key, new DownloadState(e.key, defaultMirror));
+        for (FileEntry fe : entries) {
+            fileStates.put(fe.entry.key, new DownloadState(fe.entry.key, fe.mirror));
         }
 
         // 启动心跳线程
@@ -330,7 +352,8 @@ public final class ResourceFlow {
         CountDownLatch latch = new CountDownLatch(total);
 
         for (int i = 0; i < total; i++) {
-            final S3List.Entry entry = entries.get(i);
+            final FileEntry fe = entries.get(i);
+            final S3List.Entry entry = fe.entry;
             if (firstErr.get() != null || reporter.isCancelled()) {
                 latch.countDown();
                 continue;
@@ -347,7 +370,18 @@ public final class ResourceFlow {
                     if (firstErr.get() != null || reporter.isCancelled()) return;
 
                     DownloadState state = fileStates.get(entry.key);
+                    // C-H6: 拒绝路径遍历（server-controlled entry.key）
+                    if (entry.key.startsWith("/") || entry.key.contains("\0")
+                            || entry.key.contains("\n")) {
+                        throw new java.io.IOException("非法 key（非法字符）：" + entry.key);
+                    }
                     File target = new File(destDir, entry.key);
+                    String tCanon = target.getCanonicalPath();
+                    String dCanon = destDir.getCanonicalPath();
+                    if (!tCanon.equals(dCanon)
+                            && !tCanon.startsWith(dCanon + File.separator)) {
+                        throw new java.io.IOException("拒绝路径遍历 key：" + entry.key);
+                    }
                     File parent = target.getParentFile();
                     if (parent != null && !parent.exists()) parent.mkdirs();
 
@@ -435,6 +469,13 @@ public final class ResourceFlow {
     }
 
     // ── 心跳系统内部类 ────────────────────────────────────────────────────
+
+    /** 文件条目：S3 Entry + 该文件归属的初始镜像 URL。 */
+    private static final class FileEntry {
+        final S3List.Entry entry;
+        final String       mirror;
+        FileEntry(S3List.Entry e, String m) { entry = e; mirror = m; }
+    }
 
     /** 单个文件的实时下载状态，由 download worker 写入，HeartbeatSender 读取。 */
     private static final class DownloadState {
@@ -597,118 +638,130 @@ public final class ResourceFlow {
         }
 
         reporter.setPhase("offline-verify");
-        reporter.setStatus("正在校验 zip 格式…");
+        reporter.setStatus("正在缓存离线包到私有临时目录…");
         reporter.log("INFO", "离线包 URI: " + zipUri);
-        verifyZip(zipUri);
 
-        // SHA-256 校验：仅在服务端下发了哈希值时执行
-        if (cloudSha256 != null && !cloudSha256.isEmpty()) {
-            reporter.setStatus("正在计算文件 SHA-256…");
-            reporter.log("INFO", "开始计算离线包 SHA-256，期望值=" + cloudSha256);
-            String actualSha256;
-            try {
-                actualSha256 = sha256HexFromUri(zipUri);
-            } catch (Exception e) {
-                reporter.log("WARN", "SHA-256 计算失败：" + e.getMessage() + "，跳过校验");
-                actualSha256 = null;
+        // C-C3: TOCTOU 防护——将 content:// URI 一次性拷到私有临时文件，
+        // 后续所有操作（验证、SHA-256、解压）均读此临时文件，
+        // 避免恶意 ContentProvider 在两次 openInputStream 之间返回不同字节。
+        File importedZip = new File(ctx.getCacheDir(), "cnv_import_" + System.currentTimeMillis() + ".zip");
+        try {
+            // ── 拷贝 ─────────────────────────────────────────────────────────────
+            try (InputStream src = ctx.getContentResolver().openInputStream(zipUri);
+                 FileOutputStream dst = new FileOutputStream(importedZip)) {
+                if (src == null) throw new java.io.IOException("无法打开离线包文件流");
+                byte[] cpBuf = new byte[65536];
+                int cpN;
+                while ((cpN = src.read(cpBuf)) != -1) dst.write(cpBuf, 0, cpN);
             }
-            if (actualSha256 != null && !cloudSha256.equalsIgnoreCase(actualSha256)) {
-                reporter.log("WARN", "SHA-256 校验不通过：期望=" + cloudSha256 + "，实际=" + actualSha256);
-                boolean proceed = reporter.confirmSha256Mismatch(cloudSha256, actualSha256);
-                if (!proceed) {
-                    throw new FatalConfigException("SHA-256 校验不通过，用户取消注入");
+            reporter.log("INFO", "离线包已缓存到临时文件: " + importedZip.length() + " 字节");
+
+            reporter.setStatus("正在校验 zip 格式…");
+            verifyZipFile(importedZip);
+
+            // SHA-256 校验：C-L1/C-L2: 必须硬失败，不允许跳过或用户覆盖
+            if (cloudSha256 != null && !cloudSha256.isEmpty()) {
+                reporter.setStatus("正在计算文件 SHA-256…");
+                reporter.log("INFO", "开始计算离线包 SHA-256，期望值=" + cloudSha256);
+                // C-L2: 异常不再捕获——SHA-256 计算失败视为致命错误
+                String actualSha256 = sha256HexFromFile(importedZip);
+                if (!cloudSha256.equalsIgnoreCase(actualSha256)) {
+                    // C-L1: 校验不通过时硬失败，不向用户提供继续选项
+                    reporter.log("ERROR", "SHA-256 校验失败：期望=" + cloudSha256 + "，实际=" + actualSha256);
+                    throw new FatalConfigException(
+                            "离线包 SHA-256 校验失败，已拒绝注入。期望=" + cloudSha256 + " 实际=" + actualSha256);
                 }
-                reporter.log("WARN", "用户选择忽略 SHA-256 校验不通过，继续注入");
-            } else if (actualSha256 != null) {
                 reporter.log("INFO", "SHA-256 校验通过：" + cloudSha256);
             }
-        }
 
-        // ── 第一阶段：解压外层 zip 到暂存目录（避免直接覆盖 filesDir）──────────
-        File stagingDir = new File(ctx.getFilesDir(), "cnv_staging");
-        deleteRecursive(stagingDir);  // 清理可能残留的旧暂存
-        stagingDir.mkdirs();
+            // ── 第一阶段：解压外层 zip 到暂存目录（避免直接覆盖 filesDir）──────────
+            File stagingDir = new File(ctx.getFilesDir(), "cnv_staging");
+            deleteRecursive(stagingDir);  // 清理可能残留的旧暂存
+            stagingDir.mkdirs();
 
-        try {
-            reporter.initSlots(1);
-            reporter.setSlot(0, "外层 zip（暂存解压）", 0, -1, 0);
-            reporter.setSlotPhase(0, "extracting");
-            reporter.setPhase("offline-stage1");
-            reporter.setStatus("正在解压外层 zip 到暂存目录…");
+            try {
+                reporter.initSlots(1);
+                reporter.setSlot(0, "外层 zip（暂存解压）", 0, -1, 0);
+                reporter.setSlotPhase(0, "extracting");
+                reporter.setPhase("offline-stage1");
+                reporter.setStatus("正在解压外层 zip 到暂存目录…");
 
-            long totalBytes = queryStreamLength(zipUri);
-            try (InputStream is = ctx.getContentResolver().openInputStream(zipUri)) {
-                if (is == null) throw new java.io.IOException("无法打开文件流");
-                // 不剥离前缀，保留外层 zip 的原始目录结构，便于找到内层 zip
-                Unzip.extractFromStream(is, stagingDir, totalBytes, "", new Unzip.ProgressSink() {
-                    @Override public void onEntry(String name, long idx, long est) {
-                        reporter.setStatus("暂存: " + name);
-                    }
-                    @Override public void onEntryBytes(long written, long uncompressedSize) {
-                        reporter.setSlot(0, null, written, uncompressedSize, 0);
-                    }
-                    @Override public void onEntryDone(String name) {}
-                    @Override public void onBytes(long bytesProcessed, long bytesTotal) {
-                        reporter.setOverallProgress(bytesProcessed,
-                                bytesTotal > 0 ? bytesTotal : totalBytes);
-                    }
-                    @Override public boolean isCancelled() { return reporter.isCancelled(); }
-                });
-            }
-            reporter.setSlotPhase(0, "done");
-            reporter.log("INFO", "第一阶段完成，扫描暂存目录中的内层 zip…");
-
-            // ── 第二阶段：找到所有内层 zip，逐一解压到 filesDir ─────────────────────
-            List<File> innerZips = findInnerZipsRecursive(stagingDir);
-            reporter.log("INFO", "发现内层 zip 数量=" + innerZips.size());
-
-            File destDir = ctx.getFilesDir();
-            if (innerZips.isEmpty()) {
-                // 外层 zip 内无嵌套 zip，将暂存内容复制到目标目录
-                reporter.log("INFO", "未发现内层 zip，直接复制暂存内容到目标目录");
-                reporter.setPhase("offline-stage2");
-                reporter.setStatus("正在复制资源到目标目录…");
-                copyDirectoryRecursive(stagingDir, destDir);
-            } else {
-                reporter.initSlots(innerZips.size());
-                reporter.setPhase("offline-stage2");
-                reporter.setStatus("正在解压内层 zip…");
-
-                for (int i = 0; i < innerZips.size(); i++) {
-                    File innerZip = innerZips.get(i);
-                    String name   = innerZip.getName();
-                    reporter.setSlot(i, name, 0, innerZip.length(), 0);
-                    reporter.setSlotPhase(i, "extracting");
-                    reporter.log("INFO", "第二阶段[" + i + "]: 解压 " + name);
-                    final int slot = i;
-                    Unzip.extract(innerZip, destDir, new Unzip.ProgressSink() {
-                        @Override public void onEntry(String n, long idx, long est) {
-                            reporter.setStatus("解压: " + n);
+                long totalBytes = importedZip.length();
+                try (InputStream is = new java.io.FileInputStream(importedZip)) {
+                    // 不剥离前缀，保留外层 zip 的原始目录结构，便于找到内层 zip
+                    Unzip.extractFromStream(is, stagingDir, totalBytes, "", new Unzip.ProgressSink() {
+                        @Override public void onEntry(String name, long idx, long est) {
+                            reporter.setStatus("暂存: " + name);
                         }
                         @Override public void onEntryBytes(long written, long uncompressedSize) {
-                            reporter.setSlot(slot, null, written, uncompressedSize, 0);
+                            reporter.setSlot(0, null, written, uncompressedSize, 0);
                         }
-                        @Override public void onEntryDone(String n) {}
+                        @Override public void onEntryDone(String name) {}
                         @Override public void onBytes(long bytesProcessed, long bytesTotal) {
                             reporter.setOverallProgress(bytesProcessed,
-                                    bytesTotal > 0 ? bytesTotal : innerZip.length());
+                                    bytesTotal > 0 ? bytesTotal : totalBytes);
                         }
                         @Override public boolean isCancelled() { return reporter.isCancelled(); }
                     });
-                    reporter.setSlotPhase(slot, "done");
-                    reporter.log("INFO", "第二阶段[" + i + "]: " + name + " 解压完成");
                 }
+                reporter.setSlotPhase(0, "done");
+                reporter.log("INFO", "第一阶段完成，扫描暂存目录中的内层 zip…");
+
+                // ── 第二阶段：找到所有内层 zip，逐一解压到 filesDir ─────────────────────
+                List<File> innerZips = findInnerZipsRecursive(stagingDir);
+                reporter.log("INFO", "发现内层 zip 数量=" + innerZips.size());
+
+                File destDir = ctx.getFilesDir();
+                if (innerZips.isEmpty()) {
+                    // 外层 zip 内无嵌套 zip，将暂存内容复制到目标目录
+                    reporter.log("INFO", "未发现内层 zip，直接复制暂存内容到目标目录");
+                    reporter.setPhase("offline-stage2");
+                    reporter.setStatus("正在复制资源到目标目录…");
+                    copyDirectoryRecursive(stagingDir, destDir);
+                } else {
+                    reporter.initSlots(innerZips.size());
+                    reporter.setPhase("offline-stage2");
+                    reporter.setStatus("正在解压内层 zip…");
+
+                    for (int i = 0; i < innerZips.size(); i++) {
+                        File innerZip = innerZips.get(i);
+                        String name   = innerZip.getName();
+                        reporter.setSlot(i, name, 0, innerZip.length(), 0);
+                        reporter.setSlotPhase(i, "extracting");
+                        reporter.log("INFO", "第二阶段[" + i + "]: 解压 " + name);
+                        final int slot = i;
+                        Unzip.extract(innerZip, destDir, new Unzip.ProgressSink() {
+                            @Override public void onEntry(String n, long idx, long est) {
+                                reporter.setStatus("解压: " + n);
+                            }
+                            @Override public void onEntryBytes(long written, long uncompressedSize) {
+                                reporter.setSlot(slot, null, written, uncompressedSize, 0);
+                            }
+                            @Override public void onEntryDone(String n) {}
+                            @Override public void onBytes(long bytesProcessed, long bytesTotal) {
+                                reporter.setOverallProgress(bytesProcessed,
+                                        bytesTotal > 0 ? bytesTotal : innerZip.length());
+                            }
+                            @Override public boolean isCancelled() { return reporter.isCancelled(); }
+                        });
+                        reporter.setSlotPhase(slot, "done");
+                        reporter.log("INFO", "第二阶段[" + i + "]: " + name + " 解压完成");
+                    }
+                }
+            } finally {
+                // 无论成功失败，始终清理暂存目录，避免占用存储空间
+                deleteRecursive(stagingDir);
+                reporter.log("INFO", "暂存目录已清理");
             }
+            // writeReadyFlag 仅在 try 块全部正常完成后执行（finally 无法阻止 throw）
+            reporter.setPhase("done");
+            reporter.setStatus("离线资源注入完成");
+            reporter.log("INFO", "两阶段离线资源解压完成，写入 ready flag");
+            writeReadyFlag();
         } finally {
-            // 无论成功或失败，始终清理暂存目录，避免占用存储空间
-            deleteRecursive(stagingDir);
-            reporter.log("INFO", "暂存目录已清理");
+            // 外层 finally：无论何种失败路径（拷贝/校验/解压），都清理临时导入文件
+            importedZip.delete();
         }
-        // writeReadyFlag 仅在 try 块全部正常完成后执行（finally 无法阻止 throw）
-        reporter.setPhase("done");
-        reporter.setStatus("离线资源注入完成");
-        reporter.log("INFO", "两阶段离线资源解压完成，写入 ready flag");
-        writeReadyFlag();
     }
 
     /** 递归查找目录中所有 .zip 文件。 */
@@ -776,10 +829,9 @@ public final class ResourceFlow {
         return names;
     }
 
-    private void verifyZip(Uri uri) throws java.io.IOException {
-        try (InputStream is = ctx.getContentResolver().openInputStream(uri)) {
-            if (is == null) throw new java.io.IOException("无法读取所选文件");
-            java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(is);
+    private static void verifyZipFile(File f) throws java.io.IOException {
+        try (java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(
+                new java.io.BufferedInputStream(new java.io.FileInputStream(f)))) {
             java.util.zip.ZipEntry ze = zis.getNextEntry();
             if (ze == null) throw new java.io.IOException("zip 文件为空或格式不正确");
             zis.closeEntry();
@@ -810,12 +862,12 @@ public final class ResourceFlow {
             new java.util.HashSet<>(java.util.Arrays.asList(
                     "cn_js_update.zip", "cn_scenario_update.zip"));
 
-    private static List<S3List.Entry> filterHotUpdateFiles(List<S3List.Entry> entries) {
-        List<S3List.Entry> out = new ArrayList<>();
-        for (S3List.Entry e : entries) {
-            String name = e.key.contains("/")
-                    ? e.key.substring(e.key.lastIndexOf('/') + 1) : e.key;
-            if (!HOT_UPDATE_FILES.contains(name)) out.add(e);
+    private static List<FileEntry> filterHotUpdateFiles(List<FileEntry> entries) {
+        List<FileEntry> out = new ArrayList<>();
+        for (FileEntry fe : entries) {
+            String name = fe.entry.key.contains("/")
+                    ? fe.entry.key.substring(fe.entry.key.lastIndexOf('/') + 1) : fe.entry.key;
+            if (!HOT_UPDATE_FILES.contains(name)) out.add(fe);
         }
         return out;
     }
@@ -987,53 +1039,19 @@ public final class ResourceFlow {
     }
 
     private static void unzipHotPatch(File zipFile, File destDir) throws java.io.IOException {
-        try (java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(
-                new java.io.BufferedInputStream(new java.io.FileInputStream(zipFile)))) {
-            java.util.zip.ZipEntry entry;
-            byte[] buf = new byte[65536];
-            while ((entry = zis.getNextEntry()) != null) {
-                File target = new File(destDir, entry.getName());
-                if (entry.isDirectory()) {
-                    target.mkdirs();
-                } else {
-                    File parent = target.getParentFile();
-                    if (parent != null) parent.mkdirs();
-                    try (java.io.FileOutputStream fos = new java.io.FileOutputStream(target)) {
-                        int n;
-                        while ((n = zis.read(buf)) != -1) fos.write(buf, 0, n);
-                    }
-                }
-                zis.closeEntry();
-            }
-        }
+        // C-H1: 委托给 Unzip.extract()，内置 zip-slip（canonical-path）防护。
+        // 热更新 zip 条目形如 magica/js/libs/foo.json，需保留 magica/ 前缀落到
+        // filesDir/magica/js/libs/foo.json，供 WebViewInterceptor 在该路径服务。
+        // 因此 stripPrefix 传 "" 不剥离（区别于主资源包用 DEFAULT_STRIP_PREFIX）。
+        Unzip.extract(zipFile, destDir, "", new Unzip.ProgressSink() {
+            @Override public void onEntry(String n, long idx, long est) {}
+            @Override public void onBytes(long p, long t) {}
+            @Override public boolean isCancelled() { return false; }
+        });
     }
 
-    /** 从 content URI 读取文件字节并计算 SHA-256，同时通过 reporter 汇报进度。 */
-    private String sha256HexFromUri(Uri uri) throws Exception {
-        long total = queryStreamLength(uri);
-        java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
-        try (InputStream is = ctx.getContentResolver().openInputStream(uri)) {
-            if (is == null) throw new java.io.IOException("无法打开文件流");
-            byte[] buf = new byte[65536];
-            long processed = 0L;
-            int n;
-            while ((n = is.read(buf)) != -1) {
-                md.update(buf, 0, n);
-                processed += n;
-                if (total > 0) reporter.setOverallProgress(processed, total);
-            }
-        }
-        byte[] hash = md.digest();
-        StringBuilder sb = new StringBuilder(hash.length * 2);
-        for (byte b : hash) {
-            int v = b & 0xff;
-            if (v < 0x10) sb.append('0');
-            sb.append(Integer.toHexString(v));
-        }
-        return sb.toString();
-    }
-
-    private static String sha256Hex(File file) {
+    /** 计算文件的 SHA-256，失败时抛出 IOException（C-L2: 不再静默跳过）。 */
+    private static String sha256HexFromFile(File file) throws java.io.IOException {
         try {
             java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
             try (java.io.FileInputStream fis = new java.io.FileInputStream(file)) {
@@ -1049,6 +1067,15 @@ public final class ResourceFlow {
                 sb.append(Integer.toHexString(v));
             }
             return sb.toString();
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new java.io.IOException("SHA-256 算法不可用", e);
+        }
+    }
+
+    /** 计算文件的 SHA-256，失败时返回空字符串（用于热更新等非致命校验场景）。 */
+    private static String sha256Hex(File file) {
+        try {
+            return sha256HexFromFile(file);
         } catch (Exception e) {
             return "";
         }

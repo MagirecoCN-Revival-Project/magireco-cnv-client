@@ -47,11 +47,30 @@ public final class CapWorkerSolver {
         WebView wv = new WebView(activity);
         WebSettings ws = wv.getSettings();
         ws.setJavaScriptEnabled(true);
-        // 允许 loadDataWithBaseURL 页面中的 fetch 跨域请求 cap-worker
         ws.setDomStorageEnabled(false);
+        // C-C2: 关闭所有不需要的文件/内容访问能力，限制混合内容
+        ws.setAllowFileAccess(false);
+        ws.setAllowContentAccess(false);
+        ws.setAllowFileAccessFromFileURLs(false);
+        ws.setAllowUniversalAccessFromFileURLs(false);
+        ws.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
 
         wv.addJavascriptInterface(new JsBridge(root, wv, callback), "Android");
-        wv.setWebViewClient(new WebViewClient());
+        // C-C2: 限制 WebView 只能导航到 cap-worker 同源 HTTPS 页面
+        final String capHost = android.net.Uri.parse(capUrl).getHost();
+        wv.setWebViewClient(new WebViewClient() {
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView v, String url) {
+                try {
+                    android.net.Uri u = android.net.Uri.parse(url);
+                    return !("https".equals(u.getScheme())
+                            && capHost != null
+                            && capHost.equalsIgnoreCase(u.getHost()));
+                } catch (Throwable t) {
+                    return true; // 解析失败则拒绝
+                }
+            }
+        });
 
         // 1×1 像素不可见，不影响布局
         root.addView(wv, new FrameLayout.LayoutParams(1, 1));

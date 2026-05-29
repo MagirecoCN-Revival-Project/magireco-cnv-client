@@ -13,6 +13,9 @@ package io.kamihama.cnv;
  */
 public final class CloudEndpoint {
 
+    /** 主 API 域名（含协议，不含末尾斜杠）；由 CI 从 Secret CNV_API_HOST 注入。 */
+    static final String API_HOST = "";
+
     /**
      * 客户端启动握手接口。
      *
@@ -22,7 +25,7 @@ public final class CloudEndpoint {
      * <p>响应：{@code application/json}，schema 见
      * {@link ClientInit.Response}。
      */
-    public static final String CLIENT_INIT = "https://api.magi-reco.top/client/init";
+    public static final String CLIENT_INIT = API_HOST + "/client/init";
 
     /**
      * 用户确认下载方式后上报服务端。
@@ -32,7 +35,7 @@ public final class CloudEndpoint {
      *
      * <p>响应：200 OK（无关键字段，忽略即可）。
      */
-    public static final String CLIENT_METHOD_SELECT   = "https://api.magi-reco.top/client/method-select";
+    public static final String CLIENT_METHOD_SELECT   = API_HOST + "/client/method-select";
 
     /**
      * 在线下载模式：获取镜像列表和访问令牌。
@@ -43,7 +46,7 @@ public final class CloudEndpoint {
      * <p>响应：{@code application/json}，schema 见
      * {@link ClientInit#fetchOnlineDownload(android.content.Context)}。
      */
-    public static final String CLIENT_ONLINE_DOWNLOAD = "https://api.magi-reco.top/client/online-download";
+    public static final String CLIENT_ONLINE_DOWNLOAD = API_HOST + "/client/online-download";
 
     /**
      * 离线包模式：获取离线包下载 URL、版本号和 MD5。
@@ -54,7 +57,7 @@ public final class CloudEndpoint {
      * <p>响应：{@code application/json}，schema 见
      * {@link ClientInit#fetchOfflinePackage(android.content.Context)}。
      */
-    public static final String CLIENT_OFFLINE_PACKAGE = "https://api.magi-reco.top/client/offline-package";
+    public static final String CLIENT_OFFLINE_PACKAGE = API_HOST + "/client/offline-package";
 
     /**
      * 下载过程心跳接口。
@@ -78,7 +81,7 @@ public final class CloudEndpoint {
      *   <li>{@code "ban"} —— 服务端封禁该设备；客户端持久化封禁信息并中止下载。</li>
      * </ul>
      */
-    public static final String CLIENT_HEARTBEAT = "https://api.magi-reco.top/client/heartbeat";
+    public static final String CLIENT_HEARTBEAT = API_HOST + "/client/heartbeat";
 
     /**
      * 热更新版本检查接口。每次进游戏前调用，检查 js / scenario 包是否有新版本。
@@ -94,7 +97,7 @@ public final class CloudEndpoint {
      * </pre>
      * version 为服务端整数版本号，客户端本地版本存于 SharedPreferences cnv_hot_update。
      */
-    public static final String CLIENT_HOT_UPDATE = "https://api.magi-reco.top/client/hot-update";
+    public static final String CLIENT_HOT_UPDATE = API_HOST + "/client/hot-update";
 
     // ── 账号系统 ──────────────────────────────────────────────────────────────
 
@@ -110,20 +113,41 @@ public final class CloudEndpoint {
      * <p>失败响应（401/403 等）：
      * <pre>{ "success": false, "error": "..." }</pre>
      */
-    public static final String ACCOUNT_LOGIN = "https://api.magi-reco.top/account/login";
+    public static final String ACCOUNT_LOGIN = API_HOST + "/account/login";
 
     /** 注册账号页面（浏览器打开）。 */
-    public static final String ACCOUNT_REGISTER = "https://api.magi-reco.top/account/register";
+    public static final String ACCOUNT_REGISTER = API_HOST + "/account/register";
 
     /** 忘记密码页面（浏览器打开）。 */
-    public static final String ACCOUNT_FORGOT = "https://api.magi-reco.top/account/forgot";
+    public static final String ACCOUNT_FORGOT = API_HOST + "/account/forgot";
 
     /**
-     * cap-worker 部署 URL（不含末尾斜杠），用于人机验证。
-     *
-     * @see <a href="https://github.com/xyTom/cap-worker">cap-worker</a>
+     * cap-worker 部署 URL（含协议，不含末尾斜杠），用于人机验证；由 CI 从 Secret CNV_CAP_WORKER_URL 注入。
+     * 运行时优先使用 /client/init 响应中的 services.cap_worker_url 字段。
      */
-    public static final String CAP_WORKER_URL = "https://captcha.magireco.top";
+    public static final String CAP_WORKER_URL = "";
+
+    // ── 云端存档 ──────────────────────────────────────────────────────────────
+
+    /**
+     * 云端存档上传接口。
+     *
+     * <p>请求：POST，{@code application/json}。Body：
+     * <pre>{ "token": "...", "data": { "/magica/api/...": { "req": "...", "resp": "..." }, ... } }</pre>
+     *
+     * <p>响应：{@code application/json}，{@code { "success": true }}。
+     */
+    public static final String ACCOUNT_SAVE_PUT = API_HOST + "/account/save/put";
+
+    /**
+     * 云端存档下载接口。
+     *
+     * <p>请求：POST，{@code application/json}。Body：{@code { "token": "..." }}。
+     *
+     * <p>响应：{@code { "success": true, "data": { ... } }}，data 格式同上传 body 的 data 字段。
+     * 无存档时 data 为 {@code {}}。
+     */
+    public static final String ACCOUNT_SAVE_GET = API_HOST + "/account/save/get";
 
     private CloudEndpoint() {}
 }

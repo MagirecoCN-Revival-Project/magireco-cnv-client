@@ -92,8 +92,17 @@ target_compile_options(MagiaClient PRIVATE
     -ffunction-sections
     -fdata-sections
     -Wno-unused-parameter
+    # C-L6: 编译期加固 flags
+    -fstack-protector-strong
+    -D_FORTIFY_SOURCE=2
+    -Wformat
+    -Wformat-security
 )
 target_link_options(MagiaClient PRIVATE
     -Wl,--gc-sections
     -Wl,--exclude-libs,ALL
+    # C-L6: 链接期加固 flags（RELRO + BIND_NOW + NX）
+    -Wl,-z,relro
+    -Wl,-z,now
+    -Wl,-z,noexecstack
 )

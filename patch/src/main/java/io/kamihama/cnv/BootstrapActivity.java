@@ -28,6 +28,7 @@ import android.media.AudioManager;
 import android.media.MediaPlayer;
 import android.net.Uri;
 import android.os.Build;
+import android.provider.Settings;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -50,6 +51,7 @@ import android.widget.Toast;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.Locale;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -68,12 +70,21 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     public static final String GAME_ACTIVITY = "jp.f4samurai.AppActivity";
 
     // ---- 常量 ----
-    private static final int    REQ_FILE_PICK     = 0x4D47;
+    private static final int    REQ_FILE_PICK          = 0x4D47;
+    private static final int    REQ_OVERLAY_PERMISSION = 0x4F56;
+
+    private static final int OFFLINE_CHOICE_RETRY   = 0;
+    private static final int OFFLINE_CHOICE_OFFLINE = 1;
+    private static final int OFFLINE_CHOICE_EXIT    = 2;
     private static final String PREFS_NAME        = "cnv_bootstrap_ui";
     private static final String PREF_DARK_MODE    = "dark_mode";
-    private static final String PREFS_ACCOUNT     = "cnv_account";
-    private static final String KEY_ACCOUNT_ID    = "account_id";
-    private static final String KEY_ACCOUNT_TOKEN = "account_token";
+    private static final String PREFS_ACCOUNT        = "cnv_account";
+    private static final String KEY_ACCOUNT_ID       = "account_id";
+    private static final String KEY_ACCOUNT_TOKEN    = "account_token";
+    private static final String KEY_SAVED_USERNAME   = "saved_username";
+    private static final String KEY_SAVED_PASSWORD   = "saved_password";
+    private static final String KEY_REMEMBER_PASSWORD = "remember_password";
+    private static final String KEY_AUTO_LOGIN       = "auto_login";
 
     /** 资源目录内的背景图路径（assets/cnv/background_light.png）。 */
     private static final String BG_ASSET          = "cnv/background_light.png";
@@ -180,6 +191,8 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private GlassPanelView vGlassPanel;
     private LinearLayout   vHeadRight;
     private LinearLayout   vMainRow;
+    /** 贡献者署名列表容器；握手后由 populateContributors() 动态填充。 */
+    private LinearLayout   vContribList;
 
     // ---- 右上角胶囊按钮背景（主题切换时统一重置颜色） ----
     private TextView       vThemeChip;
@@ -216,6 +229,11 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private volatile boolean serverOfflineEnabled     = true;
     /** 两个功能均关闭时服务端下发的提示文本；null 时展示默认文案。 */
     private volatile String  serverFeatureDisabledMsg = null;
+    /** 服务端下发的 cap-worker 端点；空时回退 {@link CloudEndpoint#CAP_WORKER_URL}。 */
+    private volatile String  serverCapWorkerUrl       = null;
+
+    /** 覆盖层权限申请完成后待执行的回调（onActivityResult 中触发）。 */
+    private Runnable pendingAfterPermission;
 
     private final AtomicReference<String> modeChoice  = new AtomicReference<>(null);
     private final Object                  modeLock     = new Object();
@@ -228,22 +246,29 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private static final int           LOG_BUFFER_MAX = 1000;
     private java.io.BufferedWriter     logFileWriter;
     private final Object               logFileLock  = new Object();
-    private Thread                     logcatThread;
     private static final java.text.SimpleDateFormat LOG_TS =
             new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US);
 
+    // ---- 外链 URL（占位 ""，由 .github/workflows/build-apk.yml 在构建期注入）----
+    // 不在源码里硬编码任何 URL；CI 用正则把下面的 "" 替换为对应配置值。
+    /** 标题栏「主页」按钮指向的站点。 */
+    static final String URL_HOME   = "";
+    /** 标题栏「GitHub」按钮指向的组织主页。 */
+    static final String URL_GITHUB = "";
+
     // ---- 贡献者数据 ----
-    /**
-     * 贡献者条目：圆形头像颜色 + 名字（粗体，保留原始大小写）+ 贡献说明 + 主页 URL。
-     * 头像显示名字首字，颜色与设计文档中署名颜色一致。
-     */
-    private static final Object[][] CONTRIBUTORS = {
-        // { 头像色, 名字, 贡献说明, 主页 URL }
-        { 0xFF3D7BFF, "CyberNova",   "项目负责人 · 私服开发 · UI 设计",  "https://github.com/magirecocn-revival-project" },
-        { 0xFF8BB87A, "MadeInMagius","资源整理 · 汉化数据",              "https://github.com/magirecocn-revival-project" },
-        { 0xFFE667A0, "segfault",    "资源数据 · 技术支持",              "https://github.com/magirecocn-revival-project" },
-        { 0xFF4FB7E6, "水银h2oag",   "资源数据 · 社区维护",              "https://github.com/magirecocn-revival-project" },
+    // 贡献者名单不再硬编码，改由 /client/init 响应在握手阶段下发
+    // （见 ClientInit.Response.contributors），数量不固定（可多可少可为 0）。
+    // 握手成功后由 populateContributors() 动态填充 vContribList。
+
+    /** 未指定颜色时按索引取色的备用调色板（ARGB）。 */
+    private static final int[] CONTRIB_PALETTE = {
+        0xFF3D7BFF, 0xFF8BB87A, 0xFFE667A0, 0xFF4FB7E6,
+        0xFFF2A65A, 0xFF9B8CFF, 0xFF52C7B8, 0xFFE57373,
     };
+
+    /** URL → 已解码 Bitmap 的内存缓存；static 保证 Activity 重建后不重复下载。 */
+    private static final ConcurrentHashMap<String, Bitmap> AVATAR_CACHE = new ConcurrentHashMap<>();
 
     // ======================================================================
     // Activity 生命周期
@@ -257,7 +282,6 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 .getBoolean(PREF_DARK_MODE, false);
         loadPalette(darkMode);
         openLogFile();
-        startLogcatCapture();
         setContentView(buildLayout());
         initSlots(1);
         log("生命周期", "INFO", "Activity 已创建，主题=" + (darkMode ? "夜间" : "亮色")
@@ -286,7 +310,6 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     protected void onDestroy() {
         super.onDestroy();
         log("生命周期", "INFO", "Activity 销毁，释放所有资源");
-        if (logcatThread != null) logcatThread.interrupt();
         stopBgm();
         stopSfx();
         closeLogFile();
@@ -369,7 +392,8 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         divLp.bottomMargin = dp(10);
         leftCol.addView(divider, divLp);
 
-        // 贡献者署名区（可滚动）
+        // 贡献者署名区（可滚动）。名单由 /client/init 握手后动态填充，
+        // 此处仅创建空容器并保存引用。
         ScrollView contribScroll = new ScrollView(this);
         contribScroll.setFillViewport(true);
         LinearLayout contribList = new LinearLayout(this);
@@ -377,10 +401,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         contribScroll.addView(contribList, new ScrollView.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
-        for (Object[] c : CONTRIBUTORS) {
-            contribList.addView(buildContributorRow(
-                    (int) c[0], (String) c[1], (String) c[2], (String) c[3]));
-        }
+        vContribList = contribList;
         leftCol.addView(contribScroll, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
@@ -541,7 +562,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
 
         homeChipBg = new GradientDrawable();
         homeChipBg.setCornerRadius(dp(20));
-        vHomeChip = makeChip("⌂  主页", "https://www.magireco.top", homeChipBg);
+        vHomeChip = makeChip("⌂  主页", URL_HOME, homeChipBg);
         LinearLayout.LayoutParams homeLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -550,8 +571,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
 
         githubChipBg = new GradientDrawable();
         githubChipBg.setCornerRadius(dp(20));
-        vGitHubChip = makeChip("</>  GitHub",
-                "https://github.com/MagirecoCN-Revival-Project", githubChipBg);
+        vGitHubChip = makeChip("</>  GitHub", URL_GITHUB, githubChipBg);
         LinearLayout.LayoutParams ghLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -663,7 +683,8 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
 
         // 日志正文（等宽字体 + 可全选）
         vLogScroll = new ScrollView(this);
-        vLogScroll.setFillViewport(true);
+        // FOCUS_BLOCK_DESCENDANTS 阻止 textIsSelectable 的 TextView 自动把焦点（和滚动位置）吸到顶部
+        vLogScroll.setDescendantFocusability(ViewGroup.FOCUS_BLOCK_DESCENDANTS);
         GradientDrawable logScrollBg = new GradientDrawable();
         // 使用与面板背景有明显对比的半透明深色背景，确保空日志时滚动区域可见
         logScrollBg.setColor(darkMode ? 0x44FFFFFF : 0x14000000);
@@ -800,13 +821,49 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     // ── 贡献者条目构建 ───────────────────────────────────────────────────
 
     /**
+     * 用服务端下发的贡献者名单填充署名区（UI 线程调用）。
+     *
+     * <p>清空旧内容后按顺序渲染；列表为空时显示占位文本。
+     * 颜色缺省（color==0）时按索引取调色板色。
+     */
+    private void populateContributors(java.util.List<ClientInit.Contributor> list) {
+        if (vContribList == null) return;
+        vContribList.removeAllViews();
+
+        if (list == null || list.isEmpty()) {
+            TextView empty = new TextView(this);
+            empty.setText("—");
+            empty.setTextColor(COLOR_SUB);
+            empty.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f);
+            vContribList.addView(empty);
+            return;
+        }
+
+        for (int i = 0; i < list.size(); i++) {
+            ClientInit.Contributor c = list.get(i);
+            int color = (c.color != 0)
+                    ? c.color
+                    : CONTRIB_PALETTE[i % CONTRIB_PALETTE.length];
+            vContribList.addView(buildContributorRow(
+                    color,
+                    c.name != null ? c.name : "",
+                    c.contribution != null ? c.contribution : "",
+                    c.url,
+                    c.avatarUrl));
+        }
+    }
+
+    /**
      * 构建单条贡献者条目视图。
      *
      * <p>布局：[圆形头像] [大写粗体名字（单击提示 / 双击跳转主页）]
      * <br>         [缩进]  [贡献说明文字]
+     *
+     * @param avatarUrl 头像图片 URL；null 时显示首字母彩色圆
      */
     private View buildContributorRow(final int avatarColor, final String name,
-                                     final String contribution, final String url) {
+                                     final String contribution, final String url,
+                                     final String avatarUrl) {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.VERTICAL);
         LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
@@ -824,12 +881,15 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        // 圆形头像（显示名字首字母，颜色为贡献者专属色）
+        // 圆形头像：有 avatarUrl 时异步加载网络图片，否则显示首字母彩色圆
         AvatarView avatar = new AvatarView(this, avatarColor, name);
         int avatarSize = dp(36);
         LinearLayout.LayoutParams avLp = new LinearLayout.LayoutParams(avatarSize, avatarSize);
         avLp.rightMargin = dp(8);
         nameRow.addView(avatar, avLp);
+        if (avatarUrl != null && !avatarUrl.isEmpty()) {
+            loadAvatarBitmap(avatar, avatarUrl);
+        }
 
         // 名字（粗体，保留原始大小写）
         TextView vName = new TextView(this);
@@ -881,12 +941,107 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     }
 
     /**
-     * 圆形头像 View：在指定颜色的圆形背景上显示名字首字母（大写）。
+     * 后台线程从 URL 下载头像并回调到主线程；命中静态缓存时直接同步设置。
+     * 失败静默忽略，头像保持首字母圆形兜底。
+     */
+    private void loadAvatarBitmap(AvatarView av, String url) {
+        Bitmap hit = AVATAR_CACHE.get(url);
+        if (hit != null) { av.setBitmap(hit); return; }
+        final int targetPx = dp(36);
+        new Thread(() -> {
+            Bitmap bm = fetchBitmapWithRedirect(url, targetPx);
+            if (bm != null) {
+                AVATAR_CACHE.put(url, bm);
+                ui.post(() -> av.setBitmap(bm));
+            }
+        }, "cnv-avatar").start();
+    }
+
+    /**
+     * 下载并解码图片。
+     *
+     * <p>坑点处理：
+     * <ul>
+     *   <li>手动跟踪重定向（最多 5 跳），支持 HTTP↔HTTPS 跨协议跳转；
+     *       Android 默认只跟同协议重定向。</li>
+     *   <li>模拟移动浏览器 UA，规避 Bilibili CDN 等对裸 UA 的过滤。</li>
+     *   <li>先读为字节数组，两遍解码：第一遍只取尺寸，算 inSampleSize；
+     *       第二遍按倍率解码，图片尺寸大时显著节省内存。</li>
+     * </ul>
+     */
+    private static Bitmap fetchBitmapWithRedirect(String startUrl, int targetPx) {
+        String url = startUrl;
+        for (int hop = 0; hop < 5; hop++) {
+            java.net.HttpURLConnection c = null;
+            try {
+                c = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+                c.setInstanceFollowRedirects(false); // 手动跟踪，允许跨协议
+                c.setConnectTimeout(10_000);
+                c.setReadTimeout(15_000);
+                c.setRequestProperty("User-Agent",
+                        "Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 " +
+                        "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36");
+                c.setRequestProperty("Accept", "image/webp,image/apng,image/*,*/*;q=0.8");
+                c.connect();
+                int code = c.getResponseCode();
+                if (code >= 300 && code < 400) {
+                    String loc = c.getHeaderField("Location");
+                    if (loc == null || loc.isEmpty()) return null;
+                    if (loc.startsWith("/")) {      // 相对路径补全为绝对 URL
+                        java.net.URL base = new java.net.URL(url);
+                        loc = base.getProtocol() + "://" + base.getHost() + loc;
+                    }
+                    // C-H2: 只允许 HTTPS 重定向，拒绝降级到 http:// 或其他协议
+                    java.net.URL nextUrl = new java.net.URL(loc);
+                    if (!"https".equals(nextUrl.getProtocol())) return null;
+                    url = loc;
+                    continue;                       // finally 负责 disconnect
+                }
+                if (code != 200) return null;
+                byte[] raw = streamToBytes(c.getInputStream());
+                BitmapFactory.Options opts = new BitmapFactory.Options();
+                opts.inJustDecodeBounds = true;
+                BitmapFactory.decodeByteArray(raw, 0, raw.length, opts);
+                opts.inSampleSize     = calcSampleSize(opts.outWidth, opts.outHeight, targetPx);
+                opts.inJustDecodeBounds = false;
+                return BitmapFactory.decodeByteArray(raw, 0, raw.length, opts);
+            } catch (Throwable t) {
+                return null;
+            } finally {
+                if (c != null) try { c.disconnect(); } catch (Throwable ignore) {}
+            }
+        }
+        return null;
+    }
+
+    private static byte[] streamToBytes(java.io.InputStream is) throws java.io.IOException {
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        int n;
+        while ((n = is.read(buf)) != -1) out.write(buf, 0, n);
+        return out.toByteArray();
+    }
+
+    private static int calcSampleSize(int w, int h, int targetPx) {
+        int size = 1;
+        int shorter = Math.min(w > 0 ? w : targetPx, h > 0 ? h : targetPx);
+        while (shorter / (size * 2) >= targetPx) size *= 2;
+        return size;
+    }
+
+    /**
+     * 圆形头像 View。
+     * 默认在指定颜色的圆形背景上显示名字首字母（大写）；
+     * 调用 {@link #setBitmap(Bitmap)} 后改为显示网络图片（center-crop 裁圆）。
      */
     private static final class AvatarView extends View {
-        private final Paint  circlePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final Paint  textPaint   = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final String initial;
+        private final Paint        circlePaint  = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint        textPaint    = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint        bitmapPaint  = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+        private final String       initial;
+        private       Bitmap       bitmap;
+        private       BitmapShader bitmapShader;
+        private       int          lastSz = -1;
 
         AvatarView(Context ctx, int color, String name) {
             super(ctx);
@@ -894,21 +1049,43 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             circlePaint.setStyle(Paint.Style.FILL);
             textPaint.setColor(0xFFFFFFFF);
             textPaint.setTypeface(Typeface.create(Typeface.DEFAULT_BOLD, Typeface.BOLD));
-            // 首字符大写（汉字则直接取第一个字符）
             initial = name.isEmpty() ? "?" :
                     String.valueOf(name.charAt(0)).toUpperCase(Locale.US);
+        }
+
+        void setBitmap(Bitmap bm) {
+            if (bm == null || bm.isRecycled()) return;
+            bitmap       = bm;
+            bitmapShader = new BitmapShader(bm, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP);
+            bitmapPaint.setShader(bitmapShader);
+            lastSz = -1;
+            invalidate();
         }
 
         @Override
         protected void onDraw(Canvas canvas) {
             float cx = getWidth() / 2f, cy = getHeight() / 2f;
             float r  = Math.min(cx, cy) - 2f;
-            canvas.drawCircle(cx, cy, r, circlePaint);
-            textPaint.setTextSize(r * 0.9f);
-            Paint.FontMetrics fm = textPaint.getFontMetrics();
-            float tx = cx - textPaint.measureText(initial) / 2f;
-            float ty = cy - (fm.ascent + fm.descent) / 2f;
-            canvas.drawText(initial, tx, ty, textPaint);
+            if (bitmap != null) {
+                int sz = getWidth();
+                if (sz != lastSz && sz > 0) {
+                    lastSz = sz;
+                    float bw = bitmap.getWidth(), bh = bitmap.getHeight();
+                    float scale = Math.max(sz / bw, sz / bh);
+                    Matrix m = new Matrix();
+                    m.setScale(scale, scale);
+                    m.postTranslate((sz - bw * scale) / 2f, (sz - bh * scale) / 2f);
+                    bitmapShader.setLocalMatrix(m);
+                }
+                canvas.drawCircle(cx, cy, r, bitmapPaint);
+            } else {
+                canvas.drawCircle(cx, cy, r, circlePaint);
+                textPaint.setTextSize(r * 0.9f);
+                Paint.FontMetrics fm = textPaint.getFontMetrics();
+                float tx = cx - textPaint.measureText(initial) / 2f;
+                float ty = cy - (fm.ascent + fm.descent) / 2f;
+                canvas.drawText(initial, tx, ty, textPaint);
+            }
         }
     }
 
@@ -948,6 +1125,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         t.setPadding(dp(12), dp(6), dp(12), dp(6));
         t.setBackground(bg);
         t.setOnClickListener(v -> {
+            if (openUrl == null || openUrl.isEmpty()) return;  // 未注入 URL（如本地构建）：点击无动作
             try {
                 Intent it = new Intent(Intent.ACTION_VIEW, Uri.parse(openUrl));
                 it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
@@ -1166,11 +1344,16 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     /** 切换 BGM 开/关状态并更新胶囊按钮外观。 */
     private void toggleBgm() {
         bgmMuted = !bgmMuted;
-        log("音频", "INFO", "BGM 状态切换：" + (bgmMuted ? "静音" : "恢复播放"));
+        log("音频", "INFO", "BGM 状态切换：" + (bgmMuted ? "暂停" : "恢复播放"));
         if (bgmMuted) {
-            stopBgm();   // 静音时停止并重置曲目索引（stopBgm 内完成）
+            pauseBgm();
         } else {
-            startBgm();  // 恢复时从 system01 重新开始
+            // bgmPlayer 不为 null → 从断点续播；为 null（曲目衔接间隙或准备中被丢弃）→ 重新开始
+            if (bgmPlayer != null) {
+                resumeBgm();
+            } else {
+                startBgm();
+            }
         }
         updateBgmPill();
     }
@@ -1179,7 +1362,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private void updateBgmPill() {
         if (vBgmPill == null || bgmPillBg == null) return;
         if (bgmMuted) {
-            vBgmPill.setText("♪  静音");
+            vBgmPill.setText("♪  暂停");
             bgmPillBg.setColor(0xAA888888);
         } else {
             vBgmPill.setText("♪  音乐");
@@ -1307,96 +1490,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         }
     }
 
-    // ── Logcat 捕获 ───────────────────────────────────────────────────────
 
-    /**
-     * 启动后台线程，持续读取本进程的 logcat 输出并注入日志面板。
-     * 使用 {@code --pid} 过滤仅本进程；跳过我们自己 TAG 的条目（已由 log() 写入）。
-     */
-    private void startLogcatCapture() {
-        String pid = String.valueOf(android.os.Process.myPid());
-        logcatThread = new Thread(() -> {
-            try {
-                // -v time 格式：MM-DD HH:MM:SS.mmm Level/Tag(PID): message
-                Process proc = Runtime.getRuntime().exec(
-                        new String[]{"logcat", "--pid=" + pid, "-v", "time"});
-                java.io.BufferedReader br = new java.io.BufferedReader(
-                        new java.io.InputStreamReader(proc.getInputStream(), "UTF-8"));
-                String line;
-                while (!Thread.currentThread().isInterrupted()
-                        && (line = br.readLine()) != null) {
-                    ingestLogcatLine(line);
-                }
-                proc.destroy();
-            } catch (Throwable ignore) {}
-        }, "cnv-logcat");
-        logcatThread.setDaemon(true);
-        logcatThread.start();
-    }
-
-    /**
-     * 解析一行 logcat（-v time 格式）并写入日志缓冲区。
-     * 格式示例：{@code 05-22 14:23:45.123 I/SomeTag(1234): 消息}
-     */
-    private void ingestLogcatLine(String line) {
-        if (line == null || line.length() < 20) return;
-        if (line.startsWith("---------")) return; // 日志分组分隔符
-
-        // 位置 19 是 Level 字符，格式 "MM-DD HH:MM:SS.mmm L/..."
-        char levelChar = line.charAt(19);
-        String lvl;
-        switch (levelChar) {
-            case 'W': lvl = "WARN";  break;
-            case 'E': case 'F': lvl = "ERROR"; break;
-            case 'V': case 'D': lvl = "INFO";  break;
-            default:  lvl = "INFO";
-        }
-
-        // 提取 Tag：Level/Tag(PID): message → TAG 在 '/' 和 '(' 之间
-        String comp = "系统";
-        String msg  = line;
-        try {
-            int slash = line.indexOf('/', 20);
-            int paren = slash > 0 ? line.indexOf('(', slash) : -1;
-            int colon = paren > 0 ? line.indexOf(':', paren) : -1;
-            if (slash > 0 && paren > slash && colon > paren) {
-                comp = line.substring(slash + 1, paren).trim();
-                msg  = colon + 2 < line.length() ? line.substring(colon + 2) : "";
-            }
-        } catch (Throwable ignore) {}
-
-        // 跳过我们自己 TAG（已经由 log() 写入过 buffer）
-        if (TAG.equals(comp)) return;
-
-        // 补全时间戳：logcat 只给 MM-DD，需要加年份
-        String year    = new java.text.SimpleDateFormat("yyyy", Locale.US)
-                .format(new java.util.Date());
-        String mmdd    = line.substring(0, 5);   // "MM-DD"
-        String hhmmss  = line.length() >= 18
-                ? line.substring(6, 14) : "??:??:??"; // "HH:MM:SS"
-        String fullTs  = "［" + year + "-" + mmdd + " " + hhmmss + "］[" + comp + "][" + lvl + "] " + msg;
-
-        synchronized (logBuffer) {
-            logBuffer.addLast(fullTs);
-            while (logBuffer.size() > LOG_BUFFER_MAX) logBuffer.removeFirst();
-        }
-        synchronized (logFileLock) {
-            if (logFileWriter != null) {
-                try {
-                    logFileWriter.write(fullTs);
-                    logFileWriter.write('\n');
-                    logFileWriter.flush();
-                } catch (Throwable ignore) {}
-            }
-        }
-        ui.post(() -> {
-            if (logModal != null && logModal.getVisibility() == View.VISIBLE) {
-                boolean atBottom = isAtLogBottom();
-                renderLogModal();
-                if (atBottom) vLogScroll.post(() -> vLogScroll.fullScroll(View.FOCUS_DOWN));
-            }
-        });
-    }
 
     // ======================================================================
     // 后台工作线程
@@ -1471,8 +1565,42 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
 
         // 第 0c 步：与云端 /client/init 握手（封禁 / 维护 / 版本闸门 / 功能开关）
         if (!isDebugFlag("skip_cloud_init")) {
-            log("启动", "INFO", "开始与云端握手…");
-            if (!handleCloudInit()) return;
+            cloudInitLoop:
+            while (true) {
+                log("启动", "INFO", "开始与云端握手…");
+                if (!handleCloudInit()) {
+                    if (OfflineModeManager.isActive()) {
+                        if (alreadyReady) {
+                            // 资源已就绪——让用户选择：重试 / 离线模式 / 退出
+                            log("启动", "WARN", "服务器不可达，资源已就绪，询问用户");
+                            int choice = askOfflineModeChoice();
+                            if (choice == OFFLINE_CHOICE_RETRY) {
+                                OfflineModeManager.reset();
+                                log("启动", "INFO", "用户选择重试握手");
+                                continue cloudInitLoop;
+                            } else if (choice == OFFLINE_CHOICE_OFFLINE) {
+                                log("启动", "INFO", "用户选择进入离线模式");
+                                enterOfflineMode();
+                            } else {
+                                log("启动", "INFO", "用户选择退出");
+                                ui.post(() -> {
+                                    try { finishAndRemoveTask(); }
+                                    catch (Throwable ignore) {}
+                                    android.os.Process.killProcess(android.os.Process.myPid());
+                                });
+                            }
+                        } else {
+                            log("启动", "ERROR", "服务器不可达且资源未下载，无法进入离线模式");
+                            showFatalAndExit("无法进入离线模式",
+                                    "服务器暂时不可达，无法完成首次连接。\n\n"
+                                  + "离线模式需要先完成一次完整的游戏资源下载。\n\n"
+                                  + "请检查网络连接后重试。");
+                        }
+                    }
+                    return;
+                }
+                break;
+            }
         } else {
             log("启动", "WARN", "调试：skip_cloud_init=true，已跳过云端握手（使用默认功能开关）");
         }
@@ -1486,7 +1614,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 log("启动", "WARN", "调试：skip_hot_update=true，已跳过热更新检查");
             }
             log("启动", "INFO", "热更新检查完成，显示登录界面");
-            ui.post(() -> showLoginDialog(this::launchGame));
+            ui.post(() -> showLoginDialog(this::checkSavesBeforeLaunch));
             return;
         }
 
@@ -1542,7 +1670,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             log("启动", "WARN", "调试：skip_hot_update=true，已跳过热更新检查");
         }
         log("启动", "INFO", "热更新检查完成，显示登录界面");
-        ui.post(() -> showLoginDialog(this::launchGame));
+        ui.post(() -> showLoginDialog(this::checkSavesBeforeLaunch));
     }
 
     /**
@@ -1639,11 +1767,35 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         }
     }
 
+    /** 计算文件 SHA-256，返回 64 位小写十六进制字符串；失败抛 IOException。 */
+    private static String sha256HexOfFile(java.io.File file) throws java.io.IOException {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            try (java.io.FileInputStream fis = new java.io.FileInputStream(file)) {
+                byte[] buf = new byte[65536];
+                int n;
+                while ((n = fis.read(buf)) != -1) md.update(buf, 0, n);
+            }
+            byte[] hash = md.digest();
+            StringBuilder sb = new StringBuilder(hash.length * 2);
+            for (byte b : hash) {
+                int v = b & 0xff;
+                if (v < 0x10) sb.append('0');
+                sb.append(Integer.toHexString(v));
+            }
+            return sb.toString();
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new java.io.IOException("SHA-256 算法不可用", e);
+        }
+    }
+
     /**
      * 下载新版客户端 APK 并启动系统安装器。在工作线程调用。
      * 下载成功后通过 UpdateProvider 把文件 URI 传给安装器，然后退出 Activity。
+     *
+     * @param expectedSha256 服务端下发的 APK SHA-256（64 位小写十六进制）；null 表示未提供（仅告警）
      */
-    private void downloadAndInstallClientUpdate(String url) {
+    private void downloadAndInstallClientUpdate(String url, String expectedSha256) {
         setPhase("client-update");
         setStatus("准备下载更新…");
         ui.post(() -> {
@@ -1676,6 +1828,30 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         }
 
         setSlotPhase(0, "done");
+
+        // C-C1: 安装前校验 SHA-256，防止服务端被接管后推送恶意 APK
+        if (expectedSha256 != null && expectedSha256.matches("[0-9a-fA-F]{64}")) {
+            setStatus("正在校验 APK 完整性…");
+            try {
+                String actual = sha256HexOfFile(apkFile);
+                if (!actual.equalsIgnoreCase(expectedSha256)) {
+                    apkFile.delete();
+                    log("更新", "ERROR", "APK SHA-256 不匹配：期望=" + expectedSha256 + " 实际=" + actual);
+                    showFatalAndExit("更新校验失败",
+                            "下载到的客户端 APK 哈希与服务端不符，已拒绝安装。\n\n请稍后重试或联系管理员。");
+                    return;
+                }
+                log("更新", "INFO", "APK SHA-256 校验通过：" + actual);
+            } catch (Exception e) {
+                apkFile.delete();
+                log("更新", "ERROR", "APK SHA-256 计算失败：" + e.getMessage());
+                showFatalAndExit("更新校验失败", "无法计算更新文件哈希值：" + e.getMessage());
+                return;
+            }
+        } else {
+            log("更新", "WARN", "服务端未提供可验证的 SHA-256，跳过完整性校验");
+        }
+
         setStatus("正在启动安装器…");
         log("更新", "INFO", "正在启动系统安装器");
 
@@ -1773,20 +1949,35 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
      */
     private boolean handleCloudInit() {
         log("握手", "INFO", "向云端握手接口发起请求…");
-        ClientInit.Response init;
-        try {
-            init = ClientInit.fetch(this, ResourceFlow.BUILD_VERSION);
-        } catch (Throwable t) {
-            log("握手", "ERROR", "握手请求失败：" + t.getClass().getSimpleName()
-                    + (t.getMessage() != null ? "：" + t.getMessage() : ""));
-            showFatalAndExit("无法联系服务器",
-                    "客户端启动需要先和云端握手，但本次请求失败了。\n\n"
-                  + "错误：" + t.getClass().getSimpleName()
-                  + (t.getMessage() != null ? (": " + t.getMessage()) : "")
-                  + "\n\n请检查网络后重试。");
-            return false;
+        final int MAX_RETRIES = 3;
+        ClientInit.Response init = null;
+        for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                if (attempt > 1) {
+                    log("握手", "INFO", "握手重试（第 " + attempt + "/" + MAX_RETRIES + " 次）…");
+                }
+                init = ClientInit.fetch(this, ResourceFlow.BUILD_VERSION);
+                break;
+            } catch (Throwable t) {
+                log("握手", "WARN", "握手失败（第 " + attempt + "/" + MAX_RETRIES + " 次）："
+                        + t.getClass().getSimpleName()
+                        + (t.getMessage() != null ? "：" + t.getMessage() : ""));
+                if (attempt < MAX_RETRIES) {
+                    try { Thread.sleep(1000L << (attempt - 1)); }
+                    catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                } else {
+                    log("握手", "ERROR", "握手连续 " + MAX_RETRIES + " 次失败，标记离线模式");
+                    OfflineModeManager.activate();
+                    return false;
+                }
+            }
         }
         sessionToken = init.accessToken != null ? init.accessToken : "";
+        if (!sessionToken.isEmpty()) {
+            getSharedPreferences(PREFS_ACCOUNT, MODE_PRIVATE).edit()
+                    .putString("session_token", sessionToken)
+                    .apply();
+        }
         log("握手", "INFO", "握手成功，服务端状态=" + init.serverStatus
                 + "，会话令牌=" + (sessionToken.isEmpty() ? "（未下发）" : "已获取"));
 
@@ -1833,7 +2024,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                     + " 已不在服务端允许的版本列表内。\n\n请下载最新"
                     + channelName + " APK 后再启动。";
                 if (askUserWantsInAppUpdate("客户端需要更新", msg)) {
-                    downloadAndInstallClientUpdate(url);
+                    downloadAndInstallClientUpdate(url, init.updateApkSha256);
                 } else {
                     ui.post(() -> {
                         try { finishAndRemoveTask(); } catch (Throwable ignore) {}
@@ -1856,6 +2047,25 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             log("握手", "INFO", "版本伪造参数：fakeName=" + init.fakeName
                     + "，fakeVersion=" + init.fakeVersion);
         }
+
+        // 服务端地址下发：cap-worker 端点 + 游戏代理后端列表
+        serverCapWorkerUrl = (init.capWorkerUrl != null && !init.capWorkerUrl.isEmpty())
+                ? init.capWorkerUrl : null;
+        // 代理后端列表 & 原版 host 交给 native 层；
+        // libMagiaClient.so 的 setURI 钩子按序尝试，全失败回退原版后端。
+        ProxyBackends.set(init.proxyBackends);
+        if (init.gameServerHost != null && !init.gameServerHost.isEmpty()) {
+            ProxyBackends.setGameServerHost(init.gameServerHost);
+        }
+        log("握手", "INFO", "服务端地址：cap-worker="
+                + (serverCapWorkerUrl != null ? serverCapWorkerUrl : "（回退内置）")
+                + "，代理后端 " + init.proxyBackends.size() + " 条"
+                + (init.gameServerHost != null ? "，game-host=" + init.gameServerHost : ""));
+
+        // 贡献者名单：服务端下发，数量不固定。在 UI 线程动态填充署名区。
+        final java.util.List<ClientInit.Contributor> contribs = init.contributors;
+        log("握手", "INFO", "贡献者名单：" + contribs.size() + " 人");
+        ui.post(() -> populateContributors(contribs));
 
         // 功能开关：写入实例字段，供 runWork() 决策下载模式
         serverOnlineEnabled      = init.onlineDownloadEnabled;
@@ -1891,19 +2101,95 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     // ======================================================================
 
     /**
-     * 热更新完成后显示登录对话框。若 SharedPreferences 已保存有效会话则直接跳过。
-     * 登录成功后调用 onSuccess（通常为 {@link #launchGame()}）。
+     * 热更新完成后显示登录对话框。
+     * <ul>
+     *   <li>已有有效会话令牌 → 直接跳过登录。</li>
+     *   <li>启用了自动登录且保存有凭证 → 静默自动登录，失败后回退到表单。</li>
+     *   <li>否则 → 显示登录表单。</li>
+     * </ul>
      * 必须在主线程调用。
      */
     private void showLoginDialog(Runnable onSuccess) {
         SharedPreferences prefs = getSharedPreferences(PREFS_ACCOUNT, MODE_PRIVATE);
-        String savedId    = prefs.getString(KEY_ACCOUNT_ID, null);
+        String savedId    = prefs.getString(KEY_ACCOUNT_ID,    null);
         String savedToken = prefs.getString(KEY_ACCOUNT_TOKEN, null);
         if (savedId != null && !savedId.isEmpty()
                 && savedToken != null && !savedToken.isEmpty()) {
             onSuccess.run();
             return;
         }
+        boolean autoLogin = prefs.getBoolean(KEY_AUTO_LOGIN, false);
+        String  savedUser = prefs.getString(KEY_SAVED_USERNAME, null);
+        String  savedPass = prefs.getString(KEY_SAVED_PASSWORD, null);
+        if (autoLogin
+                && savedUser != null && !savedUser.isEmpty()
+                && savedPass != null && !savedPass.isEmpty()) {
+            doAutoLogin(savedUser, savedPass, onSuccess);
+            return;
+        }
+        showLoginFormDirectly(onSuccess);
+    }
+
+    /**
+     * 使用已保存的凭证静默登录（PoW 求解 + POST，无对话框）。
+     * 成功后调用 onSuccess；失败后回退到登录表单（凭证预填充）。
+     * 必须在主线程调用。
+     */
+    private void doAutoLogin(String username, String password, Runnable onSuccess) {
+        setPhase("登录");
+        setStatus("自动登录中…");
+        log("登录", "INFO", "检测到自动登录凭证，开始静默登录");
+        String capUrl = (serverCapWorkerUrl != null && !serverCapWorkerUrl.isEmpty())
+                ? serverCapWorkerUrl : CloudEndpoint.CAP_WORKER_URL;
+        if (capUrl == null || capUrl.isEmpty()) {
+            log("登录", "WARN", "人机验证服务未配置，自动登录回退到手动登录");
+            showLoginFormDirectly(onSuccess);
+            return;
+        }
+        CapWorkerSolver.solve(this, vRoot, capUrl, new CapWorkerSolver.Callback() {
+            @Override public void onToken(String capToken) {
+                setStatus("自动登录：正在验证账号…");
+                new Thread(() -> {
+                    try {
+                        String body = "{\"username\":" + jsonEscape(username)
+                            + ",\"password\":" + jsonEscape(password)
+                            + ",\"cap_token\":" + jsonEscape(capToken) + "}";
+                        String resp = Net.postJson(CloudEndpoint.ACCOUNT_LOGIN, body, 15_000);
+                        org.json.JSONObject json = new org.json.JSONObject(resp);
+                        if (json.optBoolean("success", false)) {
+                            String accountId = json.optString("account_id", "");
+                            String token     = json.optString("token", "");
+                            getSharedPreferences(PREFS_ACCOUNT, MODE_PRIVATE).edit()
+                                .putString(KEY_ACCOUNT_ID,    accountId)
+                                .putString(KEY_ACCOUNT_TOKEN, token)
+                                .apply();
+                            log("登录", "INFO", "自动登录成功，account_id=" + accountId);
+                            ui.post(onSuccess);
+                        } else {
+                            String err = json.optString("error", "登录失败");
+                            log("登录", "WARN", "自动登录被服务端拒绝：" + err + "，回退到手动登录");
+                            ui.post(() -> showLoginFormDirectly(onSuccess));
+                        }
+                    } catch (Exception e) {
+                        log("登录", "WARN", "自动登录网络错误：" + e.getMessage() + "，回退到手动登录");
+                        ui.post(() -> showLoginFormDirectly(onSuccess));
+                    }
+                }, "cnv-auto-login").start();
+            }
+            @Override public void onError(String error) {
+                log("登录", "WARN", "自动登录人机验证失败：" + error + "，回退到手动登录");
+                showLoginFormDirectly(onSuccess);
+            }
+        });
+    }
+
+    /**
+     * 直接显示登录表单对话框，不做 token / 自动登录检查。
+     * 表单会预填充上次记住的账号密码，并显示记住密码 / 自动登录复选框。
+     * 必须在主线程调用。
+     */
+    private void showLoginFormDirectly(Runnable onSuccess) {
+        SharedPreferences prefs = getSharedPreferences(PREFS_ACCOUNT, MODE_PRIVATE);
 
         View[] frame   = inflateDialogFrame();
         FrameLayout overlay = (FrameLayout) frame[0];
@@ -1919,12 +2205,20 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         EditText etPass = buildFormEditText(true, "密码");
         card.addView(etPass, formInputLp(dp(6)));
 
+        // ── 预填充已记住的凭证 ──────────────────────────────────────────────
+        if (prefs.getBoolean(KEY_REMEMBER_PASSWORD, false)) {
+            String prefUser = prefs.getString(KEY_SAVED_USERNAME, "");
+            String prefPass = prefs.getString(KEY_SAVED_PASSWORD, "");
+            if (prefUser != null && !prefUser.isEmpty()) etUser.setText(prefUser);
+            if (prefPass != null && !prefPass.isEmpty()) etPass.setText(prefPass);
+        }
+
         // ── 注册账号 / 忘记密码 ────────────────────────────────────────────
         LinearLayout linksRow = new LinearLayout(this);
         linksRow.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams linksLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        linksLp.bottomMargin = dp(16);
+        linksLp.bottomMargin = dp(10);
 
         TextView tvRegister = buildLinkText("注册账号");
         tvRegister.setOnClickListener(v -> openUrlInBrowser(CloudEndpoint.ACCOUNT_REGISTER));
@@ -1940,6 +2234,27 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         linksRow.addView(tvForgot, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         card.addView(linksRow, linksLp);
+
+        // ── 记住密码 / 自动登录 复选框 ─────────────────────────────────────
+        android.widget.CheckBox cbRemember  = buildCheckBox("记住密码",
+                prefs.getBoolean(KEY_REMEMBER_PASSWORD, false));
+        android.widget.CheckBox cbAutoLogin = buildCheckBox("自动登录",
+                prefs.getBoolean(KEY_AUTO_LOGIN, false));
+        cbAutoLogin.setEnabled(cbRemember.isChecked());
+        cbRemember.setOnCheckedChangeListener((btn, checked) -> {
+            cbAutoLogin.setEnabled(checked);
+            if (!checked) cbAutoLogin.setChecked(false);
+        });
+        LinearLayout checkRow = new LinearLayout(this);
+        checkRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams checkRowLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        checkRowLp.bottomMargin = dp(12);
+        checkRow.addView(cbRemember,  new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        checkRow.addView(cbAutoLogin, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        card.addView(checkRow, checkRowLp);
 
         // ── 错误提示（默认隐藏）─────────────────────────────────────────────
         TextView tvError = new TextView(this);
@@ -1978,7 +2293,18 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             btnLogin.setEnabled(false);
             btnLogin.setText("验证中…");
 
-            CapWorkerSolver.solve(this, vRoot, CloudEndpoint.CAP_WORKER_URL,
+            String capUrl = (serverCapWorkerUrl != null && !serverCapWorkerUrl.isEmpty())
+                    ? serverCapWorkerUrl : CloudEndpoint.CAP_WORKER_URL;
+            // cap-worker 地址缺失（服务端未下发且 CI 未注入）时直接报错，
+            // 避免 CapWorkerSolver 用空 URL 静默挂起、按钮卡在"验证中…"。
+            if (capUrl == null || capUrl.isEmpty()) {
+                tvError.setText("人机验证服务未配置，无法登录");
+                tvError.setVisibility(View.VISIBLE);
+                btnLogin.setEnabled(true);
+                btnLogin.setText("登录");
+                return;
+            }
+            CapWorkerSolver.solve(this, vRoot, capUrl,
                 new CapWorkerSolver.Callback() {
                     @Override public void onToken(String capToken) {
                         btnLogin.setText("登录中…");
@@ -1991,13 +2317,24 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                                         CloudEndpoint.ACCOUNT_LOGIN, body, 15_000);
                                 org.json.JSONObject json = new org.json.JSONObject(resp);
                                 if (json.optBoolean("success", false)) {
-                                    String accountId = json.optString("account_id", "");
-                                    String token     = json.optString("token", "");
-                                    getSharedPreferences(PREFS_ACCOUNT, MODE_PRIVATE)
-                                        .edit()
-                                        .putString(KEY_ACCOUNT_ID, accountId)
-                                        .putString(KEY_ACCOUNT_TOKEN, token)
-                                        .apply();
+                                    String accountId    = json.optString("account_id", "");
+                                    String token        = json.optString("token", "");
+                                    boolean rememberNow = cbRemember.isChecked();
+                                    boolean autoNow     = cbAutoLogin.isChecked();
+                                    SharedPreferences.Editor ed =
+                                            getSharedPreferences(PREFS_ACCOUNT, MODE_PRIVATE).edit()
+                                            .putString(KEY_ACCOUNT_ID,        accountId)
+                                            .putString(KEY_ACCOUNT_TOKEN,     token)
+                                            .putBoolean(KEY_REMEMBER_PASSWORD, rememberNow)
+                                            .putBoolean(KEY_AUTO_LOGIN,        autoNow);
+                                    if (rememberNow) {
+                                        ed.putString(KEY_SAVED_USERNAME, user)
+                                          .putString(KEY_SAVED_PASSWORD, pass);
+                                    } else {
+                                        ed.remove(KEY_SAVED_USERNAME)
+                                          .remove(KEY_SAVED_PASSWORD);
+                                    }
+                                    ed.apply();
                                     ui.post(() -> {
                                         vRoot.removeView(overlay);
                                         onSuccess.run();
@@ -2031,6 +2368,15 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         });
 
         overlay.setVisibility(View.VISIBLE);
+    }
+
+    private android.widget.CheckBox buildCheckBox(String label, boolean checked) {
+        android.widget.CheckBox cb = new android.widget.CheckBox(this);
+        cb.setText(label);
+        cb.setChecked(checked);
+        cb.setTextColor(COLOR_TEXT);
+        cb.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
+        return cb;
     }
 
     private EditText buildFormEditText(boolean isPassword, String hint) {
@@ -2093,7 +2439,15 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             it.setClassName(getPackageName(), GAME_ACTIVITY);
             it.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
             Intent orig = getIntent();
-            if (orig != null && orig.getData() != null) it.setData(orig.getData());
+            if (orig != null && orig.getData() != null) {
+                // C-M1: 只转发白名单 scheme 的 deep-link，拒绝 http/file/content 等
+                String scheme = orig.getData().getScheme();
+                if ("magireco.com".equals(scheme) || "magireco.reward".equals(scheme)) {
+                    it.setData(orig.getData());
+                } else if (scheme != null) {
+                    log("启动", "WARN", "拒绝非白名单 deep-link scheme: " + scheme);
+                }
+            }
             startActivity(it);
             log("启动", "INFO", "游戏 Activity 已启动，BootstrapActivity 退出");
             finish();
@@ -2103,6 +2457,255 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                     + (t.getMessage() != null ? "：" + t.getMessage() : ""));
             showFatal(t);
         }
+    }
+
+    // ======================================================================
+    // 存档同步（登录后、进游戏前）
+    // ======================================================================
+
+    /**
+     * 登录成功后的入口：先申请悬浮窗权限（若未授权），然后做云端存档对比。
+     * 在主线程调用。
+     */
+    private void checkSavesBeforeLaunch() {
+        if (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(this)) {
+            pendingAfterPermission = this::doSaveCheck;
+            try {
+                Intent it = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:" + getPackageName()));
+                startActivityForResult(it, REQ_OVERLAY_PERMISSION);
+            } catch (Throwable t) {
+                // 如果无法打开权限页，直接继续
+                pendingAfterPermission = null;
+                doSaveCheck();
+            }
+        } else {
+            doSaveCheck();
+        }
+    }
+
+    /**
+     * 在后台线程拉取云端存档，与本地对比，按结果展示对话框或直接启动游戏。
+     * 可在主线程或子线程调用（内部会新开线程处理网络操作）。
+     */
+    private void doSaveCheck() {
+        SharedPreferences prefs = getSharedPreferences(PREFS_ACCOUNT, MODE_PRIVATE);
+        String accountId    = prefs.getString(KEY_ACCOUNT_ID,    null);
+        String accountToken = prefs.getString(KEY_ACCOUNT_TOKEN, null);
+        if (accountId == null || accountToken == null) {
+            ui.post(this::launchWithOverlay);
+            return;
+        }
+        final String fAccountId    = accountId;
+        final String fAccountToken = accountToken;
+        new Thread(() -> {
+            SaveSyncHelper.SaveData local;
+            SaveSyncHelper.SaveData cloud;
+            try {
+                local = SaveSyncHelper.loadLocal(getApplicationContext(), fAccountId);
+                cloud = SaveSyncHelper.fetchCloud(getApplicationContext(), fAccountToken);
+            } catch (Exception e) {
+                android.util.Log.w(TAG, "存档拉取失败，跳过同步：" + e.getMessage());
+                ui.post(this::launchWithOverlay);
+                return;
+            }
+            SaveSyncHelper.SyncState state = SaveSyncHelper.compare(local, cloud);
+            switch (state) {
+                case IN_SYNC:
+                case LOCAL_ONLY:
+                    ui.post(this::launchWithOverlay);
+                    break;
+                case CLOUD_ONLY:
+                    ui.post(() -> showDownloadConfirmDialog(cloud.json, fAccountId));
+                    break;
+                case CONFLICT:
+                    ui.post(() -> showSaveConflictDialog(
+                            local.json, cloud.json, fAccountId, fAccountToken));
+                    break;
+            }
+        }, "cnv-save-check").start();
+    }
+
+    /**
+     * 下载确认框：本地无存档、云端有存档时展示。
+     * 用户选择"下载"时将云端存档写入本地 SQLite，再启动游戏；选"跳过"直接启动。
+     */
+    private void showDownloadConfirmDialog(String cloudJson, String accountId) {
+        View[] frame = inflateDialogFrame();
+        FrameLayout overlay = (FrameLayout) frame[0];
+        LinearLayout card   = (LinearLayout) frame[1];
+        addDialogTitle(card, "下载云端存档");
+        addDialogMessage(card,
+                "检测到云端有存档，而本地尚无存档记录。\n\n是否将云端存档下载到本机？");
+        LinearLayout row = addDialogButtonRow(card);
+        Button skipBtn     = addDialogButton(row, "跳过", false);
+        Button downloadBtn = addDialogButton(row, "下载", true);
+        skipBtn.setOnClickListener(v -> {
+            overlay.setVisibility(View.GONE);
+            vRoot.removeView(overlay);
+            launchWithOverlay();
+        });
+        downloadBtn.setOnClickListener(v -> {
+            overlay.setVisibility(View.GONE);
+            vRoot.removeView(overlay);
+            new Thread(() -> {
+                try {
+                    SaveSyncHelper.applyCloud(getApplicationContext(), accountId, cloudJson);
+                } catch (Exception e) {
+                    android.util.Log.e(TAG, "应用云端存档失败：" + e.getMessage());
+                }
+                ui.post(this::launchWithOverlay);
+            }, "cnv-apply-cloud").start();
+        });
+        overlay.setVisibility(View.VISIBLE);
+    }
+
+    /**
+     * 冲突解决框：本地与云端存档均有内容但不一致时展示。
+     * 用户选择"保留本地"时将本地存档上传覆盖云端；选"使用云端"时将云端存档写入本地。
+     */
+    private void showSaveConflictDialog(String localJson, String cloudJson,
+                                        String accountId, String accountToken) {
+        View[] frame = inflateDialogFrame();
+        FrameLayout overlay = (FrameLayout) frame[0];
+        LinearLayout card   = (LinearLayout) frame[1];
+        addDialogTitle(card, "存档冲突");
+        addDialogMessage(card,
+                "检测到本机存档与云端存档不一致，请选择要保留的版本：\n\n"
+              + "• 保留本地：保留本机存档，并将其上传覆盖云端\n"
+              + "• 使用云端：下载云端存档覆盖本机记录");
+        LinearLayout row  = addDialogButtonRow(card);
+        Button localBtn   = addDialogButton(row, "保留本地", false);
+        Button cloudBtn   = addDialogButton(row, "使用云端", true);
+        localBtn.setOnClickListener(v -> {
+            overlay.setVisibility(View.GONE);
+            vRoot.removeView(overlay);
+            new Thread(() -> {
+                try {
+                    SaveSyncHelper.upload(getApplicationContext(), accountId, accountToken);
+                } catch (Exception e) {
+                    android.util.Log.e(TAG, "上传本地存档失败：" + e.getMessage());
+                }
+                ui.post(this::launchWithOverlay);
+            }, "cnv-upload-local").start();
+        });
+        cloudBtn.setOnClickListener(v -> {
+            overlay.setVisibility(View.GONE);
+            vRoot.removeView(overlay);
+            new Thread(() -> {
+                try {
+                    SaveSyncHelper.applyCloud(getApplicationContext(), accountId, cloudJson);
+                } catch (Exception e) {
+                    android.util.Log.e(TAG, "应用云端存档失败：" + e.getMessage());
+                }
+                ui.post(this::launchWithOverlay);
+            }, "cnv-apply-cloud").start();
+        });
+        overlay.setVisibility(View.VISIBLE);
+    }
+
+    /**
+     * 启动悬浮存档服务（若已获得悬浮窗权限），然后启动游戏。
+     * 在主线程调用。
+     */
+    /**
+     * 服务器不可达、资源已就绪时弹出选择框，返回用户决定。
+     * 在工作线程调用，阻塞直到用户点击按钮。
+     * 返回值：{@link #OFFLINE_CHOICE_RETRY}、{@link #OFFLINE_CHOICE_OFFLINE}
+     *         或 {@link #OFFLINE_CHOICE_EXIT}。
+     */
+    private int askOfflineModeChoice() {
+        final Object lock    = new Object();
+        final int[]  result  = { OFFLINE_CHOICE_EXIT };
+        final boolean[] done = { false };
+        ui.post(() -> {
+            View[] frame = inflateDialogFrame();
+            FrameLayout overlay = (FrameLayout) frame[0];
+            LinearLayout card   = (LinearLayout) frame[1];
+            addDialogTitle(card, "服务器不可达");
+            addDialogMessage(card,
+                    "已连续尝试 3 次，均无法联系服务器。\n\n"
+                  + "游戏资源已就绪，可以进入离线模式直连私服后端运行游戏，"
+                  + "但账号登录和存档同步将不可用。");
+            LinearLayout row = addDialogButtonRow(card);
+            Button exitBtn    = addDialogButton(row, "退出",     false);
+            Button retryBtn   = addDialogButton(row, "重试",     false);
+            Button offlineBtn = addDialogButton(row, "离线模式", true);
+            exitBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { result[0] = OFFLINE_CHOICE_EXIT; done[0] = true; lock.notifyAll(); }
+            });
+            retryBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { result[0] = OFFLINE_CHOICE_RETRY; done[0] = true; lock.notifyAll(); }
+            });
+            offlineBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { result[0] = OFFLINE_CHOICE_OFFLINE; done[0] = true; lock.notifyAll(); }
+            });
+            overlay.setVisibility(View.VISIBLE);
+        });
+        synchronized (lock) {
+            while (!done[0]) {
+                try { lock.wait(500); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return OFFLINE_CHOICE_EXIT;
+                }
+            }
+            return result[0];
+        }
+    }
+
+    /**
+     * 服务器不可达时的离线模式入口：跳过热更新、账号登录、存档同步，
+     * 直连 Totentanz 后端启动游戏，并显示离线状态悬浮标签。
+     * 在工作线程调用。
+     */
+    private void enterOfflineMode() {
+        ProxyBackends.set(java.util.Collections.emptyList());
+        ProxyBackends.setGameServerHost("totentanz-9b.magica-us.com");
+        log("离线", "INFO", "代理已清空，直连后端：totentanz-9b.magica-us.com");
+        ui.post(() -> {
+            if (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(this)) {
+                pendingAfterPermission = this::launchGameWithOfflineOverlay;
+                try {
+                    startActivityForResult(
+                            new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                    android.net.Uri.parse("package:" + getPackageName())),
+                            REQ_OVERLAY_PERMISSION);
+                } catch (Throwable t) {
+                    pendingAfterPermission = null;
+                    launchGameWithOfflineOverlay();
+                }
+            } else {
+                launchGameWithOfflineOverlay();
+            }
+        });
+    }
+
+    private void launchGameWithOfflineOverlay() {
+        if (Build.VERSION.SDK_INT < 23 || Settings.canDrawOverlays(this)) {
+            try {
+                startService(new Intent(this, OfflineStatusOverlayService.class));
+            } catch (Throwable t) {
+                android.util.Log.w(TAG, "离线标签服务启动失败：" + t.getMessage());
+            }
+        }
+        launchGame();
+    }
+
+    private void launchWithOverlay() {
+        if (Build.VERSION.SDK_INT < 23 || Settings.canDrawOverlays(this)) {
+            try {
+                startService(new Intent(this, SaveOverlayService.class));
+            } catch (Throwable t) {
+                android.util.Log.w(TAG, "悬浮窗服务启动失败：" + t.getMessage());
+            }
+        }
+        launchGame();
     }
 
     // ======================================================================
@@ -2517,6 +3120,11 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 pickFinished = true;
                 pickLock.notifyAll();
             }
+        } else if (requestCode == REQ_OVERLAY_PERMISSION) {
+            // 不依赖 resultCode（系统总返回 RESULT_CANCELED），直接检查权限并继续
+            Runnable r = pendingAfterPermission;
+            pendingAfterPermission = null;
+            if (r != null) r.run();
         }
     }
 

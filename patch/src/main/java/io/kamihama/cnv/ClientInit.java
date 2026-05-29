@@ -29,6 +29,8 @@ public final class ClientInit {
         public List<String> allowedVersions       = new ArrayList<>();
         public String       updateUrlNormal;
         public String       updateUrlInternalTest;
+        /** 更新 APK 的 SHA-256（64 位小写十六进制）；null 表示服务端未提供。 */
+        public String       updateApkSha256;
         /** 向游戏 native 层伪造的版本号；null 表示服务端未配置，退化为真实版本。 */
         public String       fakeVersion;
         /** 向游戏 native 层伪造的应用名；null 表示服务端未配置。 */
@@ -52,14 +54,78 @@ public final class ClientInit {
          * null 时展示默认维护提示。
          */
         public String       featureDisabledMessage;
+
+        // ── 服务端地址（services 字段组）─────────────────────────────────
+        /**
+         * cap-worker 验证码服务端点（含协议，不含末尾斜杠）；
+         * null 时回退 {@link io.kamihama.cnv.CloudEndpoint#CAP_WORKER_URL}。
+         */
+        public String       capWorkerUrl;
+        /**
+         * 游戏代理后端地址列表（每条均含协议，不含末尾斜杠）；
+         * 从上到下依次尝试，全部失败时回退原版游戏后端。
+         */
+        public List<String> proxyBackends = new ArrayList<>();
+        /**
+         * 游戏原版服务器的 scheme+host（如 {@code https://api.magi-reco.com}）；
+         * 供 native 层精确匹配需要被代理的请求；null 时 native 退化为路径前缀匹配。
+         */
+        public String       gameServerHost;
+
+        /**
+         * 贡献者名单；由服务端在握手阶段下发，数量不固定（可为空）。
+         * 客户端启动画面据此动态渲染署名区。
+         */
+        public List<Contributor> contributors = new ArrayList<>();
     }
 
-    /** /client/online-download 响应：镜像列表 + S3 资源令牌。 */
+    /** 单个贡献者条目（来自 /client/init 响应的 contributors 数组）。 */
+    public static final class Contributor {
+        /** 头像底色 / 名字文字色（ARGB）；0 = 服务端未指定，客户端按顺序取调色板。 */
+        public int    color;
+        /** 显示名（必填）。 */
+        public String name;
+        /** 贡献说明（单行短文本）。 */
+        public String contribution;
+        /** 主页链接；空 = 不可点击跳转。 */
+        public String url;
+        /** 头像图片地址；空 = 显示名字首字母彩色圆。 */
+        public String avatarUrl;
+    }
+
+    /** /client/online-download 响应：镜像组列表 + S3 资源令牌。 */
     public static final class OnlineDownloadInfo {
-        /** 资源下载镜像 URL 列表（按优先级排列）。 */
-        public List<String> mirrors       = new ArrayList<>();
+
+        /** 单个镜像条目：一个 URL，可选附带该镜像提供的文件列表。 */
+        public static final class MirrorEntry {
+            public String url;
+            /** null = 服务端未提供，需用 S3 XML 发现；非 null = 直接使用此列表。 */
+            public List<S3List.Entry> files;
+        }
+
+        /** 一组镜像（同一线路的多个 CDN 节点）。 */
+        public static final class MirrorGroup {
+            public String name = "默认线路";
+            public List<MirrorEntry> entries = new ArrayList<>();
+
+            /** 返回该组所有镜像的 URL 列表（供 UI 展示）。 */
+            public List<String> urls() {
+                List<String> out = new ArrayList<>();
+                for (MirrorEntry e : entries) if (e.url != null) out.add(e.url);
+                return out;
+            }
+
+            /** 该组内是否至少有一个镜像附带了文件列表。 */
+            public boolean hasFileLists() {
+                for (MirrorEntry e : entries) if (e.files != null) return true;
+                return false;
+            }
+        }
+
+        /** 按线路分组的镜像列表。 */
+        public List<MirrorGroup> groups = new ArrayList<>();
         /** S3/CDN 资源访问令牌，用于 Authorization: Bearer 头（与会话令牌独立）。 */
-        public String       resourceToken;
+        public String            resourceToken;
     }
 
     /** /client/offline-package 响应：离线包下载 URL + 版本 + SHA-256。 */
@@ -128,6 +194,7 @@ public final class ClientInit {
             if (av != null) for (int i = 0; i < av.length(); i++) r.allowedVersions.add(av.getString(i));
             r.updateUrlNormal       = client.optString("update_url_normal",        null);
             r.updateUrlInternalTest = client.optString("update_url_internal_test", null);
+            r.updateApkSha256       = client.optString("update_apk_sha256",        null);
         }
 
         JSONObject spoof = obj.optJSONObject("spoof");
@@ -143,7 +210,47 @@ public final class ClientInit {
             r.featureDisabledMessage = features.optString("disabled_message",  null);
         }
 
+        JSONObject services = obj.optJSONObject("services");
+        if (services != null) {
+            r.capWorkerUrl    = services.optString("cap_worker_url",  null);
+            r.gameServerHost  = services.optString("game_server_host", null);
+            JSONArray pb = services.optJSONArray("proxy_backends");
+            if (pb != null) for (int i = 0; i < pb.length(); i++) r.proxyBackends.add(pb.getString(i));
+        }
+
+        JSONArray contribs = obj.optJSONArray("contributors");
+        if (contribs != null) {
+            for (int i = 0; i < contribs.length(); i++) {
+                JSONObject co = contribs.optJSONObject(i);
+                if (co == null) continue;
+                Contributor c = new Contributor();
+                c.name         = co.optString("name",         null);
+                c.contribution = co.optString("contribution", null);
+                c.url          = co.optString("url",          null);
+                c.avatarUrl    = co.optString("avatar_url",   null);
+                c.color        = parseColor(co.optString("color", null));
+                if (c.name != null && !c.name.isEmpty()) r.contributors.add(c);
+            }
+        }
+
         return r;
+    }
+
+    /**
+     * 解析 {@code "#RRGGBB"} / {@code "#AARRGGBB"} 颜色字符串为 ARGB int。
+     * 缺失 / 非法返回 0（调用方据此回退到客户端调色板）。{@code #RRGGBB} 自动补全不透明 alpha。
+     */
+    private static int parseColor(String s) {
+        if (s == null || s.isEmpty()) return 0;
+        try {
+            String hex = s.startsWith("#") ? s.substring(1) : s;
+            if (hex.length() == 6) {
+                return 0xFF000000 | Integer.parseInt(hex, 16);
+            } else if (hex.length() == 8) {
+                return (int) Long.parseLong(hex, 16);
+            }
+        } catch (NumberFormatException ignore) {}
+        return 0;
     }
 
     /**
@@ -173,11 +280,61 @@ public final class ClientInit {
         OnlineDownloadInfo info = new OnlineDownloadInfo();
         if (raw == null || raw.isEmpty()) return info;
         JSONObject obj = new JSONObject(raw);
-        JSONArray mirrors = obj.optJSONArray("mirrors");
-        if (mirrors != null) {
-            for (int i = 0; i < mirrors.length(); i++) info.mirrors.add(mirrors.getString(i));
-        }
         info.resourceToken = obj.optString("resource_token", null);
+
+        JSONArray groups = obj.optJSONArray("groups");
+        if (groups != null && groups.length() > 0) {
+            // 新格式：groups 数组
+            for (int gi = 0; gi < groups.length(); gi++) {
+                JSONObject gObj = groups.getJSONObject(gi);
+                OnlineDownloadInfo.MirrorGroup group = new OnlineDownloadInfo.MirrorGroup();
+                group.name = gObj.optString("name", "线路" + (gi + 1));
+                JSONArray entries = gObj.optJSONArray("mirrors");
+                if (entries != null) {
+                    for (int ei = 0; ei < entries.length(); ei++) {
+                        Object item = entries.get(ei);
+                        OnlineDownloadInfo.MirrorEntry me = new OnlineDownloadInfo.MirrorEntry();
+                        if (item instanceof String) {
+                            me.url = (String) item;
+                        } else if (item instanceof JSONObject) {
+                            JSONObject mObj = (JSONObject) item;
+                            me.url = mObj.optString("url", null);
+                            JSONArray files = mObj.optJSONArray("files");
+                            if (files != null) {
+                                me.files = new ArrayList<>();
+                                for (int fi = 0; fi < files.length(); fi++) {
+                                    Object fItem = files.get(fi);
+                                    if (fItem instanceof String) {
+                                        me.files.add(new S3List.Entry((String) fItem, -1L));
+                                    } else if (fItem instanceof JSONObject) {
+                                        JSONObject fObj = (JSONObject) fItem;
+                                        String key = fObj.optString("key", null);
+                                        long size   = fObj.optLong("size", -1L);
+                                        if (key != null && !key.isEmpty())
+                                            me.files.add(new S3List.Entry(key, size));
+                                    }
+                                }
+                            }
+                        }
+                        if (me.url != null && !me.url.isEmpty()) group.entries.add(me);
+                    }
+                }
+                if (!group.entries.isEmpty()) info.groups.add(group);
+            }
+        } else {
+            // 旧格式兼容：平铺的 mirrors 字符串数组 → 包装为单组，无文件列表（触发 S3 XML 发现）
+            JSONArray mirrors = obj.optJSONArray("mirrors");
+            if (mirrors != null && mirrors.length() > 0) {
+                OnlineDownloadInfo.MirrorGroup group = new OnlineDownloadInfo.MirrorGroup();
+                group.name = "默认线路";
+                for (int i = 0; i < mirrors.length(); i++) {
+                    OnlineDownloadInfo.MirrorEntry me = new OnlineDownloadInfo.MirrorEntry();
+                    me.url = mirrors.getString(i);
+                    group.entries.add(me);
+                }
+                info.groups.add(group);
+            }
+        }
         return info;
     }
 

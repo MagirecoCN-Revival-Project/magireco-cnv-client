@@ -24,15 +24,20 @@ name: 🏗️ 构建并发布 APK
 # ║   8. 创建 GitHub Release，上传签名 APK                              ║
 # ║   9. 将新版本号保存回 GitHub Variables                              ║
 # ║                                                                    ║
-# ║ 所需 Secrets                                                        ║
+# ║ 所需 Secrets（敏感信息）                                            ║
 # ║ ──────────                                                         ║
-# ║   GH_TOKEN          — 有 contents:write + variables:write 权限的   ║
-# ║                        Personal Access Token                       ║
-# ║   KEYSTORE_BASE64   — base64 编码的 JKS/PKCS12 签名 keystore       ║
-# ║                        （由 gen-signing-key.yml 生成）              ║
+# ║   GH_TOKEN           — contents:write + variables:write PAT       ║
+# ║   KEYSTORE_BASE64    — base64 编码的签名 keystore                  ║
 # ║   KEY_STORE_PASSWORD — keystore 密码                               ║
-# ║   KEY_ALIAS         — key 别名                                     ║
-# ║   KEY_PASSWORD      — key 密码                                     ║
+# ║   KEY_ALIAS          — key 别名                                    ║
+# ║   KEY_PASSWORD       — key 密码                                    ║
+# ║   CNV_API_HOST       — 主 API 域名（必填）                         ║
+# ║                                                                    ║
+# ║ 所需 Variables（非敏感）                                           ║
+# ║ ──────────────────────────────────────────────────────            ║
+# ║   CNV_CAP_WORKER_URL   CNV_HOME_URL   CNV_GITHUB_URL              ║
+# ║   （贡献者 URL 已改为 /client/init 下发，相关变量可删除，           ║
+# ║     见 cleanup-contributor-vars.yml）                              ║
 # ║                                                                    ║
 # ║ 所需 Variables（首次运行会自动从 4.0.0 / VersionCode=1 开始）        ║
 # ║   APK_VERSION       — 当前版本号，如 "4.0.0"                       ║
@@ -42,6 +47,7 @@ name: 🏗️ 构建并发布 APK
 
 on:
   push:
+    branches: [main, internal-test, claude/compare-main-legacy-branches-eTGpl]   # C-H4: 只响应核心分支推送，防止 fork / 测试分支误触发
   workflow_dispatch:
     inputs:
       bump_major:
@@ -64,10 +70,7 @@ jobs:
     env:
       PYTHONUNBUFFERED: "1"
       GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
-      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-      KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
-      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+      # C-H5: 签名密钥只在签名步骤的 step-level env 中暴露，不放 job-level
       REPO: ${{ github.repository }}
 
     steps:
@@ -411,6 +414,60 @@ jobs:
               ok(f"已下载: {name}")
 
           SCRIPT_END
+
+      - name: 🌐 注入 API Host 与 URL 常量
+        run: |
+          python3 <<'SCRIPT_END'
+          import os, re, sys
+
+          # ── CloudEndpoint.java ──────────────────────────────────────
+          ce_path = 'patch/src/main/java/io/kamihama/cnv/CloudEndpoint.java'
+          api_host = os.environ.get('CNV_API_HOST', '').rstrip('/')
+          cap_url  = os.environ.get('CNV_CAP_WORKER_URL', '').rstrip('/')
+          if not api_host:
+              print('::error::Secret CNV_API_HOST 未配置，无法构建')
+              sys.exit(1)
+          with open(ce_path, 'r', encoding='utf-8') as f:
+              src = f.read()
+          src = re.sub(r'(static final String API_HOST\s*=\s*)""',
+                       r'\g<1>"' + api_host + '"', src)
+          if cap_url:
+              src = re.sub(r'(static final String CAP_WORKER_URL\s*=\s*)""',
+                           r'\g<1>"' + cap_url + '"', src)
+          else:
+              print('::warning::CNV_CAP_WORKER_URL 未设置，CAP_WORKER_URL 保持空串（人机验证不可用）')
+          with open(ce_path, 'w', encoding='utf-8') as f:
+              f.write(src)
+          print('CloudEndpoint: API_HOST =', api_host)
+
+          # ── BootstrapActivity.java ──────────────────────────────────
+          # 仅注入标题栏的主页 / GitHub 链接；贡献者名单已改为 /client/init 下发。
+          ba_path = 'patch/src/main/java/io/kamihama/cnv/BootstrapActivity.java'
+          urls = {
+              'URL_HOME':   os.environ.get('CNV_HOME_URL',   ''),
+              'URL_GITHUB': os.environ.get('CNV_GITHUB_URL', ''),
+          }
+          missing = [k for k, v in urls.items() if not v]
+          if missing:
+              print('::warning::以下 URL 变量未设置，对应按钮将不可点击: ' + ', '.join(missing))
+          with open(ba_path, 'r', encoding='utf-8') as f:
+              src = f.read()
+          for key, val in urls.items():
+              if val:
+                  src = re.sub(
+                      r'(static final String ' + key + r'\s*=\s*)""',
+                      r'\g<1>"' + val.replace('\\', '\\\\').replace('"', '\\"') + '"',
+                      src
+                  )
+                  print(f'BootstrapActivity: {key} = {val}')
+          with open(ba_path, 'w', encoding='utf-8') as f:
+              f.write(src)
+          SCRIPT_END
+        env:
+          CNV_API_HOST:       ${{ secrets.CNV_API_HOST }}
+          CNV_CAP_WORKER_URL: ${{ vars.CNV_CAP_WORKER_URL }}
+          CNV_HOME_URL:       ${{ vars.CNV_HOME_URL }}
+          CNV_GITHUB_URL:     ${{ vars.CNV_GITHUB_URL }}
 
       - name: ☕ 编译 Java 补丁源码
         run: |
@@ -886,10 +943,11 @@ jobs:
               with open(os.environ["GITHUB_OUTPUT"], "a") as f:
                   f.write(f"{key}={value}\n")
 
-          def run(cmd, **kw):
-              r = subprocess.run(cmd, shell=True, capture_output=True, text=True, **kw)
+          def run_list(cmd_list, **kw):
+              """C-H3/H5: shell=False，密码通过 args 列表传递，避免 shell 注入"""
+              r = subprocess.run(cmd_list, shell=False, capture_output=True, text=True, **kw)
               if r.returncode != 0:
-                  err(f"命令失败: {cmd}")
+                  err("命令失败")
                   err(r.stderr.strip())
                   sys.exit(1)
               return r.stdout.strip()
@@ -917,15 +975,16 @@ jobs:
 
           section("运行 apksigner")
           signed_apk = f"build/{apk_name}"
-          run(
-              f'"{bt_dir}/apksigner" sign '
-              f'--ks "{ks_path}" '
-              f'--ks-pass "pass:{ks_pass}" '
-              f'--ks-key-alias "{k_alias}" '
-              f'--key-pass "pass:{k_pass}" '
-              f'--out "{signed_apk}" '
-              f'build/aligned.apk'
-          )
+          # C-H5: shell=False，密码作为独立参数传递
+          run_list([
+              f"{bt_dir}/apksigner", "sign",
+              "--ks",           ks_path,
+              "--ks-pass",      f"pass:{ks_pass}",
+              "--ks-key-alias", k_alias,
+              "--key-pass",     f"pass:{k_pass}",
+              "--out",          signed_apk,
+              "build/aligned.apk",
+          ])
 
           ok(f"签名完成: {signed_apk}（{os.path.getsize(signed_apk):,} bytes）")
           set_output("signed_apk", signed_apk)
