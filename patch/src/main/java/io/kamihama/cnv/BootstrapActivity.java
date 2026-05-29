@@ -1502,6 +1502,18 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private void runWork() {
         log("启动", "INFO", "工作线程已启动");
 
+        // 第 0 步（最优先）：自防篡改门禁——拦截重打包 / Provider 注入攻击。
+        // 必须早于任何敏感数据（token / 存档）访问；不提供调试跳过开关。
+        IntegrityGuard.Verdict verdict = IntegrityGuard.check(this);
+        if (verdict.tampered) {
+            log("安全", "ERROR", "完整性门禁拦截：" + verdict.reason);
+            showFatalAndExit("客户端完整性校验失败",
+                    "检测到客户端被篡改或来源不可信，已停止启动以保护你的账号数据。\n\n"
+                  + "请从官方渠道重新下载安装。");
+            return;
+        }
+        log("安全", "INFO", "完整性门禁通过");
+
         // 调试模式：display_ui_only.flag=true 时仅展示 UI，跳过所有启动逻辑
         if (isDebugFlag("display_ui_only")) {
             log("启动", "WARN", "调试模式已激活（display_ui_only.flag=true），跳过所有启动逻辑");

@@ -462,10 +462,40 @@ jobs:
                   print(f'BootstrapActivity: {key} = {val}')
           with open(ba_path, 'w', encoding='utf-8') as f:
               f.write(src)
+
+          # ── IntegrityGuard.java：注入发布签名证书 SHA-256（自防篡改 pin）──
+          # 从 keystore 导出签名证书（DER），算 SHA-256；这与运行时
+          # ClientSignature 对 Signature.toByteArray()（DER 证书字节）算的
+          # SHA-256 一致。未配置 keystore 时保持空串（pin 关闭，仅 provider 审计生效）。
+          ig_path = 'patch/src/main/java/io/kamihama/cnv/IntegrityGuard.java'
+          ks_b64  = os.environ.get('KEYSTORE_BASE64', '')
+          ks_pass = os.environ.get('KEY_STORE_PASSWORD', '')
+          k_alias = os.environ.get('KEY_ALIAS', '')
+          if ks_b64.strip() and ks_pass and k_alias:
+              import base64, hashlib, subprocess, tempfile
+              ks_tmp = tempfile.NamedTemporaryFile(suffix='.keystore', delete=False)
+              ks_tmp.write(base64.b64decode(ks_b64)); ks_tmp.close()
+              der = subprocess.run(
+                  ['keytool', '-exportcert', '-keystore', ks_tmp.name,
+                   '-alias', k_alias, '-storepass', ks_pass],
+                  check=True, capture_output=True).stdout  # 无 -rfc → DER 字节
+              sig_sha256 = hashlib.sha256(der).hexdigest()
+              with open(ig_path, 'r', encoding='utf-8') as f:
+                  src = f.read()
+              src = re.sub(r'(static final String EXPECTED_SIGNATURE_SHA256\s*=\s*)""',
+                           r'\g<1>"' + sig_sha256 + '"', src)
+              with open(ig_path, 'w', encoding='utf-8') as f:
+                  f.write(src)
+              print('IntegrityGuard: EXPECTED_SIGNATURE_SHA256 =', sig_sha256)
+          else:
+              print('::warning::未配置 keystore，IntegrityGuard 签名 pin 关闭（provider 审计仍生效）')
           SCRIPT_END
         env:
           CNV_API_HOST:       ${{ secrets.CNV_API_HOST }}
           CNV_CAP_WORKER_URL: ${{ vars.CNV_CAP_WORKER_URL }}
+          KEYSTORE_BASE64:    ${{ secrets.KEYSTORE_BASE64 }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_ALIAS:          ${{ secrets.KEY_ALIAS }}
           CNV_HOME_URL:       ${{ vars.CNV_HOME_URL }}
           CNV_GITHUB_URL:     ${{ vars.CNV_GITHUB_URL }}
 
