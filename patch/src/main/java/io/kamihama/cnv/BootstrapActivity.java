@@ -221,6 +221,9 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private final Handler ui = new Handler(Looper.getMainLooper());
     private volatile boolean cancelled = false;
     private volatile boolean launched  = false;
+
+    /** 与 cloud-init 并行运行的资源完整性校验 Future；仅 alreadyReady=true 时设置。 */
+    private volatile java.util.concurrent.Future<ResourceIntegrityChecker.Result> integrityFuture;
     /** 握手后由服务端签发的会话令牌，传给 ResourceFlow 用于鉴权三件套。 */
     private volatile String  sessionToken = "";
     /** 服务端功能开关：是否允许在线下载（握手后由 handleCloudInit 写入）。 */
@@ -1545,6 +1548,23 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             }
         }
 
+        // 第 0a 后置：资源已就绪时启动完整性后台校验，与后续握手 / 热更新并行
+        if (alreadyReady && !isDebugFlag("skip_integrity_check")) {
+            File manifestFile = new File(
+                    new File(getFilesDir(), "cnv_inject"),
+                    ResourceIntegrityChecker.MANIFEST_NAME);
+            if (manifestFile.exists()) {
+                log("校验", "INFO", "启动资源完整性后台校验（与握手并行）…");
+                java.util.concurrent.ExecutorService exec =
+                        java.util.concurrent.Executors.newSingleThreadExecutor();
+                integrityFuture = exec.submit(() ->
+                        ResourceIntegrityChecker.check(getFilesDir(), manifestFile));
+                exec.shutdown();
+            } else {
+                log("校验", "INFO", "资源清单不存在，跳过本次校验（将在下次下载后生成）");
+            }
+        }
+
         // 自检完毕，触发标题音效序列（system02 → system01 BGM）
         ui.post(this::playTitleSequence);
 
@@ -1613,7 +1633,9 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             } else {
                 log("启动", "WARN", "调试：skip_hot_update=true，已跳过热更新检查");
             }
-            log("启动", "INFO", "热更新检查完成，显示登录界面");
+            log("启动", "INFO", "热更新检查完成，检查完整性校验结果");
+            if (integrityFuture != null && !handleIntegrityResult()) return;
+            log("启动", "INFO", "显示登录界面");
             ui.post(() -> showLoginDialog(this::checkSavesBeforeLaunch));
             return;
         }
@@ -2657,6 +2679,93 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             }
             return result[0];
         }
+    }
+
+    /**
+     * 等待并处理完整性校验结果。
+     * @return true 继续启动；false 已弹 fatal / 重置标志，调用方应 return
+     */
+    private boolean handleIntegrityResult() {
+        ResourceIntegrityChecker.Result result;
+        try {
+            result = integrityFuture.get(5_000, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (java.util.concurrent.TimeoutException e) {
+            log("校验", "WARN", "完整性校验超时（5s），跳过本次校验");
+            integrityFuture.cancel(true);
+            return true;
+        } catch (Throwable e) {
+            log("校验", "WARN", "获取校验结果失败：" + e.getMessage() + "，跳过");
+            return true;
+        }
+        if (result.passed) {
+            log("校验", "INFO", "资源完整性校验通过");
+            return true;
+        }
+        log("校验", "WARN", "完整性校验未通过，疑似异常文件数=" + result.tampered.size());
+        return askIntegrityWarning(result.isCheckError, result.tampered);
+    }
+
+    /**
+     * 展示完整性警告对话框。
+     * @return true 用户选择忽略继续；false 用户选择重新下载（已清除 ready flag，调用方 return）
+     */
+    private boolean askIntegrityWarning(boolean isCheckError, java.util.List<String> tampered) {
+        final Object  lock   = new Object();
+        final boolean[] cont = { false };
+        final boolean[] done = { false };
+
+        String title, message;
+        if (isCheckError) {
+            title = "资源校验程序异常";
+            message = "完整性校验程序连续失败，无法完成验证。\n\n"
+                    + "是否继续启动（可能存在风险）？";
+        } else {
+            StringBuilder sb = new StringBuilder("检测到以下脚本文件可能被篡改：\n\n");
+            int show = Math.min(tampered.size(), 8);
+            for (int i = 0; i < show; i++) sb.append("• ").append(tampered.get(i)).append('\n');
+            if (tampered.size() > show) sb.append("… 等共 ").append(tampered.size()).append(" 个文件\n");
+            sb.append("\n重新下载资源以修复；或忽略并继续（可能导致游戏异常）。");
+            title   = "资源完整性验证失败";
+            message = sb.toString();
+        }
+
+        ui.post(() -> {
+            View[] frame = inflateDialogFrame();
+            FrameLayout overlay = (FrameLayout) frame[0];
+            LinearLayout card   = (LinearLayout) frame[1];
+            addDialogTitle(card, title);
+            addDialogMessage(card, message);
+            LinearLayout row     = addDialogButtonRow(card);
+            Button continueBtn   = addDialogButton(row, "忽略并继续", false);
+            Button redownloadBtn = addDialogButton(row, "重新下载",   true);
+            continueBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { cont[0] = true; done[0] = true; lock.notifyAll(); }
+            });
+            redownloadBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { cont[0] = false; done[0] = true; lock.notifyAll(); }
+            });
+            overlay.setVisibility(View.VISIBLE);
+        });
+
+        synchronized (lock) {
+            while (!done[0]) {
+                try { lock.wait(500); }
+                catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return true; // interrupted → continue
+                }
+            }
+        }
+        if (cont[0]) return true;
+        // 用户选择重新下载：清除 ready flag，让用户重启触发下载
+        deleteReadyFlag();
+        showFatalAndExit("资源已重置",
+                "资源就绪标记已清除。\n\n请重新启动应用以重新下载游戏资源。");
+        return false;
     }
 
     /**

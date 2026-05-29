@@ -1036,6 +1036,12 @@ public final class ResourceFlow {
         state.status = DownloadState.Status.DONE;
         reporter.setSlotPhase(slot, "done");
         reporter.log("热更", "INFO", "[" + fileName + "] 更新完成，版本=" + serverVer);
+        // 热更新改变了脚本文件，异步重建清单
+        File manifestFile = new File(new File(ctx.getFilesDir(), "cnv_inject"),
+                ResourceIntegrityChecker.MANIFEST_NAME);
+        File baseDir = ctx.getFilesDir();
+        new Thread(() -> ResourceIntegrityChecker.generate(baseDir, manifestFile),
+                "cnv-manifest-hotupdate").start();
     }
 
     private static void unzipHotPatch(File zipFile, File destDir) throws java.io.IOException {
@@ -1093,6 +1099,11 @@ public final class ResourceFlow {
             fos.write(("ok:" + System.currentTimeMillis() + "\n").getBytes("UTF-8"));
         }
         reporter.log("INFO", "已写出 ready flag: " + flag.getAbsolutePath());
+        // 生成脚本/配置文件完整性清单（异步，不阻塞调用方）
+        File manifestFile = new File(dir, ResourceIntegrityChecker.MANIFEST_NAME);
+        File baseDir      = ctx.getFilesDir();
+        new Thread(() -> ResourceIntegrityChecker.generate(baseDir, manifestFile),
+                "cnv-manifest-gen").start();
     }
 
     private ResourceFlow() { throw new AssertionError(); }
