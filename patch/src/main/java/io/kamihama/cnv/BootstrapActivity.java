@@ -78,9 +78,13 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private static final int OFFLINE_CHOICE_EXIT    = 2;
     private static final String PREFS_NAME        = "cnv_bootstrap_ui";
     private static final String PREF_DARK_MODE    = "dark_mode";
-    private static final String PREFS_ACCOUNT     = "cnv_account";
-    private static final String KEY_ACCOUNT_ID    = "account_id";
-    private static final String KEY_ACCOUNT_TOKEN = "account_token";
+    private static final String PREFS_ACCOUNT        = "cnv_account";
+    private static final String KEY_ACCOUNT_ID       = "account_id";
+    private static final String KEY_ACCOUNT_TOKEN    = "account_token";
+    private static final String KEY_SAVED_USERNAME   = "saved_username";
+    private static final String KEY_SAVED_PASSWORD   = "saved_password";
+    private static final String KEY_REMEMBER_PASSWORD = "remember_password";
+    private static final String KEY_AUTO_LOGIN       = "auto_login";
 
     /** 资源目录内的背景图路径（assets/cnv/background_light.png）。 */
     private static final String BG_ASSET          = "cnv/background_light.png";
@@ -2097,19 +2101,95 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     // ======================================================================
 
     /**
-     * 热更新完成后显示登录对话框。若 SharedPreferences 已保存有效会话则直接跳过。
-     * 登录成功后调用 onSuccess（通常为 {@link #launchGame()}）。
+     * 热更新完成后显示登录对话框。
+     * <ul>
+     *   <li>已有有效会话令牌 → 直接跳过登录。</li>
+     *   <li>启用了自动登录且保存有凭证 → 静默自动登录，失败后回退到表单。</li>
+     *   <li>否则 → 显示登录表单。</li>
+     * </ul>
      * 必须在主线程调用。
      */
     private void showLoginDialog(Runnable onSuccess) {
         SharedPreferences prefs = getSharedPreferences(PREFS_ACCOUNT, MODE_PRIVATE);
-        String savedId    = prefs.getString(KEY_ACCOUNT_ID, null);
+        String savedId    = prefs.getString(KEY_ACCOUNT_ID,    null);
         String savedToken = prefs.getString(KEY_ACCOUNT_TOKEN, null);
         if (savedId != null && !savedId.isEmpty()
                 && savedToken != null && !savedToken.isEmpty()) {
             onSuccess.run();
             return;
         }
+        boolean autoLogin = prefs.getBoolean(KEY_AUTO_LOGIN, false);
+        String  savedUser = prefs.getString(KEY_SAVED_USERNAME, null);
+        String  savedPass = prefs.getString(KEY_SAVED_PASSWORD, null);
+        if (autoLogin
+                && savedUser != null && !savedUser.isEmpty()
+                && savedPass != null && !savedPass.isEmpty()) {
+            doAutoLogin(savedUser, savedPass, onSuccess);
+            return;
+        }
+        showLoginFormDirectly(onSuccess);
+    }
+
+    /**
+     * 使用已保存的凭证静默登录（PoW 求解 + POST，无对话框）。
+     * 成功后调用 onSuccess；失败后回退到登录表单（凭证预填充）。
+     * 必须在主线程调用。
+     */
+    private void doAutoLogin(String username, String password, Runnable onSuccess) {
+        setPhase("登录");
+        setStatus("自动登录中…");
+        log("登录", "INFO", "检测到自动登录凭证，开始静默登录");
+        String capUrl = (serverCapWorkerUrl != null && !serverCapWorkerUrl.isEmpty())
+                ? serverCapWorkerUrl : CloudEndpoint.CAP_WORKER_URL;
+        if (capUrl == null || capUrl.isEmpty()) {
+            log("登录", "WARN", "人机验证服务未配置，自动登录回退到手动登录");
+            showLoginFormDirectly(onSuccess);
+            return;
+        }
+        CapWorkerSolver.solve(this, vRoot, capUrl, new CapWorkerSolver.Callback() {
+            @Override public void onToken(String capToken) {
+                setStatus("自动登录：正在验证账号…");
+                new Thread(() -> {
+                    try {
+                        String body = "{\"username\":" + jsonEscape(username)
+                            + ",\"password\":" + jsonEscape(password)
+                            + ",\"cap_token\":" + jsonEscape(capToken) + "}";
+                        String resp = Net.postJson(CloudEndpoint.ACCOUNT_LOGIN, body, 15_000);
+                        org.json.JSONObject json = new org.json.JSONObject(resp);
+                        if (json.optBoolean("success", false)) {
+                            String accountId = json.optString("account_id", "");
+                            String token     = json.optString("token", "");
+                            getSharedPreferences(PREFS_ACCOUNT, MODE_PRIVATE).edit()
+                                .putString(KEY_ACCOUNT_ID,    accountId)
+                                .putString(KEY_ACCOUNT_TOKEN, token)
+                                .apply();
+                            log("登录", "INFO", "自动登录成功，account_id=" + accountId);
+                            ui.post(onSuccess);
+                        } else {
+                            String err = json.optString("error", "登录失败");
+                            log("登录", "WARN", "自动登录被服务端拒绝：" + err + "，回退到手动登录");
+                            ui.post(() -> showLoginFormDirectly(onSuccess));
+                        }
+                    } catch (Exception e) {
+                        log("登录", "WARN", "自动登录网络错误：" + e.getMessage() + "，回退到手动登录");
+                        ui.post(() -> showLoginFormDirectly(onSuccess));
+                    }
+                }, "cnv-auto-login").start();
+            }
+            @Override public void onError(String error) {
+                log("登录", "WARN", "自动登录人机验证失败：" + error + "，回退到手动登录");
+                showLoginFormDirectly(onSuccess);
+            }
+        });
+    }
+
+    /**
+     * 直接显示登录表单对话框，不做 token / 自动登录检查。
+     * 表单会预填充上次记住的账号密码，并显示记住密码 / 自动登录复选框。
+     * 必须在主线程调用。
+     */
+    private void showLoginFormDirectly(Runnable onSuccess) {
+        SharedPreferences prefs = getSharedPreferences(PREFS_ACCOUNT, MODE_PRIVATE);
 
         View[] frame   = inflateDialogFrame();
         FrameLayout overlay = (FrameLayout) frame[0];
@@ -2125,12 +2205,20 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         EditText etPass = buildFormEditText(true, "密码");
         card.addView(etPass, formInputLp(dp(6)));
 
+        // ── 预填充已记住的凭证 ──────────────────────────────────────────────
+        if (prefs.getBoolean(KEY_REMEMBER_PASSWORD, false)) {
+            String prefUser = prefs.getString(KEY_SAVED_USERNAME, "");
+            String prefPass = prefs.getString(KEY_SAVED_PASSWORD, "");
+            if (prefUser != null && !prefUser.isEmpty()) etUser.setText(prefUser);
+            if (prefPass != null && !prefPass.isEmpty()) etPass.setText(prefPass);
+        }
+
         // ── 注册账号 / 忘记密码 ────────────────────────────────────────────
         LinearLayout linksRow = new LinearLayout(this);
         linksRow.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams linksLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        linksLp.bottomMargin = dp(16);
+        linksLp.bottomMargin = dp(10);
 
         TextView tvRegister = buildLinkText("注册账号");
         tvRegister.setOnClickListener(v -> openUrlInBrowser(CloudEndpoint.ACCOUNT_REGISTER));
@@ -2146,6 +2234,27 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         linksRow.addView(tvForgot, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         card.addView(linksRow, linksLp);
+
+        // ── 记住密码 / 自动登录 复选框 ─────────────────────────────────────
+        android.widget.CheckBox cbRemember  = buildCheckBox("记住密码",
+                prefs.getBoolean(KEY_REMEMBER_PASSWORD, false));
+        android.widget.CheckBox cbAutoLogin = buildCheckBox("自动登录",
+                prefs.getBoolean(KEY_AUTO_LOGIN, false));
+        cbAutoLogin.setEnabled(cbRemember.isChecked());
+        cbRemember.setOnCheckedChangeListener((btn, checked) -> {
+            cbAutoLogin.setEnabled(checked);
+            if (!checked) cbAutoLogin.setChecked(false);
+        });
+        LinearLayout checkRow = new LinearLayout(this);
+        checkRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams checkRowLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        checkRowLp.bottomMargin = dp(12);
+        checkRow.addView(cbRemember,  new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        checkRow.addView(cbAutoLogin, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        card.addView(checkRow, checkRowLp);
 
         // ── 错误提示（默认隐藏）─────────────────────────────────────────────
         TextView tvError = new TextView(this);
@@ -2208,13 +2317,24 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                                         CloudEndpoint.ACCOUNT_LOGIN, body, 15_000);
                                 org.json.JSONObject json = new org.json.JSONObject(resp);
                                 if (json.optBoolean("success", false)) {
-                                    String accountId = json.optString("account_id", "");
-                                    String token     = json.optString("token", "");
-                                    getSharedPreferences(PREFS_ACCOUNT, MODE_PRIVATE)
-                                        .edit()
-                                        .putString(KEY_ACCOUNT_ID, accountId)
-                                        .putString(KEY_ACCOUNT_TOKEN, token)
-                                        .apply();
+                                    String accountId    = json.optString("account_id", "");
+                                    String token        = json.optString("token", "");
+                                    boolean rememberNow = cbRemember.isChecked();
+                                    boolean autoNow     = cbAutoLogin.isChecked();
+                                    SharedPreferences.Editor ed =
+                                            getSharedPreferences(PREFS_ACCOUNT, MODE_PRIVATE).edit()
+                                            .putString(KEY_ACCOUNT_ID,        accountId)
+                                            .putString(KEY_ACCOUNT_TOKEN,     token)
+                                            .putBoolean(KEY_REMEMBER_PASSWORD, rememberNow)
+                                            .putBoolean(KEY_AUTO_LOGIN,        autoNow);
+                                    if (rememberNow) {
+                                        ed.putString(KEY_SAVED_USERNAME, user)
+                                          .putString(KEY_SAVED_PASSWORD, pass);
+                                    } else {
+                                        ed.remove(KEY_SAVED_USERNAME)
+                                          .remove(KEY_SAVED_PASSWORD);
+                                    }
+                                    ed.apply();
                                     ui.post(() -> {
                                         vRoot.removeView(overlay);
                                         onSuccess.run();
@@ -2248,6 +2368,15 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         });
 
         overlay.setVisibility(View.VISIBLE);
+    }
+
+    private android.widget.CheckBox buildCheckBox(String label, boolean checked) {
+        android.widget.CheckBox cb = new android.widget.CheckBox(this);
+        cb.setText(label);
+        cb.setChecked(checked);
+        cb.setTextColor(COLOR_TEXT);
+        cb.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
+        return cb;
     }
 
     private EditText buildFormEditText(boolean isPassword, String hint) {
