@@ -82,9 +82,16 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private static final String KEY_ACCOUNT_ID       = "account_id";
     private static final String KEY_ACCOUNT_TOKEN    = "account_token";
     private static final String KEY_SAVED_USERNAME   = "saved_username";
-    private static final String KEY_SAVED_PASSWORD   = "saved_password";
-    private static final String KEY_REMEMBER_PASSWORD = "remember_password";
-    private static final String KEY_AUTO_LOGIN       = "auto_login";
+    /**
+     * "记住登录"开关。取代旧的"记住密码 + 自动登录"——不再在磁盘存明文密码，
+     * 改为持久化服务端下发的会话 token（{@link #KEY_ACCOUNT_TOKEN}）：
+     * <ul>
+     *   <li>勾选：保留 account_id + token，下次启动用 token 静默恢复会话。</li>
+     *   <li>不勾选：下次启动清除已存 token，要求重新登录。</li>
+     * </ul>
+     * token 可由服务端撤销、且仅本应用私有可读，安全性优于明文密码。
+     */
+    private static final String KEY_REMEMBER_LOGIN   = "remember_login";
 
     /** 资源目录内的背景图路径（assets/cnv/background_light.png）。 */
     private static final String BG_ASSET          = "cnv/background_light.png";
@@ -2137,89 +2144,35 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     /**
      * 热更新完成后显示登录对话框。
      * <ul>
-     *   <li>已有有效会话令牌 → 直接跳过登录。</li>
-     *   <li>启用了自动登录且保存有凭证 → 静默自动登录，失败后回退到表单。</li>
-     *   <li>否则 → 显示登录表单。</li>
+     *   <li>"记住登录"开启且存有有效 token → 用 token 静默恢复会话，跳过登录。</li>
+     *   <li>否则 → 清除可能残留的 token，显示登录表单。</li>
      * </ul>
      * 必须在主线程调用。
      */
     private void showLoginDialog(Runnable onSuccess) {
         SharedPreferences prefs = getSharedPreferences(PREFS_ACCOUNT, MODE_PRIVATE);
-        String savedId    = prefs.getString(KEY_ACCOUNT_ID,    null);
-        String savedToken = prefs.getString(KEY_ACCOUNT_TOKEN, null);
-        if (savedId != null && !savedId.isEmpty()
+        boolean remember  = prefs.getBoolean(KEY_REMEMBER_LOGIN, true);
+        String  savedId    = prefs.getString(KEY_ACCOUNT_ID,    null);
+        String  savedToken = prefs.getString(KEY_ACCOUNT_TOKEN, null);
+        if (remember
+                && savedId != null && !savedId.isEmpty()
                 && savedToken != null && !savedToken.isEmpty()) {
+            log("登录", "INFO", "记住登录已开启，用已存 token 恢复会话");
             onSuccess.run();
             return;
         }
-        boolean autoLogin = prefs.getBoolean(KEY_AUTO_LOGIN, false);
-        String  savedUser = prefs.getString(KEY_SAVED_USERNAME, null);
-        String  savedPass = prefs.getString(KEY_SAVED_PASSWORD, null);
-        if (autoLogin
-                && savedUser != null && !savedUser.isEmpty()
-                && savedPass != null && !savedPass.isEmpty()) {
-            doAutoLogin(savedUser, savedPass, onSuccess);
-            return;
+        // 未开启记住登录：清除可能残留的 token / id，避免下次被静默复用
+        if (!remember && (savedToken != null || savedId != null)) {
+            prefs.edit().remove(KEY_ACCOUNT_ID).remove(KEY_ACCOUNT_TOKEN).apply();
+            log("登录", "INFO", "记住登录未开启，已清除残留 token");
         }
         showLoginFormDirectly(onSuccess);
     }
 
     /**
-     * 使用已保存的凭证静默登录（PoW 求解 + POST，无对话框）。
-     * 成功后调用 onSuccess；失败后回退到登录表单（凭证预填充）。
-     * 必须在主线程调用。
-     */
-    private void doAutoLogin(String username, String password, Runnable onSuccess) {
-        setPhase("登录");
-        setStatus("自动登录中…");
-        log("登录", "INFO", "检测到自动登录凭证，开始静默登录");
-        String capUrl = (serverCapWorkerUrl != null && !serverCapWorkerUrl.isEmpty())
-                ? serverCapWorkerUrl : CloudEndpoint.CAP_WORKER_URL;
-        if (capUrl == null || capUrl.isEmpty()) {
-            log("登录", "WARN", "人机验证服务未配置，自动登录回退到手动登录");
-            showLoginFormDirectly(onSuccess);
-            return;
-        }
-        CapWorkerSolver.solve(this, vRoot, capUrl, new CapWorkerSolver.Callback() {
-            @Override public void onToken(String capToken) {
-                setStatus("自动登录：正在验证账号…");
-                new Thread(() -> {
-                    try {
-                        String body = "{\"username\":" + jsonEscape(username)
-                            + ",\"password\":" + jsonEscape(password)
-                            + ",\"cap_token\":" + jsonEscape(capToken) + "}";
-                        String resp = Net.postJson(CloudEndpoint.ACCOUNT_LOGIN, body, 15_000);
-                        org.json.JSONObject json = new org.json.JSONObject(resp);
-                        if (json.optBoolean("success", false)) {
-                            String accountId = json.optString("account_id", "");
-                            String token     = json.optString("token", "");
-                            getSharedPreferences(PREFS_ACCOUNT, MODE_PRIVATE).edit()
-                                .putString(KEY_ACCOUNT_ID,    accountId)
-                                .putString(KEY_ACCOUNT_TOKEN, token)
-                                .apply();
-                            log("登录", "INFO", "自动登录成功，account_id=" + accountId);
-                            ui.post(onSuccess);
-                        } else {
-                            String err = json.optString("error", "登录失败");
-                            log("登录", "WARN", "自动登录被服务端拒绝：" + err + "，回退到手动登录");
-                            ui.post(() -> showLoginFormDirectly(onSuccess));
-                        }
-                    } catch (Exception e) {
-                        log("登录", "WARN", "自动登录网络错误：" + e.getMessage() + "，回退到手动登录");
-                        ui.post(() -> showLoginFormDirectly(onSuccess));
-                    }
-                }, "cnv-auto-login").start();
-            }
-            @Override public void onError(String error) {
-                log("登录", "WARN", "自动登录人机验证失败：" + error + "，回退到手动登录");
-                showLoginFormDirectly(onSuccess);
-            }
-        });
-    }
-
-    /**
-     * 直接显示登录表单对话框，不做 token / 自动登录检查。
-     * 表单会预填充上次记住的账号密码，并显示记住密码 / 自动登录复选框。
+     * 直接显示登录表单对话框。
+     * 表单会预填充上次记住的账号名（仅账号名，绝不存密码），
+     * 并显示单个"记住登录"复选框。
      * 必须在主线程调用。
      */
     private void showLoginFormDirectly(Runnable onSuccess) {
@@ -2239,13 +2192,9 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         EditText etPass = buildFormEditText(true, "密码");
         card.addView(etPass, formInputLp(dp(6)));
 
-        // ── 预填充已记住的凭证 ──────────────────────────────────────────────
-        if (prefs.getBoolean(KEY_REMEMBER_PASSWORD, false)) {
-            String prefUser = prefs.getString(KEY_SAVED_USERNAME, "");
-            String prefPass = prefs.getString(KEY_SAVED_PASSWORD, "");
-            if (prefUser != null && !prefUser.isEmpty()) etUser.setText(prefUser);
-            if (prefPass != null && !prefPass.isEmpty()) etPass.setText(prefPass);
-        }
+        // ── 预填充已记住的账号名（仅账号名，密码绝不落盘）──────────────────
+        String prefUser = prefs.getString(KEY_SAVED_USERNAME, "");
+        if (prefUser != null && !prefUser.isEmpty()) etUser.setText(prefUser);
 
         // ── 注册账号 / 忘记密码 ────────────────────────────────────────────
         LinearLayout linksRow = new LinearLayout(this);
@@ -2269,26 +2218,13 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         card.addView(linksRow, linksLp);
 
-        // ── 记住密码 / 自动登录 复选框 ─────────────────────────────────────
-        android.widget.CheckBox cbRemember  = buildCheckBox("记住密码",
-                prefs.getBoolean(KEY_REMEMBER_PASSWORD, false));
-        android.widget.CheckBox cbAutoLogin = buildCheckBox("自动登录",
-                prefs.getBoolean(KEY_AUTO_LOGIN, false));
-        cbAutoLogin.setEnabled(cbRemember.isChecked());
-        cbRemember.setOnCheckedChangeListener((btn, checked) -> {
-            cbAutoLogin.setEnabled(checked);
-            if (!checked) cbAutoLogin.setChecked(false);
-        });
-        LinearLayout checkRow = new LinearLayout(this);
-        checkRow.setOrientation(LinearLayout.HORIZONTAL);
-        LinearLayout.LayoutParams checkRowLp = new LinearLayout.LayoutParams(
+        // ── "记住登录"复选框（持久化 token，取代旧的记住密码 + 自动登录）──
+        android.widget.CheckBox cbRememberLogin = buildCheckBox("记住登录",
+                prefs.getBoolean(KEY_REMEMBER_LOGIN, true));
+        LinearLayout.LayoutParams cbLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        checkRowLp.bottomMargin = dp(12);
-        checkRow.addView(cbRemember,  new LinearLayout.LayoutParams(
-                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        checkRow.addView(cbAutoLogin, new LinearLayout.LayoutParams(
-                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        card.addView(checkRow, checkRowLp);
+        cbLp.bottomMargin = dp(12);
+        card.addView(cbRememberLogin, cbLp);
 
         // ── 错误提示（默认隐藏）─────────────────────────────────────────────
         TextView tvError = new TextView(this);
@@ -2353,20 +2289,19 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                                 if (json.optBoolean("success", false)) {
                                     String accountId    = json.optString("account_id", "");
                                     String token        = json.optString("token", "");
-                                    boolean rememberNow = cbRemember.isChecked();
-                                    boolean autoNow     = cbAutoLogin.isChecked();
+                                    boolean rememberNow = cbRememberLogin.isChecked();
+                                    // token / account_id 本会话的存档同步、悬浮窗都要用，
+                                    // 因此总是写入；remember 标志决定它是否能跨启动复用
+                                    // （showLoginDialog 在 remember=false 时会清掉）。
                                     SharedPreferences.Editor ed =
                                             getSharedPreferences(PREFS_ACCOUNT, MODE_PRIVATE).edit()
-                                            .putString(KEY_ACCOUNT_ID,        accountId)
-                                            .putString(KEY_ACCOUNT_TOKEN,     token)
-                                            .putBoolean(KEY_REMEMBER_PASSWORD, rememberNow)
-                                            .putBoolean(KEY_AUTO_LOGIN,        autoNow);
+                                            .putString(KEY_ACCOUNT_ID,      accountId)
+                                            .putString(KEY_ACCOUNT_TOKEN,   token)
+                                            .putBoolean(KEY_REMEMBER_LOGIN, rememberNow);
                                     if (rememberNow) {
-                                        ed.putString(KEY_SAVED_USERNAME, user)
-                                          .putString(KEY_SAVED_PASSWORD, pass);
+                                        ed.putString(KEY_SAVED_USERNAME, user); // 仅账号名，非密码
                                     } else {
-                                        ed.remove(KEY_SAVED_USERNAME)
-                                          .remove(KEY_SAVED_PASSWORD);
+                                        ed.remove(KEY_SAVED_USERNAME);
                                     }
                                     ed.apply();
                                     ui.post(() -> {
