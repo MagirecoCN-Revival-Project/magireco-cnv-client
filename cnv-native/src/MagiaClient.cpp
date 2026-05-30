@@ -262,6 +262,9 @@ void dlJsonOnRespErrNew(void* _this) {
     dlJsonOnRespErrOld(_this);
 }
 
+// ─── 代理辅助前向声明 ───────────────────────────────────────
+static void advanceProxy(const char* ctx, int code);
+
 // ════════════════════════════════════════════════════════
 // MainScene 回调 — 主场景加载
 // ════════════════════════════════════════════════════════
