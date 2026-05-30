@@ -2079,6 +2079,34 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             return false;
         }
 
+        // 强制更新（服务端主动拒绝版本，HTTP 200 + force_update:true）
+        if (init.forceUpdateFlag) {
+            log("握手", "WARN", "服务端强制更新：version=" + ResourceFlow.BUILD_VERSION);
+            boolean internalTest = BuildChannel.isInternalTest(this);
+            String  channelName  = internalTest ? "内测版" : "正常版";
+            String  url          = internalTest
+                    ? init.updateUrlInternalTest : init.updateUrlNormal;
+            if (url != null && !url.isEmpty()) {
+                String msg = "当前客户端版本 " + ResourceFlow.BUILD_VERSION
+                        + " 已过低，不受服务端支持。\n\n请下载最新"
+                        + channelName + " APK 后再启动。";
+                if (askUserWantsInAppUpdate("客户端需要更新", msg)) {
+                    downloadAndInstallClientUpdate(url, init.updateApkSha256);
+                } else {
+                    ui.post(() -> {
+                        try { finishAndRemoveTask(); } catch (Throwable ignore) {}
+                        android.os.Process.killProcess(android.os.Process.myPid());
+                    });
+                }
+            } else {
+                showFatalAndExit("客户端需要更新",
+                        "当前客户端版本 " + ResourceFlow.BUILD_VERSION
+                        + " 已过低，但服务端未下发" + channelName
+                        + " APK 的下载地址。\n\n请联系管理员。");
+            }
+            return false;
+        }
+
         // 服务器维护 / 故障
         if ("maintenance".equals(init.serverStatus)) {
             String msg = (init.maintenanceMessage != null && !init.maintenanceMessage.isEmpty())

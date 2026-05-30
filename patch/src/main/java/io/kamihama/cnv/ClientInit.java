@@ -20,6 +20,12 @@ public final class ClientInit {
     public static final class Response {
         public boolean      bannedFlag;
         public String       bannedReason;
+        /**
+         * 服务端版本拒绝：HTTP 200 + {@code force_update:true}，表示当前版本不受支持。
+         * 此时 {@link #updateUrlNormal} / {@link #updateUrlInternalTest} 有值，
+         * 其余握手字段（access_token / server / spoof 等）均不会出现。
+         */
+        public boolean      forceUpdateFlag;
         /** null / "normal" = 正常；"maintenance" = 维护；"error" = 故障。 */
         public String       serverStatus;
         public String       maintenanceMessage;
@@ -177,9 +183,10 @@ public final class ClientInit {
         if (raw == null || raw.isEmpty()) return r;
         JSONObject obj = new JSONObject(raw);
 
-        r.bannedFlag   = obj.optBoolean("banned",      false);
-        r.bannedReason = obj.optString("ban_reason",   null);
-        r.accessToken  = obj.optString("access_token", null);
+        r.bannedFlag      = obj.optBoolean("banned",       false);
+        r.bannedReason    = obj.optString("ban_reason",    null);
+        r.forceUpdateFlag = obj.optBoolean("force_update", false);
+        r.accessToken     = obj.optString("access_token",  null);
 
         JSONObject srv = obj.optJSONObject("server");
         if (srv != null) {
@@ -196,6 +203,11 @@ public final class ClientInit {
             r.updateUrlInternalTest = client.optString("update_url_internal_test", null);
             r.updateApkSha256       = client.optString("update_apk_sha256",        null);
         }
+        // force_update 响应里 update_url_* 在顶层（无 client 嵌套），兜底读取。
+        if (r.updateUrlNormal == null)
+            r.updateUrlNormal = obj.optString("update_url_normal", null);
+        if (r.updateUrlInternalTest == null)
+            r.updateUrlInternalTest = obj.optString("update_url_internal_test", null);
 
         JSONObject spoof = obj.optJSONObject("spoof");
         if (spoof != null) {
