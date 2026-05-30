@@ -26,8 +26,14 @@ import java.util.Set;
  *       脚本配置文件，写出 SHA-256 + size + mtime 清单
  *       ({@code cnv_inject/resource_manifest.json})。</li>
  *   <li>{@link #check} — 启动时调用：先用 size+mtime 快速筛，
- *       只对可疑文件做 SHA-256 深度校验。出错时保守放行，避免误报。</li>
+ *       只对可疑文件做 SHA-256 深度校验。校验程序自身连续 3 次异常时返回
+ *       {@code isCheckError=true}，由调用方弹窗提示（不静默放行）。</li>
  * </ol>
+ *
+ * <p><b>能力边界：</b>清单 {@code resource_manifest.json} 与资源同处可写目录、
+ * 未签名，因此本机制只能发现<em>非对抗性</em>的损坏 / 第三方 App 篡改：有 root
+ * 或会改清单的攻击者可同步改清单绕过。对抗重打包靠 {@link IntegrityGuard}
+ * 与服务端签名校验；本类负责"日常资源没被改坏"这一层。</p>
  */
 public final class ResourceIntegrityChecker {
 

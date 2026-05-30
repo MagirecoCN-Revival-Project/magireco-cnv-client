@@ -1585,7 +1585,13 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                         ResourceIntegrityChecker.check(getFilesDir(), manifestFile));
                 exec.shutdown();
             } else {
-                log("校验", "INFO", "资源清单不存在，跳过本次校验（将在下次下载后生成）");
+                // 清单缺失：可能是旧版安装（早于本特性），也可能是攻击者删清单想绕过
+                // 校验。本次无基线可比，但后台用当前资源生成一份基线清单，使后续启动
+                // 能发现此后发生的篡改——把"删清单 = 永久跳过校验"的缺口收敛为"仅本次跳过"。
+                log("校验", "INFO", "资源清单不存在，后台生成基线清单（本次无可比对，下次起生效）");
+                final File baseDir = getFilesDir();
+                new Thread(() -> ResourceIntegrityChecker.generate(baseDir, manifestFile),
+                        "cnv-manifest-baseline").start();
             }
         }
 
