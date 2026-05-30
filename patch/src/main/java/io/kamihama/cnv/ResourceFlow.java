@@ -852,27 +852,6 @@ public final class ResourceFlow {
         }
     }
 
-    /** 预扫描 zip 条目名列表（剥离 magica/ 前缀，跳过目录条目）。 */
-    private List<String> scanZipEntries(Uri uri) {
-        List<String> names = new ArrayList<>();
-        try (InputStream is = ctx.getContentResolver().openInputStream(uri)) {
-            if (is == null) return names;
-            java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(is);
-            java.util.zip.ZipEntry ze;
-            while ((ze = zis.getNextEntry()) != null) {
-                if (!ze.isDirectory()) {
-                    String name = ze.getName();
-                    if (name.startsWith("magica/")) name = name.substring(7);
-                    if (!name.isEmpty()) names.add(name);
-                }
-                try { zis.closeEntry(); } catch (Throwable ignore) {}
-            }
-        } catch (Throwable t) {
-            reporter.log("WARN", "zip 预扫描失败（忽略）: " + t.getMessage());
-        }
-        return names;
-    }
-
     private static void verifyZipFile(File f) throws java.io.IOException {
         try (java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(
                 new java.io.BufferedInputStream(new java.io.FileInputStream(f)))) {
@@ -882,17 +861,6 @@ public final class ResourceFlow {
         } catch (java.util.zip.ZipException ze) {
             throw new java.io.IOException("不是有效的 zip 文件: " + ze.getMessage(), ze);
         }
-    }
-
-    private long queryStreamLength(Uri uri) {
-        try (android.database.Cursor c = ctx.getContentResolver().query(
-                uri, new String[]{android.provider.OpenableColumns.SIZE}, null, null, null)) {
-            if (c != null && c.moveToFirst()) {
-                int col = c.getColumnIndex(android.provider.OpenableColumns.SIZE);
-                if (col >= 0) return c.getLong(col);
-            }
-        } catch (Throwable ignore) {}
-        return -1L;
     }
 
     // ── 热更新 ────────────────────────────────────────────────────────────

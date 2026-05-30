@@ -68,6 +68,9 @@ public final class SaveSyncHelper {
         Iterator<String> keys = states.keys();
         while (keys.hasNext()) {
             String endpoint = keys.next();
+            // 与 JS 桥 saveState 用同一份白名单：丢弃非法 endpoint，避免云端
+            // （即便己方服务端）写入越界 / 超长 key 影响 WebView 注入逻辑。
+            if (!io.kamihama.magianative.CnvJsBridge.isValidEndpoint(endpoint)) continue;
             JSONObject entry = states.optJSONObject(endpoint);
             if (entry == null) continue;
             String req  = entry.has("req")  ? entry.getString("req")  : null;

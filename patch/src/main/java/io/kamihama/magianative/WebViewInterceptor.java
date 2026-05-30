@@ -71,12 +71,10 @@ public class WebViewInterceptor {
 
         if ("GET".equals(method) && url.contains("/magica/api/user/")) {
             String endpoint = normalizeEndpoint(url);
-            String accountId;
-            try {
-                accountId = io.kamihama.cnv.DeviceId.get(view.getContext());
-            } catch (Throwable t) {
-                accountId = "default";
-            }
+            // 必须与 installJsBridge / CnvJsBridge 用同一个 accountId 来源：
+            // 登录后桥用 cnv_account/account_id 写缓存，这里若退化成 DeviceId 查，
+            // 两个 key 命名空间不一致 → 登录态下 GET 注入永远查不到刚写入的缓存。
+            String accountId = resolveAccountId(view.getContext());
             String cached = PlayerStateCache.get(view.getContext())
                                             .loadRespJson(accountId, endpoint);
             if (cached != null) {

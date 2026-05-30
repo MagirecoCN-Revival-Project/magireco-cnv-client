@@ -38,9 +38,6 @@ public final class Net {
     /** 所有请求统一带这个 User-Agent。 */
     public static final String UA = "Magireco-CNV-Bootstrap/1.0";
 
-    /** 当 expectedTotal 已知且文件大小恰好等于它时，认为下载已完成。 */
-    private static final double EQUAL_TOLERANCE = 0.0; // bytes 必须严格相等
-
     /**
      * getString / postJson / getStringWithToken 读入内存的响应体上限（64 MB）。
      * 这些接口只用于控制面 JSON / S3 清单，正常体量在 KB~MB 级；

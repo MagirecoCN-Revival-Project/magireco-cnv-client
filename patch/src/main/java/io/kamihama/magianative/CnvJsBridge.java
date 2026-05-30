@@ -23,8 +23,12 @@ public final class CnvJsBridge {
         this.accountId = accountId;
     }
 
-    /** 校验端点合法：非空、长度有界、以 /magica/api/ 开头、不含路径穿越。 */
-    private static boolean isValidEndpoint(String endpoint) {
+    /**
+     * 校验端点合法：非空、长度有界、以 /magica/api/ 开头、不含路径穿越。
+     * 公开供云端存档下行路径（SaveSyncHelper.applyCloud）复用，确保写入
+     * PlayerStateCache 的 key 与 JS 桥经过同一套白名单。
+     */
+    public static boolean isValidEndpoint(String endpoint) {
         return endpoint != null
             && !endpoint.isEmpty()
             && endpoint.length() <= ENDPOINT_MAX_LEN

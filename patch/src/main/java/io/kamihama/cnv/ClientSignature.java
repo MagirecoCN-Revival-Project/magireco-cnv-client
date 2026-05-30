@@ -8,7 +8,6 @@ import android.content.pm.SigningInfo;
 import android.os.Build;
 
 import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 
 /**
  * APK 签名证书 SHA-256 摘要。
@@ -100,14 +99,6 @@ public final class ClientSignature {
             sb.append(Integer.toHexString(v));
         }
         return sb.toString();
-    }
-
-    private static String sha256Hex(byte[] data) {
-        try {
-            return toHex(MessageDigest.getInstance("SHA-256").digest(data));
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException(e);
-        }
     }
 
     private ClientSignature() {}
