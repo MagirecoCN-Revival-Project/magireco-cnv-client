@@ -47,7 +47,7 @@ name: 🏗️ 构建并发布 APK
 
 on:
   push:
-    branches: [main, internal-test, claude/compare-main-legacy-branches-eTGpl]   # C-H4: 只响应核心分支推送，防止 fork / 测试分支误触发
+    branches: [main, internal-test]   # C-H4: 只响应核心分支推送，防止 fork / 测试分支误触发
   workflow_dispatch:
     inputs:
       bump_major:
