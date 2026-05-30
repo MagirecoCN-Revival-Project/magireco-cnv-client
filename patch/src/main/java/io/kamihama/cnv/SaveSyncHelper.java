@@ -4,6 +4,8 @@ import android.content.Context;
 
 import org.json.JSONObject;
 
+import java.io.IOException;
+import java.util.ArrayDeque;
 import java.util.Iterator;
 
 /**
@@ -11,6 +13,29 @@ import java.util.Iterator;
  * 按比对结果决定是否上传、下载或展示冲突对话框。
  */
 public final class SaveSyncHelper {
+
+    /** 上传滑动窗口：60 秒内最多 2 次。 */
+    private static final long UPLOAD_WINDOW_MS  = 60_000L;
+    private static final int  UPLOAD_MAX_CALLS  = 2;
+    private static final ArrayDeque<Long> uploadCallTimes = new ArrayDeque<>();
+
+    /**
+     * 滑动窗口限速检查。调用前持有类锁，通过后记录本次时间戳。
+     * 超出限额时抛 {@link IOException}，附带剩余等待秒数，
+     * 让调用方可以直接向用户展示或记录日志。
+     */
+    private static synchronized void checkUploadRateLimit() throws IOException {
+        long now = System.currentTimeMillis();
+        while (!uploadCallTimes.isEmpty() && now - uploadCallTimes.peek() >= UPLOAD_WINDOW_MS) {
+            uploadCallTimes.poll();
+        }
+        if (uploadCallTimes.size() >= UPLOAD_MAX_CALLS) {
+            long waitSec = (UPLOAD_WINDOW_MS - (now - uploadCallTimes.peek())) / 1000 + 1;
+            throw new IOException("上传限速：1分钟内最多 " + UPLOAD_MAX_CALLS
+                    + " 次，请 " + waitSec + " 秒后重试");
+        }
+        uploadCallTimes.offer(now);
+    }
 
     public enum SyncState {
         IN_SYNC,    // 一致或均为空
@@ -48,6 +73,7 @@ public final class SaveSyncHelper {
 
     /** 将本地 SQLite 存档上传到云端。 */
     public static void upload(Context ctx, String accountId, String accountToken) throws Exception {
+        checkUploadRateLimit();
         String data = io.kamihama.magianative.PlayerStateCache.get(ctx).loadAll(accountId);
         // C-M5: 使用 JSONObject 构造请求体，避免直接拼接 untrusted JSON 字符串
         JSONObject body = new JSONObject();
