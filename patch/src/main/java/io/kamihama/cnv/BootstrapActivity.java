@@ -1534,6 +1534,10 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         // 第 0a 步：检查本机资源是否已准备就绪；同时检测是否处于游戏崩溃循环中
         boolean alreadyReady = isResourcesAlreadyReady();
         log("启动", "INFO", "资源就绪检查：" + (alreadyReady ? "已就绪，跳过下载" : "未就绪，进入下载流程"));
+        // 永久资源已就绪时，任何残留的临时离线标记都已过时，清掉避免误判
+        if (alreadyReady && isProvisionalResourcesPresent()) {
+            clearProvisionalResources();
+        }
         if (alreadyReady) {
             android.content.SharedPreferences launchState =
                     getSharedPreferences("cnv_launch_state", 0);
@@ -1630,11 +1634,36 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                                 });
                             }
                         } else {
-                            log("启动", "ERROR", "服务器不可达且资源未下载，无法进入离线模式");
-                            showFatalAndExit("无法进入离线模式",
-                                    "服务器暂时不可达，无法完成首次连接。\n\n"
-                                  + "离线模式需要先完成一次完整的游戏资源下载。\n\n"
-                                  + "请检查网络连接后重试。");
+                            // 资源未下载——允许"临时离线包注入"应急进入游戏：
+                            // 只做离线包包内本地校验（zip 格式 + 逐条 CRC），不写永久就绪
+                            // 标记；服务端恢复后该临时资源不算数，须重新下载或重载离线包。
+                            boolean hasProvisional = isProvisionalResourcesPresent();
+                            log("启动", "WARN", "服务器不可达且无永久资源；临时资源="
+                                    + (hasProvisional ? "已存在" : "无"));
+                            int choice = askOfflineInjectChoice(hasProvisional);
+                            if (choice == OFFLINE_CHOICE_RETRY) {
+                                OfflineModeManager.reset();
+                                log("启动", "INFO", "用户选择重试握手");
+                                continue cloudInitLoop;
+                            } else if (choice == OFFLINE_CHOICE_OFFLINE) {
+                                if (hasProvisional) {
+                                    log("启动", "INFO", "用户选择用已注入的临时资源继续离线游戏");
+                                    enterOfflineMode();
+                                } else {
+                                    log("启动", "INFO", "用户选择临时离线包注入");
+                                    if (runProvisionalInjection()) {
+                                        enterOfflineMode();
+                                    }
+                                    // 注入失败/取消已在内部弹窗，落到下方 return 结束
+                                }
+                            } else {
+                                log("启动", "INFO", "用户选择退出");
+                                ui.post(() -> {
+                                    try { finishAndRemoveTask(); }
+                                    catch (Throwable ignore) {}
+                                    android.os.Process.killProcess(android.os.Process.myPid());
+                                });
+                            }
                         }
                     }
                     return;
@@ -1643,6 +1672,18 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             }
         } else {
             log("启动", "WARN", "调试：skip_cloud_init=true，已跳过云端握手（使用默认功能开关）");
+        }
+
+        // 第 0c-后置：服务端已恢复（握手成功才会走到这里）。若上次留有"临时离线
+        // 资源"，它不算数——清除其标记，并提示用户即将重新下载或重载离线包完成
+        // 正式安装。permanent ready 优先；仅在无永久资源时处理临时资源。
+        if (!alreadyReady && isProvisionalResourcesPresent()) {
+            log("启动", "INFO", "服务端已恢复，临时离线资源失效，清除标记并要求重新获取资源");
+            clearProvisionalResources();
+            showInfoDialog("临时资源已失效",
+                    "服务器已恢复连接。\n\n"
+                  + "之前载入的临时离线资源不计入正式安装，"
+                  + "现在将重新下载或重新载入离线包以完成正式安装。");
         }
 
         // 第 0d 步：资源已齐则跳过下载，直接检查热更新
@@ -2749,6 +2790,112 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             }
         }
         launchGame();
+    }
+
+    // ── 临时离线包注入（应急路径） ────────────────────────────────────────────
+
+    /** 临时离线注入标记文件：&lt;filesDir&gt;/cnv_inject/cn_resources_provisional.flag。 */
+    private File provisionalFlagFile() {
+        return new File(new File(getFilesDir(), "cnv_inject"), "cn_resources_provisional.flag");
+    }
+
+    /** 本机是否存在上次临时注入留下的离线资源（仅看临时标记，不看永久就绪标记）。 */
+    private boolean isProvisionalResourcesPresent() {
+        return provisionalFlagFile().exists();
+    }
+
+    /**
+     * 清除临时离线资源标记。临时资源"不算数"，服务端恢复后调用此方法令其失效，
+     * 强制走正常的重新下载 / 重新载入离线包流程。只删标记即可——后续正式安装会
+     * 覆盖写同一资源目录；不主动删资源文件以免误删用户其它数据。
+     */
+    private void clearProvisionalResources() {
+        File f = provisionalFlagFile();
+        if (f.exists()) {
+            boolean ok = f.delete();
+            log("启动", "INFO", "清除临时离线资源标记" + (ok ? "成功" : "失败"));
+        }
+    }
+
+    /**
+     * 执行临时离线包注入（仅本地校验，不写永久就绪标记）。在工作线程调用。
+     * @return true 注入成功（已写出临时标记，可进入离线游戏）；false 失败 / 取消（已弹窗）
+     */
+    private boolean runProvisionalInjection() {
+        try {
+            new ResourceFlow(this, this, ResourceFlow.MODE_OFFLINE, sessionToken)
+                    .runProvisionalOffline();
+            return isProvisionalResourcesPresent();
+        } catch (ResourceFlow.FatalConfigException fce) {
+            // showFatalAndExit 已在 ResourceFlow 内弹过（取消 / 校验失败等）
+            log("启动", "ERROR", "临时离线注入未完成：" + fce.getMessage());
+            return false;
+        } catch (final Throwable t) {
+            log("启动", "ERROR", "临时离线注入异常：" + t.getClass().getSimpleName()
+                    + "：" + t.getMessage());
+            ui.post(() -> showFatal(t));
+            return false;
+        }
+    }
+
+    /**
+     * 服务器不可达且本机无永久资源时的选择对话框。
+     *
+     * @param hasProvisional 是否已有上次注入的临时资源；为 true 时第三个按钮为
+     *                       "继续离线游戏"（直接用已有临时资源），否则为"离线包注入"
+     * @return {@link #OFFLINE_CHOICE_RETRY} / {@link #OFFLINE_CHOICE_OFFLINE} / {@link #OFFLINE_CHOICE_EXIT}
+     */
+    private int askOfflineInjectChoice(boolean hasProvisional) {
+        final Object lock    = new Object();
+        final int[]  result  = { OFFLINE_CHOICE_EXIT };
+        final boolean[] done = { false };
+        ui.post(() -> {
+            View[] frame = inflateDialogFrame();
+            FrameLayout overlay = (FrameLayout) frame[0];
+            LinearLayout card   = (LinearLayout) frame[1];
+            addDialogTitle(card, "服务器不可达");
+            addDialogMessage(card, hasProvisional
+                    ? "已连续尝试 3 次，均无法联系服务器。\n\n"
+                      + "本机已有临时注入的离线资源，可继续离线游戏"
+                      + "（账号登录、存档同步不可用）。\n\n"
+                      + "注意：临时资源不计入正式安装，服务端恢复后需重新下载"
+                      + "或重新载入离线包。"
+                    : "已连续尝试 3 次，均无法联系服务器，且尚未下载游戏资源。\n\n"
+                      + "可载入本地离线包临时进入游戏（仅做包内本地校验，"
+                      + "账号登录、存档同步不可用）。\n\n"
+                      + "注意：临时资源不计入正式安装，服务端恢复后需重新下载"
+                      + "或重新载入离线包。");
+            LinearLayout row = addDialogButtonRow(card);
+            Button exitBtn = addDialogButton(row, "退出", false);
+            Button retryBtn = addDialogButton(row, "重试", false);
+            Button okBtn = addDialogButton(row,
+                    hasProvisional ? "继续离线游戏" : "离线包注入", true);
+            exitBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { result[0] = OFFLINE_CHOICE_EXIT; done[0] = true; lock.notifyAll(); }
+            });
+            retryBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { result[0] = OFFLINE_CHOICE_RETRY; done[0] = true; lock.notifyAll(); }
+            });
+            okBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { result[0] = OFFLINE_CHOICE_OFFLINE; done[0] = true; lock.notifyAll(); }
+            });
+            overlay.setVisibility(View.VISIBLE);
+        });
+        synchronized (lock) {
+            while (!done[0]) {
+                try { lock.wait(500); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return OFFLINE_CHOICE_EXIT;
+                }
+            }
+            return result[0];
+        }
     }
 
     private void launchWithOverlay() {

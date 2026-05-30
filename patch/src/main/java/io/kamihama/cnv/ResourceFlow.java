@@ -622,6 +622,44 @@ public final class ResourceFlow {
             reporter.log("WARN", "获取云端离线包信息失败（忽略）: " + t.getMessage());
         }
 
+        // 来源选择 + 文件选择 + 校验 + 解压（正式安装，写永久就绪标记）
+        injectFromPicker(cloudUrl, cloudVersion, cloudSha256, false);
+    }
+
+    /**
+     * 临时离线包注入（应急路径）：服务器不可达且本机尚无资源时，仅凭本地
+     * 离线包让玩家临时进入游戏。在工作线程调用。
+     *
+     * <p>与 {@link #runOffline()} 的区别：
+     * <ul>
+     *   <li><b>不联系服务端</b>——不 method-select、不 fetchOfflinePackage、
+     *       无云端 SHA-256（服务端本就不可达）。</li>
+     *   <li><b>只做离线包"包内"本地校验</b>——zip 格式合法性 + 解压时逐条
+     *       CRC32 校验（{@link Unzip} 基于 ZipInputStream，CRC 不符直接抛异常）。</li>
+     *   <li><b>写临时标记</b> {@code cn_resources_provisional.flag} 而非正式就绪
+     *       标记，因此"不算数"：服务端恢复后 BootstrapActivity 会清除它、
+     *       要求重新下载或重新载入离线包完成正式安装。</li>
+     * </ul>
+     */
+    public void runProvisionalOffline() throws Exception {
+        reporter.setPhase("init");
+        reporter.log("INFO", "ResourceFlow 启动，模式=临时离线注入（provisional，仅本地校验）");
+        // cloudUrl/version/sha256 全为 null：来源对话框仅展示本地文件、跳过云端 SHA-256
+        injectFromPicker(null, null, null, true);
+    }
+
+    /**
+     * 公共注入流水线：来源对话框 → 文件选择器 → 缓存到私有临时文件 →
+     * zip 格式校验 →（可选）云端 SHA-256 硬校验 → 两阶段解压 → 写就绪标记。
+     *
+     * @param cloudUrl     云端离线包地址（{@code null}=仅本地来源）
+     * @param cloudVersion 云端离线包版本（仅用于对话框展示）
+     * @param cloudSha256  云端 SHA-256（{@code null}/空=跳过云端校验，只做包内本地校验）
+     * @param provisional  {@code true}=临时注入，写 provisional 标记，不计入正式安装；
+     *                     {@code false}=正式安装，写永久就绪标记并生成完整性清单
+     */
+    private void injectFromPicker(String cloudUrl, String cloudVersion,
+                                  String cloudSha256, boolean provisional) throws Exception {
         // 展示来源选择对话框
         reporter.setPhase("offline-pick");
         reporter.setStatus("选择离线包来源…");
@@ -753,11 +791,17 @@ public final class ResourceFlow {
                 deleteRecursive(stagingDir);
                 reporter.log("INFO", "暂存目录已清理");
             }
-            // writeReadyFlag 仅在 try 块全部正常完成后执行（finally 无法阻止 throw）
+            // 写标记仅在 try 块全部正常完成后执行（finally 无法阻止 throw）
             reporter.setPhase("done");
-            reporter.setStatus("离线资源注入完成");
-            reporter.log("INFO", "两阶段离线资源解压完成，写入 ready flag");
-            writeReadyFlag();
+            if (provisional) {
+                reporter.setStatus("临时离线资源注入完成");
+                reporter.log("INFO", "两阶段解压完成，写入临时标记（不计入正式安装）");
+                writeProvisionalFlag();
+            } else {
+                reporter.setStatus("离线资源注入完成");
+                reporter.log("INFO", "两阶段离线资源解压完成，写入 ready flag");
+                writeReadyFlag();
+            }
         } finally {
             // 外层 finally：无论何种失败路径（拷贝/校验/解压），都清理临时导入文件
             importedZip.delete();
@@ -1104,6 +1148,26 @@ public final class ResourceFlow {
         File baseDir      = ctx.getFilesDir();
         new Thread(() -> ResourceIntegrityChecker.generate(baseDir, manifestFile),
                 "cnv-manifest-gen").start();
+    }
+
+    /**
+     * 写出临时离线注入标记 {@code cn_resources_provisional.flag}。
+     *
+     * <p>故意不写正式就绪标记、也不生成完整性清单：临时资源"不算数"，
+     * 服务端恢复后须重新下载或重新载入离线包，无需对它做后续完整性校验。
+     * {@code BootstrapActivity.isResourcesAlreadyReady()} 只认正式标记，
+     * 因此本标记不会让下次启动误判为已完成正式安装。
+     */
+    private void writeProvisionalFlag() throws java.io.IOException {
+        File dir  = new File(ctx.getFilesDir(), "cnv_inject");
+        if (!dir.exists() && !dir.mkdirs()) {
+            throw new java.io.IOException("无法创建 cnv_inject 目录");
+        }
+        File flag = new File(dir, "cn_resources_provisional.flag");
+        try (FileOutputStream fos = new FileOutputStream(flag)) {
+            fos.write(("provisional:" + System.currentTimeMillis() + "\n").getBytes("UTF-8"));
+        }
+        reporter.log("INFO", "已写出临时离线标记: " + flag.getAbsolutePath());
     }
 
     private ResourceFlow() { throw new AssertionError(); }
