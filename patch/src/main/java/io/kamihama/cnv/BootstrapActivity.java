@@ -2280,11 +2280,12 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                         btnLogin.setText("登录中…");
                         new Thread(() -> {
                             try {
-                                String body = "{\"username\":" + jsonEscape(user)
-                                    + ",\"password\":" + jsonEscape(pass)
-                                    + ",\"cap_token\":" + jsonEscape(capToken) + "}";
+                                org.json.JSONObject bodyObj = new org.json.JSONObject();
+                                bodyObj.put("username",  user);
+                                bodyObj.put("password",  pass);
+                                bodyObj.put("cap_token", capToken);
                                 String resp = Net.postJson(
-                                        CloudEndpoint.ACCOUNT_LOGIN, body, 15_000);
+                                        CloudEndpoint.ACCOUNT_LOGIN, bodyObj.toString(), 15_000);
                                 org.json.JSONObject json = new org.json.JSONObject(resp);
                                 if (json.optBoolean("success", false)) {
                                     String accountId    = json.optString("account_id", "");
@@ -2386,10 +2387,6 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private void openUrlInBrowser(String url) {
         try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url))); }
         catch (Exception ignored) {}
-    }
-
-    private static String jsonEscape(String s) {
-        return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
     }
 
     private void launchGame() {
