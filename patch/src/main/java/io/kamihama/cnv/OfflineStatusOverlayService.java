@@ -23,10 +23,19 @@ import android.widget.TextView;
  * 离线模式状态悬浮标签服务。
  *
  * <p>游戏在离线模式下运行时以 Foreground Service 启动，
- * 通过 WindowManager 在屏幕左下角常驻显示"离线模式 v{version}"标签。
+ * 通过 WindowManager 在屏幕左下角常驻显示状态标签。
  * 标签不接受触摸输入，不随游戏 Activity 生命周期消失。
+ *
+ * <p>通过 Intent extra {@link #EXTRA_PROVISIONAL} 区分两种模式：
+ * <ul>
+ *   <li>{@code false}（默认）：普通离线模式，显示 "离线模式 v{version}"（粉色）</li>
+ *   <li>{@code true}：临时离线包注入，显示警告文字（红色），提示内容未经云端校验</li>
+ * </ul>
  */
 public class OfflineStatusOverlayService extends Service {
+
+    /** Intent extra：是否为临时离线包注入模式（boolean，默认 false）。 */
+    public static final String EXTRA_PROVISIONAL = "provisional";
 
     private static final String TAG     = "CnvOfflineOverlay";
     private static final int    NOTIF_ID = 0x4F46;
@@ -34,17 +43,21 @@ public class OfflineStatusOverlayService extends Service {
 
     private WindowManager wm;
     private View          labelView;
+    private boolean       provisional;
 
     @Override
     public void onCreate() {
         super.onCreate();
         wm = (WindowManager) getSystemService(WINDOW_SERVICE);
-        startForegroundCompat();
-        createLabelView();
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        if (labelView == null) {
+            provisional = intent != null && intent.getBooleanExtra(EXTRA_PROVISIONAL, false);
+            startForegroundCompat();
+            createLabelView();
+        }
         return START_STICKY;
     }
 
@@ -67,6 +80,7 @@ public class OfflineStatusOverlayService extends Service {
 
     @SuppressWarnings({"deprecation", "NewApi"})
     private void startForegroundCompat() {
+        String notifText = provisional ? "临时离线注入运行中（内容未经云端校验）" : "离线模式运行中";
         if (Build.VERSION.SDK_INT >= 26) {
             NotificationManager nm =
                     (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
@@ -76,7 +90,7 @@ public class OfflineStatusOverlayService extends Service {
             nm.createNotificationChannel(ch);
             Notification n = new Notification.Builder(this, CHAN_ID)
                     .setContentTitle("魔法纪录 CNV")
-                    .setContentText("离线模式运行中")
+                    .setContentText(notifText)
                     .setSmallIcon(android.R.drawable.ic_dialog_alert)
                     .setOngoing(true)
                     .build();
@@ -84,7 +98,7 @@ public class OfflineStatusOverlayService extends Service {
         } else {
             Notification n = new Notification.Builder(this)
                     .setContentTitle("魔法纪录 CNV")
-                    .setContentText("离线模式运行中")
+                    .setContentText(notifText)
                     .setSmallIcon(android.R.drawable.ic_dialog_alert)
                     .setOngoing(true)
                     .setPriority(Notification.PRIORITY_MIN)
@@ -96,10 +110,23 @@ public class OfflineStatusOverlayService extends Service {
     // ── Overlay window ───────────────────────────────────────────────────────
 
     private void createLabelView() {
-        String version = ResourceFlow.BUILD_VERSION;
-        if (version == null || version.isEmpty()) version = "unknown";
+        final String labelText;
+        final int    textColor;
+        final int    bgColor;
 
-        labelView = new OfflineLabelView(this, "离线模式 v" + version);
+        if (provisional) {
+            labelText = "临时离线注入，未经过校验，请仔细核对游戏内容。";
+            textColor = 0xFFFF3333;   // 鲜红
+            bgColor   = 0xDD1A0000;   // 深红底
+        } else {
+            String version = ResourceFlow.BUILD_VERSION;
+            if (version == null || version.isEmpty()) version = "unknown";
+            labelText = "离线模式 v" + version;
+            textColor = 0xFFFF6BAF;   // 粉色（原色）
+            bgColor   = 0xCC1F1030;   // 深紫底（原色）
+        }
+
+        labelView = new OfflineLabelView(this, labelText, textColor, bgColor);
 
         int type = Build.VERSION.SDK_INT >= 26
                 ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -136,17 +163,17 @@ public class OfflineStatusOverlayService extends Service {
         private float measuredW;
         private float measuredH;
 
-        OfflineLabelView(android.content.Context ctx, String text) {
+        OfflineLabelView(android.content.Context ctx, String text, int textColor, int bgColor) {
             super(ctx);
             this.text     = text;
             this.textSize = sp(11f);
             this.padH     = dp(9);
             this.padV     = dp(5);
 
-            bgPaint.setColor(0xCC1F1030);
+            bgPaint.setColor(bgColor);
             bgPaint.setStyle(Paint.Style.FILL);
 
-            textPaint.setColor(0xFFFF6BAF);
+            textPaint.setColor(textColor);
             textPaint.setTextSize(textSize);
             textPaint.setTypeface(Typeface.create(Typeface.MONOSPACE, Typeface.BOLD));
             textPaint.setAntiAlias(true);
@@ -187,3 +214,4 @@ public class OfflineStatusOverlayService extends Service {
         return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
     }
 }
+

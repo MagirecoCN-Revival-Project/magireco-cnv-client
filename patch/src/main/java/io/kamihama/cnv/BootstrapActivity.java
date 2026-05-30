@@ -2784,7 +2784,12 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private void launchGameWithOfflineOverlay() {
         if (Build.VERSION.SDK_INT < 23 || Settings.canDrawOverlays(this)) {
             try {
-                startService(new Intent(this, OfflineStatusOverlayService.class));
+                Intent svc = new Intent(this, OfflineStatusOverlayService.class);
+                // 临时离线注入：写有 provisional 标记时传红色警告模式
+                if (isProvisionalResourcesPresent()) {
+                    svc.putExtra(OfflineStatusOverlayService.EXTRA_PROVISIONAL, true);
+                }
+                startService(svc);
             } catch (Throwable t) {
                 android.util.Log.w(TAG, "离线标签服务启动失败：" + t.getMessage());
             }
