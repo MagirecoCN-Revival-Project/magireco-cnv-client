@@ -18,7 +18,7 @@ import java.nio.charset.StandardCharsets;
  *
  * <p><b>静态文件拦截（{@link #intercept}）：</b>
  * WebView 发出含 "/magica/" 路径的请求时，优先从本地
- * {@code /data/data/io.kamihama.totentanz/files/magica/<相对路径>} 提供文件；
+ * {@code /data/data/moe.magireco.cnvclient/files/magica/<相对路径>} 提供文件；
  * 不存在时尝试 APK assets/cnv/；API 请求（{@code api/} 前缀）直接放行走网络。
  *
  * <p><b>页面加载完成（{@link #onPageFinished}）：</b>
@@ -29,7 +29,7 @@ import java.nio.charset.StandardCharsets;
 public class WebViewInterceptor {
 
     private static final String TAG       = "MagiaHook-URL";
-    private static final String LOCAL_DIR = "/data/data/io.kamihama.totentanz/files/magica/";
+    private static final String LOCAL_DIR = "/data/data/moe.magireco.cnvclient/files/magica/";
 
     // ── JS 桥安装 ──────────────────────────────────────────────────────────────
 

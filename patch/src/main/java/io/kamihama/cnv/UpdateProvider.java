@@ -36,7 +36,7 @@ import java.io.FileNotFoundException;
 public class UpdateProvider extends ContentProvider {
 
     /** ContentProvider authority；与 AndroidManifest.xml 中的声明一致。 */
-    public static final String AUTHORITY = "io.kamihama.totentanz.cnvupdate";
+    public static final String AUTHORITY = "moe.magireco.cnvclient.cnvupdate";
     /** 暂存在 cacheDir 下的 APK 文件名。 */
     public static final String FILE_NAME = "client_update.apk";
 

@@ -54,7 +54,7 @@ public final class IntegrityGuard {
      * 期望的应用包名（与 AndroidManifest 的 {@code package=} 一致）。
      * 原生 hook 的 FLAG_PATH 同样硬编码此包名，改包名重打包会同时触发此 pin。
      */
-    private static final String EXPECTED_PACKAGE = "io.kamihama.totentanz";
+    private static final String EXPECTED_PACKAGE = "moe.magireco.cnvclient";
 
     /**
      * 本 APK 合法声明的全部 ContentProvider：{@code authority → 实现类全限定名}。
@@ -72,8 +72,8 @@ public final class IntegrityGuard {
      *       InitializationProvider 的库）后，务必回来补全对应 authority 与实现类。</li>
      *   <li><b>多了会放过攻击</b>：白名单写了 manifest 里没有的 authority，
      *       等于给攻击者留了一个可注入而不报警的 authority 名。只加确实存在的。</li>
-     *   <li><b>authority 用包名前缀</b>（manifest 里 {@code package="io.kamihama.totentanz"}）。
-     *       新条目按 {@code io.kamihama.totentanz.xxx} 的实际声明值原样抄，不要臆造。</li>
+     *   <li><b>authority 用包名前缀</b>（manifest 里 {@code package="moe.magireco.cnvclient"}）。
+     *       新条目按 {@code moe.magireco.cnvclient.xxx} 的实际声明值原样抄，不要臆造。</li>
      *   <li><b>实现类（value）必须填 manifest 里 {@code android:name} 的全限定名</b>，
      *       不要写错——写错会误锁正版。{@link #checkProviders} 会逐一比对，挡住
      *       "借用合法 authority、替换恶意实现类"的注入变体。</li>
@@ -87,9 +87,9 @@ public final class IntegrityGuard {
     private static final Map<String, String> ALLOWED_PROVIDERS;
     static {
         Map<String, String> m = new HashMap<>();
-        m.put("io.kamihama.totentanz.cnvupdate",           "io.kamihama.cnv.UpdateProvider");
-        m.put("io.kamihama.totentanz.androidx-startup",    "androidx.startup.InitializationProvider");
-        m.put("io.kamihama.totentanz.firebaseinitprovider","com.google.firebase.provider.FirebaseInitProvider");
+        m.put("moe.magireco.cnvclient.cnvupdate",           "io.kamihama.cnv.UpdateProvider");
+        m.put("moe.magireco.cnvclient.androidx-startup",    "androidx.startup.InitializationProvider");
+        m.put("moe.magireco.cnvclient.firebaseinitprovider","com.google.firebase.provider.FirebaseInitProvider");
         ALLOWED_PROVIDERS = Collections.unmodifiableMap(m);
     }
 

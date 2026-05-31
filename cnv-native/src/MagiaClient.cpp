@@ -39,7 +39,7 @@ namespace cocos2d {
 //   <filesDir>/cnv_inject/cn_resources_ready.flag
 // 见 ResourceFlow.writeReadyFlag。
 static const std::string FLAG_PATH =
-    "/data/data/io.kamihama.totentanz/files/cnv_inject/cn_resources_ready.flag";
+    "/data/data/moe.magireco.cnvclient/files/cnv_inject/cn_resources_ready.flag";
 
 // ─── 函数指针 ────────────────────────────────────────────
 bool (*checkParseJsonOld)(void*, const cocos2d::Data&) = nullptr;
