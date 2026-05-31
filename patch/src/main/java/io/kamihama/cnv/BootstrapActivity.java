@@ -1520,7 +1520,34 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private void runWork() {
         log("启动", "INFO", "工作线程已启动");
 
-        // 第 0 步（最优先）：自防篡改门禁——拦截重打包 / Provider 注入攻击。
+        // 调试模式（最高优先级，早于安全门禁）：
+        // skip_to_tutorial.flag=true → 跳过所有逻辑，直接显示教程弹窗，选择后退出。
+        // 仅用于教程弹窗本身的 UI/逻辑测试，无法进入游戏，故绕过完整性门禁不存在安全风险。
+        if (isDebugFlag("skip_to_tutorial")) {
+            log("启动", "WARN", "调试：skip_to_tutorial=true，绕过安全门禁，直接显示教程弹窗，完毕后退出");
+            setPhase("init");
+            setStatus("调试模式：跳过至教程弹窗");
+            Net.setVerboseLog(isDebugFlag("verbose_net_log"));
+            ui.post(this::playTitleSequence);
+            ui.post(() -> {
+                SharedPreferences tutPrefs = getSharedPreferences(PREFS_TUTORIAL, MODE_PRIVATE);
+                tutorialPromptShowing = false;
+                tutorialPromptDone    = false;
+                showTutorialPromptDialog(tutPrefs, () -> {
+                    log("教程", "WARN", "调试：教程弹窗测试完毕，APP 即将退出");
+                    android.widget.Toast.makeText(this,
+                            "调试：教程弹窗测试完毕，APP 即将退出",
+                            android.widget.Toast.LENGTH_LONG).show();
+                    ui.postDelayed(this::finish, 1500);
+                });
+            });
+            return;
+        }
+
+        // 初始化 Net 层详细日志（早于所有网络操作）
+        Net.setVerboseLog(isDebugFlag("verbose_net_log"));
+
+        // 第 0 步：自防篡改门禁——拦截重打包 / Provider 注入攻击。
         // 必须早于任何敏感数据（token / 存档）访问；不提供调试跳过开关。
         IntegrityGuard.Verdict verdict = IntegrityGuard.check(this);
         if (verdict.tampered) {
@@ -1538,21 +1565,6 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             ui.post(this::playTitleSequence);
             setPhase("init");
             setStatus("调试模式：仅展示 UI");
-            return;
-        }
-
-        // 调试模式：skip_to_tutorial.flag=true 时跳过所有前置逻辑，直接显示教程弹窗
-        if (isDebugFlag("skip_to_tutorial")) {
-            log("启动", "WARN", "调试：skip_to_tutorial=true，跳过所有前置逻辑，直接显示教程弹窗");
-            setPhase("init");
-            setStatus("调试模式：跳过至教程弹窗");
-            ui.post(this::playTitleSequence);
-            ui.post(() -> {
-                SharedPreferences tutPrefs = getSharedPreferences(PREFS_TUTORIAL, MODE_PRIVATE);
-                tutorialPromptShowing = false;
-                tutorialPromptDone    = false;
-                showTutorialPromptDialog(tutPrefs);
-            });
             return;
         }
 
@@ -1793,14 +1805,15 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
      *
      * <p>已定义的 flag：
      * <ul>
-     *   <li>{@code display_ui_only} — 仅展示 UI，跳过所有启动逻辑（最早检查）</li>
-     *   <li>{@code skip_to_tutorial} — 跳过所有前置逻辑，直接弹出教程弹窗（无视"不再提示"状态）</li>
+     *   <li>{@code skip_to_tutorial} — <b>优先级最高，绕过安全门禁</b>：跳过所有前置逻辑，
+     *       直接弹出教程弹窗（无视"不再提示"状态），用户选择后退出 APP，不进入游戏</li>
+     *   <li>{@code display_ui_only} — 仅展示 UI，跳过所有启动逻辑</li>
+     *   <li>{@code verbose_net_log} — 启用 Net 层详细网络日志（URL、状态码、耗时、Headers）</li>
      *   <li>{@code skip_cloud_init} — 跳过云端握手，使用默认功能开关</li>
      *   <li>{@code skip_ban_check} — 跳过本地封禁记录检查</li>
      *   <li>{@code skip_hot_update} — 跳过热更新检查</li>
      *   <li>{@code force_online_mode} — 强制使用在线下载模式（忽略服务端功能开关）</li>
      *   <li>{@code force_offline_mode} — 强制使用离线包注入模式（忽略服务端功能开关）</li>
-     *   <li>{@code verbose_net_log} — 启用详细网络日志（由 Net 层读取）</li>
      * </ul>
      */
     boolean isDebugFlag(String name) {
@@ -2588,12 +2601,19 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             return false;
         }
         tutorialPromptShowing = true;
-        showTutorialPromptDialog(prefs);
+        showTutorialPromptDialog(prefs, this::launchGame);
         return true;
     }
 
-    /** 构建并显示"进入新手教程"弹窗（是 / 否 + 不再提示）。在主线程调用。 */
-    private void showTutorialPromptDialog(final SharedPreferences prefs) {
+    /**
+     * 构建并显示"进入新手教程"弹窗（是 / 否 + 不再提示）。在主线程调用。
+     *
+     * @param afterAction 用户做出选择、弹窗关闭后执行的回调。
+     *                    正常流程传 {@code this::launchGame}；
+     *                    调试路径传退出逻辑（测试完毕直接 finish）。
+     */
+    private void showTutorialPromptDialog(final SharedPreferences prefs,
+                                          final Runnable afterAction) {
         View[] frame = inflateDialogFrame();
         final FrameLayout overlay = (FrameLayout) frame[0];
         LinearLayout card   = (LinearLayout) frame[1];
@@ -2618,7 +2638,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         Button noBtn  = addDialogButton(row, "否", false);
         Button yesBtn = addDialogButton(row, "是", true);
 
-        // 关闭弹窗 + 落地"不再提示" + 放行后再次 launchGame（此时 tutorialPromptDone 已置位）。
+        // 关闭弹窗 + 落地"不再提示" + 执行 afterAction（此时 tutorialPromptDone 已置位）。
         final Runnable[] proceed = new Runnable[1];
         proceed[0] = () -> {
             if (dontAsk.isChecked()) {
@@ -2629,7 +2649,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             tutorialPromptDone    = true;
             overlay.setVisibility(View.GONE);
             vRoot.removeView(overlay);
-            launchGame();
+            afterAction.run();
         };
 
         yesBtn.setOnClickListener(v -> {

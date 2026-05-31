@@ -38,6 +38,17 @@ public final class Net {
     /** 所有请求统一带这个 User-Agent。 */
     public static final String UA = "Magireco-CNV-Bootstrap/1.0";
 
+    private static final String VTAG = "CNV-Net";
+
+    /** verbose_net_log 调试开关；由 BootstrapActivity 检测到 flag 后调用 {@link #setVerboseLog}。 */
+    private static volatile boolean verboseLog = false;
+
+    /** 开启/关闭 Net 层详细日志（URL、方法、状态码、耗时、分片进度）。 */
+    public static void setVerboseLog(boolean enabled) {
+        verboseLog = enabled;
+        if (enabled) android.util.Log.d(VTAG, "Net 详细日志已启用");
+    }
+
     /**
      * getString / postJson / getStringWithToken 读入内存的响应体上限（64 MB）。
      * 这些接口只用于控制面 JSON / S3 清单，正常体量在 KB~MB 级；
@@ -81,9 +92,12 @@ public final class Net {
 
     /** GET 一个 URL，把响应体当 UTF-8 字符串返回。 */
     public static String getString(String url, int timeoutMs) throws IOException {
+        if (verboseLog) android.util.Log.d(VTAG, "GET " + url);
+        long t0 = System.currentTimeMillis();
         HttpURLConnection c = openConnection(url, timeoutMs);
         c.setRequestMethod("GET");
         int code = c.getResponseCode();
+        if (verboseLog) android.util.Log.d(VTAG, "GET " + code + " (" + (System.currentTimeMillis() - t0) + "ms) " + url);
         if (code >= 400) {
             try { c.disconnect(); } catch (Throwable ignore) {}
             throw new IOException("HTTP " + code + " for " + url);
@@ -102,6 +116,8 @@ public final class Net {
      * 的 message——便于上层把"服务端拒绝 + 拒绝理由"一起转给用户。
      */
     public static String postJson(String url, String jsonBody, int timeoutMs) throws IOException {
+        if (verboseLog) android.util.Log.d(VTAG, "POST " + url + " body=" + jsonBody.length() + "B");
+        long t0 = System.currentTimeMillis();
         HttpURLConnection c = openConnection(url, timeoutMs);
         c.setRequestMethod("POST");
         c.setDoOutput(true);
@@ -114,6 +130,7 @@ public final class Net {
                 os.write(payload);
             }
             int code = c.getResponseCode();
+            if (verboseLog) android.util.Log.d(VTAG, "POST " + code + " (" + (System.currentTimeMillis() - t0) + "ms) " + url);
             InputStream is = (code >= 400) ? c.getErrorStream() : c.getInputStream();
             String body = "";
             if (is != null) {
@@ -124,6 +141,7 @@ public final class Net {
                 }
             }
             if (code >= 400) {
+                if (verboseLog) android.util.Log.d(VTAG, "POST error body: " + body);
                 throw new IOException("HTTP " + code + " for " + url
                         + (body.isEmpty() ? "" : " : " + body));
             }
@@ -147,6 +165,8 @@ public final class Net {
          */
     public static void downloadResume(String url, File target, long expectedTotal,
                                       int connectTimeoutMs, ProgressSink sink) throws IOException {
+        if (verboseLog) android.util.Log.d(VTAG, "downloadResume " + url + " → " + target.getName()
+                + " expect=" + expectedTotal);
         File parent = target.getParentFile();
         if (parent != null && !parent.exists()) parent.mkdirs();
         // 如果之前 downloadChunked 跑过一半留下了 .cnvprog 残骸，target
@@ -174,6 +194,8 @@ public final class Net {
         if (existing > 0) c.setRequestProperty("Range", "bytes=" + existing + "-");
         c.connect();
         int code = c.getResponseCode();
+        if (verboseLog) android.util.Log.d(VTAG, "downloadResume " + code
+                + " existing=" + existing + " " + target.getName());
         if (existing > 0 && code != 206 && code != 200) {
             try { c.disconnect(); } catch (Throwable ignore) {}
             throw new IOException("HTTP " + code + " for resume " + url);
@@ -254,6 +276,8 @@ public final class Net {
                                        long expectedTotal, int chunks,
                                        int connectTimeoutMs,
                                        ProgressSink sink) throws IOException {
+        if (verboseLog) android.util.Log.d(VTAG, "downloadChunked " + url + " → " + target.getName()
+                + " expect=" + expectedTotal + " chunks=" + chunks);
         if (chunks <= 1 || expectedTotal <= 0) {
             downloadResume(url, target, expectedTotal, connectTimeoutMs, sink);
             return;
@@ -365,14 +389,19 @@ public final class Net {
                                          AtomicLong windowBytes,
                                          ProgressSink sink) throws IOException {
         long chunkLen = chunkEnd - chunkStart + 1;
-        if (done[idx] >= chunkLen) return; // 已经下完了
+        if (done[idx] >= chunkLen) {
+            if (verboseLog) android.util.Log.d(VTAG, "chunk#" + idx + " already done, skip");
+            return;
+        }
 
         long startByte = chunkStart + done[idx];
+        if (verboseLog) android.util.Log.d(VTAG, "chunk#" + idx + " GET bytes=" + startByte + "-" + chunkEnd);
         HttpURLConnection c = openConnection(url, connectTimeoutMs);
         c.setRequestMethod("GET");
         c.setRequestProperty("Range", "bytes=" + startByte + "-" + chunkEnd);
         c.connect();
         int code = c.getResponseCode();
+        if (verboseLog) android.util.Log.d(VTAG, "chunk#" + idx + " → HTTP " + code);
         if (code != 206 && code != 200) {
             try { c.disconnect(); } catch (Throwable ignore) {}
             throw new IOException("HTTP " + code + " for chunk " + idx + " of " + url);
@@ -424,11 +453,15 @@ public final class Net {
             c = openConnection(url, timeoutMs);
             c.setRequestMethod("HEAD");
             int code = c.getResponseCode();
+            if (verboseLog) android.util.Log.d(VTAG, "HEAD " + code + " " + url
+                    + " Accept-Ranges=" + c.getHeaderField("Accept-Ranges")
+                    + " Content-Length=" + c.getHeaderField("Content-Length"));
             if (code >= 400) return false;
             String ar = c.getHeaderField("Accept-Ranges");
             long cl = parseLongHeader(c, "Content-Length");
             return cl > 0 && ar != null && ar.toLowerCase(java.util.Locale.US).contains("bytes");
         } catch (Throwable t) {
+            if (verboseLog) android.util.Log.d(VTAG, "HEAD failed: " + t.getMessage());
             return false;
         } finally {
             if (c != null) try { c.disconnect(); } catch (Throwable ignore) {}
@@ -510,12 +543,15 @@ public final class Net {
      */
     public static String getStringWithToken(String url, String token,
                                             int timeoutMs) throws IOException {
+        if (verboseLog) android.util.Log.d(VTAG, "GET(token) " + url);
+        long t0 = System.currentTimeMillis();
         HttpURLConnection c = openConnection(url, timeoutMs);
         c.setRequestMethod("GET");
         if (token != null && !token.isEmpty()) {
             c.setRequestProperty("Authorization", "Bearer " + token);
         }
         int code = c.getResponseCode();
+        if (verboseLog) android.util.Log.d(VTAG, "GET(token) " + code + " (" + (System.currentTimeMillis() - t0) + "ms) " + url);
         if (code >= 400) {
             try { c.disconnect(); } catch (Throwable ignore) {}
             throw new IOException("HTTP " + code + " for " + url);
