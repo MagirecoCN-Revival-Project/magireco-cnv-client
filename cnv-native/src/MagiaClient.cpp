@@ -60,6 +60,10 @@ void (*downloadSceneLayerCtorOld)(void*, void*) = nullptr;
 bool (*downloadSceneLayerInitOld)(void*) = nullptr;
 void (*downloadSceneLayerOnEnterOld)(void*) = nullptr;
 
+// ADX2 音频采样率 + HTTP/2 连接数（从 libuwasa 逆向移植的两个无害性能 hook）
+int  (*criNcv_GetHardwareSamplingRateOld)(void) = nullptr;
+void (*setMaxConnectionNumOld)(void*, int) = nullptr;
+
 // DownloadSceneLayerInfo 构造函数：C2(ESceneLayerType, std::function<void()>&, std::string&, DownloadRunningType)
 void (*dslInfoCtorOld)(void*, int, const std::function<void()>&,
                        const std::string&, int) = nullptr;
@@ -428,6 +432,30 @@ void http2OnRespNew(void* _this, void* resp) {
 }
 
 // ════════════════════════════════════════════════════════
+// criNcv_GetHardwareSamplingRate_ANDROID → 锁定 48000 Hz
+// ════════════════════════════════════════════════════════
+// ADX2 SDK 在设备初始化时查询硬件采样率；部分设备（如 Galaxy A 系列）
+// 返回 44100，导致 ADX2 内部重采样后音调轻微偏移。强制返回 48000 与
+// 多数内容母带一致，消除该问题。逻辑从 libuwasa 0x679e4 逆向所得。
+int criNcv_GetHardwareSamplingRateNew(void) {
+    int orig = criNcv_GetHardwareSamplingRateOld ? criNcv_GetHardwareSamplingRateOld() : 0;
+    LOGI("[ADX2] GetHardwareSamplingRate: device=%d → 48000", orig);
+    return 48000;
+}
+
+// ════════════════════════════════════════════════════════
+// http2::Http2Session::setMaxConnectionNum — 4 → 10
+// ════════════════════════════════════════════════════════
+// 游戏初始化时调用 setMaxConnectionNum(4)；ADX2 分配 4 条并发 HTTP/2
+// stream 下载资产。改为 10 可明显降低初次资产加载时间。
+// 逻辑从 libuwasa 0x679c8 逆向所得；全局值 0xe9f38 = 10。
+void setMaxConnectionNumNew(void* _this, int n) {
+    int patched = (n == 4) ? 10 : n;
+    if (patched != n) LOGI("[http2] setMaxConnectionNum %d → %d", n, patched);
+    setMaxConnectionNumOld(_this, patched);
+}
+
+// ════════════════════════════════════════════════════════
 // JNI_OnLoad — .so 加载入口，注册所有 hook
 // ════════════════════════════════════════════════════════
 extern "C" jint JNI_OnLoad(JavaVM* vm, void* reserved) {
@@ -516,6 +544,15 @@ extern "C" jint JNI_OnLoad(JavaVM* vm, void* reserved) {
     H("_ZN14AssetLoadState12onDownloadedEv",
       (void*)assetLoadOnDownloadedNew, (void**)&assetLoadOnDownloadedOld,
       "AssetLoadState::onDownloaded");
+
+    // ── 性能 hook（从 libuwasa 逆向移植，已停用 libuwasa 加载）────────
+    H("criNcv_GetHardwareSamplingRate_ANDROID",
+      (void*)criNcv_GetHardwareSamplingRateNew, (void**)&criNcv_GetHardwareSamplingRateOld,
+      "criNcv_GetHardwareSamplingRate(→48000)");
+
+    H("_ZN5http212Http2Session19setMaxConnectionNumEi",
+      (void*)setMaxConnectionNumNew, (void**)&setMaxConnectionNumOld,
+      "http2::setMaxConnectionNum(4→10)");
 
     // ── Http2Response ─────────────────────────────────────
     // 这两个不装 hook，只是把原版函数指针拿到留着后面直接调。
