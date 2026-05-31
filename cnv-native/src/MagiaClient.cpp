@@ -22,6 +22,7 @@
 #include <atomic>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <cstdio>          // remove()
 
 #undef LOGI
 #undef LOGE
@@ -41,6 +42,13 @@ namespace cocos2d {
 static const std::string FLAG_PATH =
     "/data/data/moe.magireco.cnvclient/files/cnv_inject/cn_resources_ready.flag";
 
+// 强制新手教程标记：BootstrapActivity 在标题画面让用户选择"是"时写出。
+//   <filesDir>/cnv_inject/force_tutorial.flag
+// 我们在引擎首次准备进入主页(TopScene)时消费它，改为进入序章(Prologue)场景。
+// 见 BootstrapActivity.writeForceTutorialFlag。
+static const std::string FORCE_TUTORIAL_FLAG_PATH =
+    "/data/data/moe.magireco.cnvclient/files/cnv_inject/force_tutorial.flag";
+
 // ─── 函数指针 ────────────────────────────────────────────
 bool (*checkParseJsonOld)(void*, const cocos2d::Data&) = nullptr;
 void (*setURIOld)(void*, const std::string&) = nullptr;
@@ -55,6 +63,12 @@ void (*mainSceneOnErrOld)(void*, void*, int) = nullptr;
 void (*qbSceneOnRespOld)(void*, void*, void*) = nullptr;
 void (*questDataOnRespOld)(void*, void*, void*) = nullptr;
 void (*assetLoadOnDownloadedOld)(void*) = nullptr;
+
+// web::SceneCommand 场景跳转命令（强制新手教程用）。
+// pushSceneTop 装 inline hook 拦截"进入主页"；pushScenePrologue 不 hook，
+// 只解析出原版函数指针，命中强制标记时直接调用以进入序章场景。
+void (*pushSceneTopOld)(void*, const std::string&) = nullptr;
+void (*pushScenePrologueFn)(void*, const std::string&) = nullptr;
 
 void (*downloadSceneLayerCtorOld)(void*, void*) = nullptr;
 bool (*downloadSceneLayerInitOld)(void*) = nullptr;
@@ -100,6 +114,15 @@ static bool fileExists(const std::string& p) {
 
 static bool resourcesReady() {
     return fileExists(FLAG_PATH);
+}
+
+// 消费强制新手教程标记：存在则删除（一次性）并返回 true。
+// 删除是关键——保证只在本次启动的首个 pushSceneTop 处强制一次，序章结束
+// 返回主页、以及之后的所有正常启动都不再触发。
+static bool consumeForceTutorial() {
+    if (!fileExists(FORCE_TUTORIAL_FLAG_PATH)) return false;
+    remove(FORCE_TUTORIAL_FLAG_PATH.c_str());
+    return true;
 }
 
 static JNIEnv* attachEnv(bool& attached) {
@@ -296,6 +319,27 @@ void qbSceneOnRespNew(void* _this, void* session, void* resp) {
 void questDataOnRespNew(void* _this, void* session, void* resp) {
     if (!resourcesReady()) { return; }
     questDataOnRespOld(_this, session, resp);
+}
+
+// ════════════════════════════════════════════════════════
+// web::SceneCommand::pushSceneTop — 强制新手教程入口
+// ════════════════════════════════════════════════════════
+// 前端在登录/读取完账号数据后，请求进入主页(TopScene)。官方服已停服、
+// 复刻服对任何账号都下发"满级存档"，正常流程永远不会进新手教程；唯一
+// 可靠的办法就是在这条"进主页"的命令上拦截、改走引擎自带的序章场景。
+//
+// 命中强制标记时调用原版 pushScenePrologue（与调试菜单"播放序章"等价：
+// PrologueSceneLayerInfo(ESceneLayerType=9, "", "")）。传最小合法 JSON
+// "{}"：无任何字段，序章按默认空参数构造，不依赖服务端下发的关卡数据。
+// 标记一次性消费，序章结束后引擎再次 pushSceneTop 即正常进主页。
+void pushSceneTopNew(void* self, const std::string& arg) {
+    if (pushScenePrologueFn && consumeForceTutorial()) {
+        LOGI("[Tutorial] 命中强制教程标记 → 改为进入序章(Prologue)场景");
+        std::string prologueArg = "{}";
+        pushScenePrologueFn(self, prologueArg);
+        return;
+    }
+    pushSceneTopOld(self, arg);
 }
 
 // ════════════════════════════════════════════════════════
@@ -524,6 +568,10 @@ extern "C" jint JNI_OnLoad(JavaVM* vm, void* reserved) {
     H("_ZN25QuestStoredDataSceneLayer10onResponseEPN5http212Http2SessionEPNS0_13Http2ResponseE",
       (void*)questDataOnRespNew, (void**)&questDataOnRespOld, "QuestData::onResp");
 
+    // ── 强制新手教程：拦截"进主页"命令，命中标记时改走序章场景 ──────────
+    H("_ZN3web12SceneCommand12pushSceneTopERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE",
+      (void*)pushSceneTopNew, (void**)&pushSceneTopOld, "SceneCommand::pushSceneTop(强制教程闸门)");
+
     // ── DownloadSceneLayerInfo::ctor ──────────────────────
     H("_ZN22DownloadSceneLayerInfoC2E15ESceneLayerTypeRKNSt6__ndk18functionIFvvEEERKNS1_12basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEEN19DownloadRunningType21DownloadRunningType__E",
       (void*)dslInfoCtorNew, (void**)&dslInfoCtorOld, "DownloadSceneLayerInfo::ctor");
@@ -566,6 +614,15 @@ extern "C" jint JNI_OnLoad(JavaVM* vm, void* reserved) {
             void* p2 = shadowhook_dlsym(handle, "_ZN5http213Http2Response19getResponseDataSizeEv");
             if (p1) getDataOld     = reinterpret_cast<const unsigned char*(*)(void*)>(p1);
             if (p2) getDataSizeOld = reinterpret_cast<size_t(*)(void*)>(p2);
+            // 强制教程要直接调用的原版函数（只取地址、不 hook）
+            void* p3 = shadowhook_dlsym(handle,
+                "_ZN3web12SceneCommand17pushScenePrologueERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE");
+            if (p3) {
+                pushScenePrologueFn = reinterpret_cast<void(*)(void*, const std::string&)>(p3);
+                LOGI("[Tutorial] 已解析 pushScenePrologue 地址 %p", p3);
+            } else {
+                LOGE("[Tutorial] 未找到 pushScenePrologue 符号，强制教程将不可用");
+            }
             shadowhook_dlclose(handle);
         }
     }

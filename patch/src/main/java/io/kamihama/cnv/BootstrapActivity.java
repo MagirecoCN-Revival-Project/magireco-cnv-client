@@ -40,6 +40,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
@@ -93,6 +94,11 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
      * token 可由服务端撤销、且仅本应用私有可读，安全性优于明文密码。
      */
     private static final String KEY_REMEMBER_LOGIN   = "remember_login";
+
+    /** 新手教程弹窗相关持久化（与账号无关，按设备维度记忆"不再提示"）。 */
+    private static final String PREFS_TUTORIAL              = "cnv_tutorial";
+    /** 勾选"不再提示"后置 true：以后启动直接跳过弹窗，正常进入游戏。 */
+    private static final String KEY_TUTORIAL_PROMPT_DISMISSED = "prompt_dismissed";
 
     /** 资源目录内的背景图路径（assets/cnv/background_light.png）。 */
     private static final String BG_ASSET          = "cnv/background_light.png";
@@ -229,6 +235,10 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private final Handler ui = new Handler(Looper.getMainLooper());
     private volatile boolean cancelled = false;
     private volatile boolean launched  = false;
+
+    /** 新手教程弹窗状态机：done = 已做出选择/无需弹窗（放行 launchGame）；showing = 弹窗显示中（防重入）。 */
+    private boolean tutorialPromptDone    = false;
+    private boolean tutorialPromptShowing = false;
 
     /** 与 cloud-init 并行运行的资源完整性校验 Future；仅 alreadyReady=true 时设置。 */
     private volatile java.util.concurrent.Future<ResourceIntegrityChecker.Result> integrityFuture;
@@ -2467,6 +2477,10 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
 
     private void launchGame() {
         if (launched) return;
+        // 标题画面 → 正式进入游戏之间的最后一道闸门：是否进入新手教程。
+        // 在线/离线两条路径最终都汇聚到 launchGame()，放在这里可统一覆盖。
+        // 返回 true 表示弹窗已接管（用户选择后会再次调用 launchGame）。
+        if (maybeShowTutorialPrompt()) return;
         launched = true;
         log("启动", "INFO", "准备启动游戏：停止 BGM，跳转至 " + GAME_ACTIVITY);
         // 记录本次游戏启动时间（用于下次启动时检测是否发生了崩溃循环）
@@ -2499,6 +2513,119 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                     + (t.getMessage() != null ? "：" + t.getMessage() : ""));
             showFatal(t);
         }
+    }
+
+    // ======================================================================
+    // 新手教程弹窗（标题画面 → 正式进入游戏之间）
+    // ======================================================================
+
+    /** 强制教程标记文件：&lt;filesDir&gt;/cnv_inject/force_tutorial.flag，与 MagiaClient.cpp 约定一致。 */
+    private File forceTutorialFlagFile() {
+        return new File(new File(getFilesDir(), "cnv_inject"), "force_tutorial.flag");
+    }
+
+    /**
+     * 写出强制教程标记：用户选择"是"时调用。引擎首个"进主页"命令(pushSceneTop)
+     * 会消费它，改为进入序章(Prologue)场景，无视账号是否已通关教程。
+     */
+    private void writeForceTutorialFlag() {
+        try {
+            File dir = new File(getFilesDir(), "cnv_inject");
+            if (!dir.exists() && !dir.mkdirs()) {
+                log("教程", "WARN", "无法创建 cnv_inject 目录，强制教程标记写入失败");
+                return;
+            }
+            File flag = forceTutorialFlagFile();
+            try (java.io.FileOutputStream fos = new java.io.FileOutputStream(flag)) {
+                fos.write(("force:" + System.currentTimeMillis() + "\n").getBytes("UTF-8"));
+            }
+            log("教程", "INFO", "已写出强制教程标记：" + flag.getAbsolutePath());
+        } catch (Throwable t) {
+            log("教程", "ERROR", "写强制教程标记失败：" + t.getMessage());
+        }
+    }
+
+    /** 清除强制教程标记：用户选择"否"或已勾选"不再提示"时调用，避免上次残留导致误触发。 */
+    private void clearForceTutorialFlag() {
+        try {
+            File flag = forceTutorialFlagFile();
+            if (flag.exists() && flag.delete()) {
+                log("教程", "INFO", "已清除强制教程标记");
+            }
+        } catch (Throwable ignore) {}
+    }
+
+    /**
+     * 在正式进入游戏前决定是否弹出"进入新手教程"询问。
+     *
+     * @return true = 弹窗已接管本次启动（调用方应 return，等用户选择后回调会再次 launchGame）；
+     *         false = 无需弹窗，调用方继续正常启动。
+     */
+    private boolean maybeShowTutorialPrompt() {
+        if (tutorialPromptDone)    return false;  // 用户已选择 / 已判定无需弹 → 放行
+        if (tutorialPromptShowing) return true;   // 弹窗显示中（防重入）→ 继续拦截
+        SharedPreferences prefs = getSharedPreferences(PREFS_TUTORIAL, MODE_PRIVATE);
+        if (prefs.getBoolean(KEY_TUTORIAL_PROMPT_DISMISSED, false)) {
+            // 已勾选"不再提示"：正常进入，并清掉可能残留的强制标记。
+            clearForceTutorialFlag();
+            tutorialPromptDone = true;
+            return false;
+        }
+        tutorialPromptShowing = true;
+        showTutorialPromptDialog(prefs);
+        return true;
+    }
+
+    /** 构建并显示"进入新手教程"弹窗（是 / 否 + 不再提示）。在主线程调用。 */
+    private void showTutorialPromptDialog(final SharedPreferences prefs) {
+        View[] frame = inflateDialogFrame();
+        final FrameLayout overlay = (FrameLayout) frame[0];
+        LinearLayout card   = (LinearLayout) frame[1];
+        addDialogTitle(card, "新手教程");
+        addDialogMessage(card,
+                "是否进入新手教程？\n\n"
+              + "• 选择「是」：无视当前账号进度，强制从头播放新手教程（序章）。\n"
+              + "• 选择「否」：正常进入游戏。");
+
+        // "不再提示"复选框
+        final CheckBox dontAsk = new CheckBox(this);
+        dontAsk.setText("不再提示");
+        dontAsk.setTextColor(COLOR_LOG_PANEL_TEXT);
+        dontAsk.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
+        dontAsk.setButtonTintList(android.content.res.ColorStateList.valueOf(COLOR_ACCENT));
+        LinearLayout.LayoutParams cbLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        cbLp.bottomMargin = dp(12);
+        card.addView(dontAsk, cbLp);
+
+        LinearLayout row = addDialogButtonRow(card);
+        Button noBtn  = addDialogButton(row, "否", false);
+        Button yesBtn = addDialogButton(row, "是", true);
+
+        // 关闭弹窗 + 落地"不再提示" + 放行后再次 launchGame（此时 tutorialPromptDone 已置位）。
+        final Runnable[] proceed = new Runnable[1];
+        proceed[0] = () -> {
+            if (dontAsk.isChecked()) {
+                prefs.edit().putBoolean(KEY_TUTORIAL_PROMPT_DISMISSED, true).apply();
+                log("教程", "INFO", "用户勾选「不再提示」，后续启动不再弹窗");
+            }
+            tutorialPromptShowing = false;
+            tutorialPromptDone    = true;
+            overlay.setVisibility(View.GONE);
+            vRoot.removeView(overlay);
+            launchGame();
+        };
+
+        yesBtn.setOnClickListener(v -> {
+            log("教程", "INFO", "用户选择进入新手教程，写出强制标记");
+            writeForceTutorialFlag();
+            proceed[0].run();
+        });
+        noBtn.setOnClickListener(v -> {
+            clearForceTutorialFlag();
+            proceed[0].run();
+        });
+        overlay.setVisibility(View.VISIBLE);
     }
 
     // ======================================================================
