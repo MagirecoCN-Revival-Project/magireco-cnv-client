@@ -83,6 +83,13 @@ public final class ClientInit {
          * 客户端启动画面据此动态渲染署名区。
          */
         public List<Contributor> contributors = new ArrayList<>();
+
+        /**
+         * 服务端要求的最低离线包版本；null 表示服务端未下发（不作版本约束）。
+         * 来源：响应体 {@code offline_pack.min_version}（优先）或顶层
+         * {@code required_pack_version}（兼容旧格式）。
+         */
+        public String requiredPackVersion;
     }
 
     /** 单个贡献者条目（来自 /client/init 响应的 contributors 数组）。 */
@@ -228,6 +235,14 @@ public final class ClientInit {
             r.gameServerHost  = services.optString("game_server_host", null);
             JSONArray pb = services.optJSONArray("proxy_backends");
             if (pb != null) for (int i = 0; i < pb.length(); i++) r.proxyBackends.add(pb.getString(i));
+        }
+
+        JSONObject offlinePack = obj.optJSONObject("offline_pack");
+        if (offlinePack != null) {
+            r.requiredPackVersion = offlinePack.optString("min_version", null);
+        }
+        if (r.requiredPackVersion == null) {
+            r.requiredPackVersion = obj.optString("required_pack_version", null);
         }
 
         JSONArray contribs = obj.optJSONArray("contributors");

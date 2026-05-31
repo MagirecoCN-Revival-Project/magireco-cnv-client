@@ -608,22 +608,20 @@ public final class ResourceFlow {
             reporter.log("WARN", "method-select 上报失败（忽略）: " + t.getMessage());
         }
 
-        // 尝试获取云端离线包信息（供用户参考；失败不阻断离线流程）
-        String cloudUrl = null, cloudVersion = null, cloudSha256 = null;
+        // 尝试获取云端离线包信息（URL 和版本号供来源对话框展示；SHA-256 由 injectFromPicker 在文件选完后实时确认）
+        String cloudUrl = null, cloudVersion = null;
         try {
             reporter.setStatus("正在获取云端离线包信息…");
             ClientInit.OfflinePackageInfo pkg = ClientInit.fetchOfflinePackage(ctx, sessionToken);
             cloudUrl     = pkg.downloadUrl;
             cloudVersion = pkg.packageVersion;
-            cloudSha256  = pkg.sha256;
-            reporter.log("INFO", "云端离线包版本=" + cloudVersion
-                    + (cloudSha256 != null ? "，SHA-256 已获取" : "，SHA-256 未下发"));
+            reporter.log("INFO", "云端离线包版本=" + cloudVersion);
         } catch (Throwable t) {
             reporter.log("WARN", "获取云端离线包信息失败（忽略）: " + t.getMessage());
         }
 
         // 来源选择 + 文件选择 + 校验 + 解压（正式安装，写永久就绪标记）
-        injectFromPicker(cloudUrl, cloudVersion, cloudSha256, false);
+        injectFromPicker(cloudUrl, cloudVersion, false);
     }
 
     /**
@@ -644,22 +642,29 @@ public final class ResourceFlow {
     public void runProvisionalOffline() throws Exception {
         reporter.setPhase("init");
         reporter.log("INFO", "ResourceFlow 启动，模式=临时离线注入（provisional，仅本地校验）");
-        // cloudUrl/version/sha256 全为 null：来源对话框仅展示本地文件、跳过云端 SHA-256
-        injectFromPicker(null, null, null, true);
+        // cloudUrl/version 为 null：来源对话框仅展示本地文件；provisional=true 跳过服务端 SHA-256 确认
+        injectFromPicker(null, null, true);
     }
 
     /**
      * 公共注入流水线：来源对话框 → 文件选择器 → 缓存到私有临时文件 →
-     * zip 格式校验 →（可选）云端 SHA-256 硬校验 → 两阶段解压 → 写就绪标记。
+     * zip 格式校验 → 向服务端实时确认 SHA-256（正式路径）→ 两阶段解压 → 写就绪标记。
+     *
+     * <p>SHA-256 校验策略（C-L1/C-L2）：
+     * <ul>
+     *   <li>文件选完后再向服务端请求最新 SHA-256，避免使用启动时预取的过期值。</li>
+     *   <li>服务端确认失败时记录警告但不阻断（网络抖动不应让注入失败）。</li>
+     *   <li>拿到服务端 SHA-256 且本地计算不匹配时硬失败，不向用户提供继续选项。</li>
+     *   <li>{@code provisional=true} 时服务端本就不可达，完全跳过远程确认。</li>
+     * </ul>
      *
      * @param cloudUrl     云端离线包地址（{@code null}=仅本地来源）
      * @param cloudVersion 云端离线包版本（仅用于对话框展示）
-     * @param cloudSha256  云端 SHA-256（{@code null}/空=跳过云端校验，只做包内本地校验）
      * @param provisional  {@code true}=临时注入，写 provisional 标记，不计入正式安装；
      *                     {@code false}=正式安装，写永久就绪标记并生成完整性清单
      */
     private void injectFromPicker(String cloudUrl, String cloudVersion,
-                                  String cloudSha256, boolean provisional) throws Exception {
+                                  boolean provisional) throws Exception {
         // 展示来源选择对话框
         reporter.setPhase("offline-pick");
         reporter.setStatus("选择离线包来源…");
@@ -697,25 +702,47 @@ public final class ResourceFlow {
             reporter.setStatus("正在校验 zip 格式…");
             verifyZipFile(importedZip);
 
-            // SHA-256 校验：C-L1/C-L2: 必须硬失败，不允许跳过或用户覆盖
-            if (cloudSha256 != null && !cloudSha256.isEmpty()) {
-                reporter.setStatus("正在计算文件 SHA-256…");
-                reporter.log("INFO", "开始计算离线包 SHA-256，期望值=" + cloudSha256);
-                // C-L2: 异常不再捕获——SHA-256 计算失败视为致命错误
-                String actualSha256 = sha256HexFromFile(importedZip);
-                if (!cloudSha256.equalsIgnoreCase(actualSha256)) {
-                    // C-L1: 校验不通过时硬失败，不向用户提供继续选项
-                    reporter.log("ERROR", "SHA-256 校验失败：期望=" + cloudSha256 + "，实际=" + actualSha256);
-                    throw new FatalConfigException(
-                            "离线包 SHA-256 校验失败，已拒绝注入。期望=" + cloudSha256 + " 实际=" + actualSha256);
+            // 文件选完后实时向服务端确认最新 SHA-256（仅正式安装路径；临时注入服务端不可达，跳过）
+            if (!provisional && sessionToken != null && !sessionToken.isEmpty()) {
+                reporter.setStatus("正在向服务端确认离线包 SHA-256…");
+                reporter.log("INFO", "文件已缓存，向服务端请求最新 SHA-256");
+                String serverSha256 = null;
+                try {
+                    ClientInit.OfflinePackageInfo freshPkg = ClientInit.fetchOfflinePackage(ctx, sessionToken);
+                    serverSha256 = freshPkg.sha256;
+                    if (serverSha256 != null && !serverSha256.isEmpty()) {
+                        reporter.log("INFO", "服务端 SHA-256 已获取：" + serverSha256);
+                    } else {
+                        reporter.log("WARN", "服务端未下发 SHA-256，跳过哈希校验");
+                    }
+                } catch (Throwable t) {
+                    reporter.log("WARN", "获取服务端 SHA-256 失败（忽略，继续注入）：" + t.getMessage());
                 }
-                reporter.log("INFO", "SHA-256 校验通过：" + cloudSha256);
+                if (serverSha256 != null && !serverSha256.isEmpty()) {
+                    reporter.setStatus("正在计算文件 SHA-256…");
+                    reporter.log("INFO", "开始计算本地离线包 SHA-256，期望=" + serverSha256);
+                    // C-L2: 计算失败视为致命错误
+                    String actualSha256 = sha256HexFromFile(importedZip);
+                    if (!serverSha256.equalsIgnoreCase(actualSha256)) {
+                        // C-L1: 不匹配时硬失败，不向用户提供继续选项
+                        reporter.log("ERROR", "SHA-256 校验失败：期望=" + serverSha256 + "，实际=" + actualSha256);
+                        throw new FatalConfigException(
+                                "离线包文件与服务端记录不符，请重新下载最新版离线包后重试。"
+                                + "（期望=" + serverSha256 + " 实际=" + actualSha256 + "）");
+                    }
+                    reporter.log("INFO", "SHA-256 校验通过：" + serverSha256);
+                }
+            } else if (!provisional) {
+                reporter.log("WARN", "未持有会话令牌，跳过服务端 SHA-256 确认（仅做本地格式校验）");
             }
 
             // ── 第一阶段：解压外层 zip 到暂存目录（避免直接覆盖 filesDir）──────────
             File stagingDir = new File(ctx.getFilesDir(), "cnv_staging");
             deleteRecursive(stagingDir);  // 清理可能残留的旧暂存
             stagingDir.mkdirs();
+
+            // 暂存目录清理前读取的离线包版本（在 inner finally 前赋值，之后使用）
+            String extractedPackVersion = null;
 
             try {
                 reporter.initSlots(1);
@@ -744,6 +771,14 @@ public final class ResourceFlow {
                 }
                 reporter.setSlotPhase(0, "done");
                 reporter.log("INFO", "第一阶段完成，扫描暂存目录中的内层 zip…");
+
+                // 第一阶段解压后，从暂存目录读取离线包元数据（stagingDir 将在 finally 中删除）
+                extractedPackVersion = readPackMetaVersion(stagingDir);
+                if (extractedPackVersion != null) {
+                    reporter.log("INFO", "离线包元数据：pack_version=" + extractedPackVersion);
+                } else {
+                    reporter.log("INFO", "未发现 cnv_pack_meta.json，跳过离线包版本记录");
+                }
 
                 // ── 第二阶段：找到所有内层 zip，逐一解压到 filesDir ─────────────────────
                 List<File> innerZips = findInnerZipsRecursive(stagingDir);
@@ -801,6 +836,10 @@ public final class ResourceFlow {
                 reporter.setStatus("离线资源注入完成");
                 reporter.log("INFO", "两阶段离线资源解压完成，写入 ready flag");
                 writeReadyFlag();
+                if (extractedPackVersion != null) {
+                    writeInstalledPackVersion(extractedPackVersion);
+                    reporter.log("INFO", "已记录已安装离线包版本：" + extractedPackVersion);
+                }
             }
         } finally {
             // 外层 finally：无论何种失败路径（拷贝/校验/解压），都清理临时导入文件
@@ -1136,6 +1175,44 @@ public final class ResourceFlow {
             fos.write(("provisional:" + System.currentTimeMillis() + "\n").getBytes("UTF-8"));
         }
         reporter.log("INFO", "已写出临时离线标记: " + flag.getAbsolutePath());
+    }
+
+    /**
+     * 从暂存目录根读取 {@code cnv_pack_meta.json} 并返回其中的 {@code pack_version} 字段。
+     * 文件不存在、格式错误、字段缺失均返回 {@code null}（非致命，记录 WARN）。
+     */
+    private String readPackMetaVersion(File stagingDir) {
+        File meta = new File(stagingDir, "cnv_pack_meta.json");
+        if (!meta.exists()) return null;
+        try {
+            byte[] bytes = new byte[(int) meta.length()];
+            try (java.io.FileInputStream fis = new java.io.FileInputStream(meta)) {
+                int total = 0, n;
+                while (total < bytes.length && (n = fis.read(bytes, total, bytes.length - total)) != -1)
+                    total += n;
+            }
+            String content = new String(bytes, "UTF-8");
+            org.json.JSONObject obj = new org.json.JSONObject(content);
+            String ver = obj.optString("pack_version", null);
+            return (ver != null && !ver.isEmpty()) ? ver : null;
+        } catch (Throwable t) {
+            reporter.log("WARN", "读取 cnv_pack_meta.json 失败（忽略）：" + t.getMessage());
+            return null;
+        }
+    }
+
+    /** 将已安装的离线包版本写入 {@code <filesDir>/cnv_inject/installed_pack_version.txt}。 */
+    private void writeInstalledPackVersion(String version) {
+        try {
+            File dir = new File(ctx.getFilesDir(), "cnv_inject");
+            if (!dir.exists()) dir.mkdirs();
+            File vf = new File(dir, "installed_pack_version.txt");
+            try (FileOutputStream fos = new FileOutputStream(vf)) {
+                fos.write(version.getBytes("UTF-8"));
+            }
+        } catch (Throwable t) {
+            reporter.log("WARN", "写入已安装离线包版本失败（忽略）：" + t.getMessage());
+        }
     }
 
     private ResourceFlow() { throw new AssertionError(); }

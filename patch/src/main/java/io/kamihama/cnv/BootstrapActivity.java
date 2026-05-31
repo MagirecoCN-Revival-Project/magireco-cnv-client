@@ -252,6 +252,10 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
     private volatile String  serverFeatureDisabledMsg = null;
     /** 服务端下发的 cap-worker 端点；空时回退 {@link CloudEndpoint#CAP_WORKER_URL}。 */
     private volatile String  serverCapWorkerUrl       = null;
+    /** 服务端要求的最低离线包版本；握手后由 handleCloudInit 写入。null = 无版本约束。 */
+    private volatile String  serverRequiredPackVersion = null;
+    /** 离线包版本过低弹窗中用户的选择；null = 未触发或用户选择忽略。 */
+    private volatile String  packUpgradeMethod        = null;
 
     /** 覆盖层权限申请完成后待执行的回调（onActivityResult 中触发）。 */
     private Runnable pendingAfterPermission;
@@ -1729,6 +1733,32 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
                   + "现在将重新下载或重新载入离线包以完成正式安装。");
         }
 
+        // 第 0c-3 步：离线包版本检查（仅资源已就绪时；需服务端下发版本要求）
+        if (alreadyReady
+                && serverRequiredPackVersion != null
+                && !serverRequiredPackVersion.isEmpty()) {
+            String installed = readInstalledPackVersion();
+            log("启动", "INFO", "离线包版本：已安装=" + (installed != null ? installed : "（未记录）")
+                    + "，服务端要求最低=" + serverRequiredPackVersion);
+            if (isPackVersionOutdated(installed, serverRequiredPackVersion)) {
+                log("启动", "WARN", "离线包版本过低，弹出更新提示");
+                int choice = askPackVersionOutdated(installed, serverRequiredPackVersion);
+                if (choice == 0) {
+                    log("启动", "INFO", "用户选择重新注入离线包");
+                    deleteReadyFlag();
+                    packUpgradeMethod = ResourceFlow.MODE_OFFLINE;
+                    alreadyReady = false;
+                } else if (choice == 1) {
+                    log("启动", "INFO", "用户选择在线重新下载资源");
+                    deleteReadyFlag();
+                    packUpgradeMethod = ResourceFlow.MODE_ONLINE;
+                    alreadyReady = false;
+                } else {
+                    log("启动", "WARN", "用户选择忽略离线包版本警告，继续启动");
+                }
+            }
+        }
+
         // 第 0d 步：资源已齐则跳过下载，直接检查热更新
         if (alreadyReady) {
             log("启动", "INFO", "资源已就绪，跳过下载，检查热更新");
@@ -1755,14 +1785,20 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             userMethod = ResourceFlow.MODE_OFFLINE;
             log("启动", "WARN", "调试：force_offline_mode=true，强制使用离线模式");
         } else if (serverOnlineEnabled && serverOfflineEnabled) {
-            log("启动", "INFO", "弹出下载模式选择对话框");
-            userMethod = askDownloadMethod();
-            if (userMethod == null) {
-                log("启动", "WARN", "用户取消了下载模式选择，APP 即将退出");
-                showFatalAndExit("已取消", "下载模式选择被取消，APP 即将退出。");
-                return;
+            if (packUpgradeMethod != null) {
+                // 离线包版本过低弹窗中用户已选定模式，直接沿用，不再弹选择对话框
+                userMethod = packUpgradeMethod;
+                log("启动", "INFO", "沿用离线包版本检查时的用户选择：" + userMethod);
+            } else {
+                log("启动", "INFO", "弹出下载模式选择对话框");
+                userMethod = askDownloadMethod();
+                if (userMethod == null) {
+                    log("启动", "WARN", "用户取消了下载模式选择，APP 即将退出");
+                    showFatalAndExit("已取消", "下载模式选择被取消，APP 即将退出。");
+                    return;
+                }
+                log("启动", "INFO", "用户选择了下载模式：" + userMethod);
             }
-            log("启动", "INFO", "用户选择了下载模式：" + userMethod);
         } else if (serverOnlineEnabled) {
             userMethod = ResourceFlow.MODE_ONLINE;
             log("启动", "INFO", "服务端仅开放在线下载，自动选择在线模式");
@@ -2227,8 +2263,11 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         serverOnlineEnabled      = init.onlineDownloadEnabled;
         serverOfflineEnabled     = init.offlinePackageEnabled;
         serverFeatureDisabledMsg = init.featureDisabledMessage;
+        serverRequiredPackVersion = init.requiredPackVersion;
         log("握手", "INFO", "功能开关：在线下载=" + serverOnlineEnabled
-                + "，离线包注入=" + serverOfflineEnabled);
+                + "，离线包注入=" + serverOfflineEnabled
+                + (serverRequiredPackVersion != null
+                        ? "，最低离线包版本=" + serverRequiredPackVersion : ""));
 
         // 两个功能均关闭 → 按服务器维护处理
         if (!serverOnlineEnabled && !serverOfflineEnabled) {
@@ -3245,6 +3284,99 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
         showFatalWithRetry("资源准备失败",
                 "无法继续启动游戏：" + t.getMessage()
                 + "\n\n请检查网络后重试，或尝试切换为离线包注入方式。");
+    }
+
+    /** 读取本机已安装离线包版本；文件不存在或读取失败返回 null。 */
+    private String readInstalledPackVersion() {
+        File vf = new File(new File(getFilesDir(), "cnv_inject"), "installed_pack_version.txt");
+        if (!vf.exists()) return null;
+        try (java.io.BufferedReader br = new java.io.BufferedReader(
+                new java.io.InputStreamReader(new java.io.FileInputStream(vf), "UTF-8"))) {
+            String line = br.readLine();
+            return (line != null && !line.trim().isEmpty()) ? line.trim() : null;
+        } catch (Throwable t) {
+            log("启动", "WARN", "读取已安装离线包版本失败：" + t.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * 比较离线包版本号：installed < required 返回 true（需要更新）。
+     * 支持点分格式（如 "1.2.3"）和纯整数格式（如 "20240101"）。
+     * installed 为 null / 空串时视为"未记录"，始终返回 true。
+     */
+    private static boolean isPackVersionOutdated(String installed, String required) {
+        if (installed == null || installed.isEmpty()) return true;
+        String[] ip = installed.split("\\.");
+        String[] rp = required.split("\\.");
+        int len = Math.max(ip.length, rp.length);
+        for (int i = 0; i < len; i++) {
+            int iv = i < ip.length ? safeParseVersionPart(ip[i]) : 0;
+            int rv = i < rp.length ? safeParseVersionPart(rp[i]) : 0;
+            if (iv < rv) return true;
+            if (iv > rv) return false;
+        }
+        return false;
+    }
+
+    private static int safeParseVersionPart(String s) {
+        try { return Integer.parseInt(s.trim()); } catch (NumberFormatException e) { return 0; }
+    }
+
+    /**
+     * 离线包版本过低时弹出更新提示对话框。
+     *
+     * @return 0=重新注入离线包，1=在线下载，-1=忽略继续启动
+     */
+    private int askPackVersionOutdated(String installed, String required) {
+        final Object  lock   = new Object();
+        final int[]   result = { -1 };
+        final boolean[] done = { false };
+        final boolean canOnline  = serverOnlineEnabled;
+        final boolean canOffline = serverOfflineEnabled;
+        final String  installedStr = (installed != null) ? installed : "（未记录）";
+        ui.post(() -> {
+            View[] frame = inflateDialogFrame();
+            FrameLayout overlay = (FrameLayout) frame[0];
+            LinearLayout card   = (LinearLayout) frame[1];
+            addDialogTitle(card, "离线包版本过低");
+            addDialogMessage(card,
+                    "当前已安装的离线包版本（" + installedStr + "）低于服务端要求的最低版本（" + required + "）。\n\n"
+                  + "继续使用旧版离线包可能导致游戏内容不完整或出现异常。\n\n"
+                  + "建议立即更新。");
+            LinearLayout row = addDialogButtonRow(card);
+            Button ignoreBtn = addDialogButton(row, "暂时忽略", false);
+            ignoreBtn.setOnClickListener(v -> {
+                overlay.setVisibility(View.GONE);
+                vRoot.removeView(overlay);
+                synchronized (lock) { result[0] = -1; done[0] = true; lock.notifyAll(); }
+            });
+            if (canOffline) {
+                Button reinjectBtn = addDialogButton(row, "重新注入", false);
+                reinjectBtn.setOnClickListener(v -> {
+                    overlay.setVisibility(View.GONE);
+                    vRoot.removeView(overlay);
+                    synchronized (lock) { result[0] = 0; done[0] = true; lock.notifyAll(); }
+                });
+            }
+            if (canOnline) {
+                Button onlineBtn = addDialogButton(row, "在线下载", true);
+                onlineBtn.setOnClickListener(v -> {
+                    overlay.setVisibility(View.GONE);
+                    vRoot.removeView(overlay);
+                    synchronized (lock) { result[0] = 1; done[0] = true; lock.notifyAll(); }
+                });
+            }
+            overlay.setVisibility(View.VISIBLE);
+        });
+        synchronized (lock) {
+            while (!done[0]) {
+                try { lock.wait(500); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt(); return -1;
+                }
+            }
+            return result[0];
+        }
     }
 
     /**
