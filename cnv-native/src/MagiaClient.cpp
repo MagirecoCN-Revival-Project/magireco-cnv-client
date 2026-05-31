@@ -64,11 +64,14 @@ void (*qbSceneOnRespOld)(void*, void*, void*) = nullptr;
 void (*questDataOnRespOld)(void*, void*, void*) = nullptr;
 void (*assetLoadOnDownloadedOld)(void*) = nullptr;
 
-// web::SceneCommand 场景跳转命令（强制新手教程用）。
-// pushSceneTop 装 inline hook 拦截"进入主页"；pushScenePrologue 不 hook，
-// 只解析出原版函数指针，命中强制标记时直接调用以进入序章场景。
+// web::SceneCommand 场景跳转命令（强制新手教程用）。pushSceneTop 装 inline
+// hook 拦截"进入主页"；命中标记时不调 pushScenePrologue（其参数来自前端
+// 下发的 JSON），而是直接复刻调试菜单"播放序章"的构造，逐字段写死参数。
 void (*pushSceneTopOld)(void*, const std::string&) = nullptr;
-void (*pushScenePrologueFn)(void*, const std::string&) = nullptr;
+// PrologueSceneLayerInfo::ctor(ESceneLayerType, std::string const&, std::string const&)
+void (*prologueInfoCtorFn)(void*, int, const std::string&, const std::string&) = nullptr;
+// SceneLayerManager::getInstance()（静态单例）
+void* (*sceneLayerMgrGetInstanceFn)() = nullptr;
 
 void (*downloadSceneLayerCtorOld)(void*, void*) = nullptr;
 bool (*downloadSceneLayerInitOld)(void*) = nullptr;
@@ -328,15 +331,30 @@ void questDataOnRespNew(void* _this, void* session, void* resp) {
 // 复刻服对任何账号都下发"满级存档"，正常流程永远不会进新手教程；唯一
 // 可靠的办法就是在这条"进主页"的命令上拦截、改走引擎自带的序章场景。
 //
-// 命中强制标记时调用原版 pushScenePrologue（与调试菜单"播放序章"等价：
-// PrologueSceneLayerInfo(ESceneLayerType=9, "", "")）。传最小合法 JSON
-// "{}"：无任何字段，序章按默认空参数构造，不依赖服务端下发的关卡数据。
-// 标记一次性消费，序章结束后引擎再次 pushSceneTop 即正常进主页。
+// 逐条复刻调试菜单"播放序章"(DebugMenuSceneLayer::onSelectMenu) 的构造：
+//   info = new PrologueSceneLayerInfo(ESceneLayerType=9, "OP020", "{}")
+//          - "OP020" 是序章脚本 ID（写死，等同调试菜单）；"{}" 为空参数
+//   SceneLayerManager::getInstance() 经虚表 [vptr+0x18]
+//          (= pushSceneLayer) 压入 info；与 pushScenePrologue 的压栈一致。
+// 不走 pushScenePrologue 是因为其两个字符串参数来自前端下发的 JSON，
+// 这里直接写死才能"无视账号状态"。标记一次性消费，序章结束后引擎再次
+// pushSceneTop 即正常进主页。
+static void forceEnterPrologue() {
+    void* info = ::operator new(0x58);   // sizeof(PrologueSceneLayerInfo)=0x58，与引擎一致
+    {
+        std::string scenarioId = "OP020";
+        std::string params     = "{}";
+        prologueInfoCtorFn(info, 9, scenarioId, params);
+    }   // scenarioId/params 在此析构；ctor 已把它们拷进 info
+    void*  mgr  = sceneLayerMgrGetInstanceFn();
+    void** vptr = *reinterpret_cast<void***>(mgr);
+    reinterpret_cast<void(*)(void*, void*)>(vptr[3])(mgr, info);  // [vptr+0x18]
+}
+
 void pushSceneTopNew(void* self, const std::string& arg) {
-    if (pushScenePrologueFn && consumeForceTutorial()) {
-        LOGI("[Tutorial] 命中强制教程标记 → 改为进入序章(Prologue)场景");
-        std::string prologueArg = "{}";
-        pushScenePrologueFn(self, prologueArg);
+    if (prologueInfoCtorFn && sceneLayerMgrGetInstanceFn && consumeForceTutorial()) {
+        LOGI("[Tutorial] 命中强制教程标记 → 改为进入序章(Prologue, OP020)场景");
+        forceEnterPrologue();
         return;
     }
     pushSceneTopOld(self, arg);
@@ -614,14 +632,17 @@ extern "C" jint JNI_OnLoad(JavaVM* vm, void* reserved) {
             void* p2 = shadowhook_dlsym(handle, "_ZN5http213Http2Response19getResponseDataSizeEv");
             if (p1) getDataOld     = reinterpret_cast<const unsigned char*(*)(void*)>(p1);
             if (p2) getDataSizeOld = reinterpret_cast<size_t(*)(void*)>(p2);
-            // 强制教程要直接调用的原版函数（只取地址、不 hook）
-            void* p3 = shadowhook_dlsym(handle,
-                "_ZN3web12SceneCommand17pushScenePrologueERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE");
-            if (p3) {
-                pushScenePrologueFn = reinterpret_cast<void(*)(void*, const std::string&)>(p3);
-                LOGI("[Tutorial] 已解析 pushScenePrologue 地址 %p", p3);
+            // 强制教程要直接调用的原版函数（只取地址、不 hook）：
+            // 序章 Info 的构造函数 + SceneLayerManager 单例取用。
+            void* pc = shadowhook_dlsym(handle,
+                "_ZN22PrologueSceneLayerInfoC2E15ESceneLayerTypeRKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEES9_");
+            void* pg = shadowhook_dlsym(handle, "_ZN17SceneLayerManager11getInstanceEv");
+            if (pc) prologueInfoCtorFn = reinterpret_cast<void(*)(void*, int, const std::string&, const std::string&)>(pc);
+            if (pg) sceneLayerMgrGetInstanceFn = reinterpret_cast<void*(*)()>(pg);
+            if (pc && pg) {
+                LOGI("[Tutorial] 已解析序章构造符号 (ctor=%p getInstance=%p)", pc, pg);
             } else {
-                LOGE("[Tutorial] 未找到 pushScenePrologue 符号，强制教程将不可用");
+                LOGE("[Tutorial] 序章构造符号缺失 (ctor=%p getInstance=%p)，强制教程将不可用", pc, pg);
             }
             shadowhook_dlclose(handle);
         }
