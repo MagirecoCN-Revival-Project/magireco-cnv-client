@@ -1541,6 +1541,21 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             return;
         }
 
+        // 调试模式：skip_to_tutorial.flag=true 时跳过所有前置逻辑，直接显示教程弹窗
+        if (isDebugFlag("skip_to_tutorial")) {
+            log("启动", "WARN", "调试：skip_to_tutorial=true，跳过所有前置逻辑，直接显示教程弹窗");
+            setPhase("init");
+            setStatus("调试模式：跳过至教程弹窗");
+            ui.post(this::playTitleSequence);
+            ui.post(() -> {
+                SharedPreferences tutPrefs = getSharedPreferences(PREFS_TUTORIAL, MODE_PRIVATE);
+                tutorialPromptShowing = false;
+                tutorialPromptDone    = false;
+                showTutorialPromptDialog(tutPrefs);
+            });
+            return;
+        }
+
         // 第 0a 步：检查本机资源是否已准备就绪；同时检测是否处于游戏崩溃循环中
         boolean alreadyReady = isResourcesAlreadyReady();
         log("启动", "INFO", "资源就绪检查：" + (alreadyReady ? "已就绪，跳过下载" : "未就绪，进入下载流程"));
@@ -1779,6 +1794,7 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
      * <p>已定义的 flag：
      * <ul>
      *   <li>{@code display_ui_only} — 仅展示 UI，跳过所有启动逻辑（最早检查）</li>
+     *   <li>{@code skip_to_tutorial} — 跳过所有前置逻辑，直接弹出教程弹窗（无视"不再提示"状态）</li>
      *   <li>{@code skip_cloud_init} — 跳过云端握手，使用默认功能开关</li>
      *   <li>{@code skip_ban_check} — 跳过本地封禁记录检查</li>
      *   <li>{@code skip_hot_update} — 跳过热更新检查</li>
