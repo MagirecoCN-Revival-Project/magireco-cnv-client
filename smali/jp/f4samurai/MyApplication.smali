@@ -7,8 +7,6 @@
 .method public constructor <init>()V
     .locals 0
 
-    invoke-static {}, Lcom/loadLib/libLoader;->loadLib()V
-
     invoke-direct {p0}, Landroid/app/Application;-><init>()V
 
     return-void
