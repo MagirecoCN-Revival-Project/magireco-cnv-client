@@ -2625,11 +2625,11 @@ public class BootstrapActivity extends Activity implements ResourceFlow.Reporter
             new Thread(() -> {
                 try {
                     SaveSyncHelper.upload(getApplicationContext(), accountId, accountToken);
-                } catch (SaveSyncHelper.RateLimitedException e) {
-                    ui.post(() -> Toast.makeText(BootstrapActivity.this,
-                            "存档上传过快，请稍后再试", Toast.LENGTH_SHORT).show());
                 } catch (Exception e) {
-                    android.util.Log.e(TAG, "上传本地存档失败：" + e.getMessage());
+                    android.util.Log.w(TAG, "上传本地存档失败：" + e.getMessage());
+                    String tip = SaveSyncHelper.friendlyUploadError(e);
+                    ui.post(() -> Toast.makeText(BootstrapActivity.this,
+                            tip, Toast.LENGTH_SHORT).show());
                 }
                 ui.post(this::launchWithOverlay);
             }, "cnv-upload-local").start();

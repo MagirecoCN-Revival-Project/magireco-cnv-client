@@ -5,6 +5,9 @@ import android.content.Context;
 import org.json.JSONObject;
 
 import java.io.IOException;
+import java.net.ConnectException;
+import java.net.SocketTimeoutException;
+import java.net.UnknownHostException;
 import java.util.ArrayDeque;
 import java.util.Iterator;
 
@@ -83,7 +86,44 @@ public final class SaveSyncHelper {
         JSONObject body = new JSONObject();
         body.put("token", accountToken);
         body.put("data",  new JSONObject(data != null ? data : "{}"));
-        Net.postJson(CloudEndpoint.ACCOUNT_SAVE_PUT, body.toString(), 15_000);
+        String resp = Net.postJson(CloudEndpoint.ACCOUNT_SAVE_PUT, body.toString(), 15_000);
+        // 服务端 HTTP 200 但明确返回 success:false（如存储配额超限、token 已失效等）
+        try {
+            JSONObject obj = new JSONObject(resp);
+            if (!obj.optBoolean("success", true)) {
+                String reason = obj.optString("message", "");
+                throw new IOException("服务端拒绝存档上传"
+                        + (reason.isEmpty() ? "" : "：" + reason));
+            }
+        } catch (org.json.JSONException ignore) {
+            // 响应体非 JSON（服务端未返回 JSON），视为成功
+        }
+    }
+
+    /**
+     * 将上传失败的异常翻译为适合向用户展示的单行中文提示。
+     * 所有调用方统一走这里，避免在 UI 层重复判断异常类型。
+     */
+    public static String friendlyUploadError(Exception e) {
+        if (e instanceof RateLimitedException)   return "存档上传过快，请稍后再试";
+        if (e instanceof SocketTimeoutException) return "服务器未响应，请稍后重试";
+        if (e instanceof UnknownHostException)   return "网络不可用，请检查网络连接";
+        if (e instanceof ConnectException)       return "无法连接到服务器，请稍后重试";
+        if (e instanceof javax.net.ssl.SSLException)
+                                                 return "网络安全验证失败，请检查系统时间";
+        if (e instanceof IOException) {
+            String msg = e.getMessage();
+            if (msg != null) {
+                if (msg.contains("HTTP 503"))                    return "服务器维护中，请稍后重试";
+                if (msg.contains("HTTP 429"))                    return "上传请求过于频繁，请稍后重试";
+                if (msg.contains("HTTP 401") || msg.contains("HTTP 403"))
+                                                                 return "账号验证失败，请重新登录";
+                if (msg.contains("HTTP 5"))                      return "服务器出现错误，请稍后重试";
+                if (msg.startsWith("服务端拒绝存档上传"))           return msg;
+            }
+            return "网络错误，存档上传失败";
+        }
+        return "存档上传失败，请稍后重试";
     }
 
     /**
