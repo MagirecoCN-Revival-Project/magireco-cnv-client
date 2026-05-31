@@ -14,6 +14,11 @@ import java.util.Iterator;
  */
 public final class SaveSyncHelper {
 
+    /** 上传被限速时抛出的异常，调用方可据此向用户展示友好提示而非记录为错误。 */
+    public static final class RateLimitedException extends java.io.IOException {
+        RateLimitedException(String msg) { super(msg); }
+    }
+
     /** 上传滑动窗口：60 秒内最多 2 次。 */
     private static final long UPLOAD_WINDOW_MS  = 60_000L;
     private static final int  UPLOAD_MAX_CALLS  = 2;
@@ -31,8 +36,7 @@ public final class SaveSyncHelper {
         }
         if (uploadCallTimes.size() >= UPLOAD_MAX_CALLS) {
             long waitSec = (UPLOAD_WINDOW_MS - (now - uploadCallTimes.peek())) / 1000 + 1;
-            throw new IOException("上传限速：1分钟内最多 " + UPLOAD_MAX_CALLS
-                    + " 次，请 " + waitSec + " 秒后重试");
+            throw new RateLimitedException("上传过快，请 " + waitSec + " 秒后重试");
         }
         uploadCallTimes.offer(now);
     }
