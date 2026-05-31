@@ -31,14 +31,10 @@
 
 # virtual methods
 .method public run()V
-    .locals 1
+    .locals 0
 
     .prologue
-    .line 17
-    const-string/jumbo v0, "uwasa"
-
-    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V
-
-    .line 18
+    # libuwasa (Totentanz legacy) 已停用：其 RestClient JNI 入口已移除，
+    # 更新/资源渠道由 cnv-native + ClientInit + ResourceFlow 接管。
     return-void
 .end method
